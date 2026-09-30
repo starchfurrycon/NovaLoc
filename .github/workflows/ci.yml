@@ -1,16 +1,23 @@
 name: CI
 
-# push / PR 上跑静态检查与导入冒烟测试。
+# push / PR 上跑静态检查、导入冒烟测试、纯逻辑 pytest，以及**打包断言**。
 #
-# ⚠️ 这里**故意不跑完整测试套件**。
+# ⚠️ 这里**跑不了完整测试套件**。
 #
 # 原因：真实测试需要 PP-OCRv6 的 ONNX 模型（约 140 MB 下载）和可用的
 # DirectML/CUDA 推理后端。CI runner 既没有 GPU、也不该为每次 push 去
-# 下载模型，所以 `pytest` 在这个环境里跑不全，跑了也只会给出误导性的绿。
+# 下载模型，所以那些套件在这里会被 marker 排除。
 #
-# 当前能做的两件事：
-#   1. `ruff check src` —— 静态检查，不需要任何运行时依赖；
-#   2. 导入冒烟测试 —— 确认包能被导入、没有语法/循环导入/缺失模块的问题。
+# 现在做四件事：
+#   1. `ruff check src tests` —— 静态检查，不需要运行时依赖；
+#   2. 导入冒烟测试 —— 包能导入、无语法/循环导入/缺模块；
+#   3. 纯逻辑 pytest（用 marker 挑出不需要 GPU/字体/模型的套件）；
+#   4. **wheel 必须自带前端** —— 见文件末尾 `wheel-contains-frontend`。
+#
+# 第 4 条是补上的：前端产物曾经放在仓库根，而 hatchling 只打包
+# `src/novaloc`，于是 wheel 里没有前端，`pip install` 出来的界面 404，
+# 而**构建时毫无警告**。这条断言在仓库里测不管用
+# （`_web_dist()` 会命中源码树），必须**装一遍再在仓库外导入**。
 #
 # 完整测试请在本地跑（需要模型与 GPU），见 README 的「开发」一节。
 on:
@@ -84,3 +91,90 @@ jobs:
         # 所以即使在这里全跑也是安全的；但跳过一大片会让日志难以判读，
         # 因此显式限定范围。
         run: pytest tests -q -m "not needs_fonts and not needs_gpu and not needs_models"
+
+  wheel-contains-frontend:
+    name: wheel 必须自带前端
+    runs-on: ubuntu-latest
+
+    # 单独立一个 job，因为这是一条**打包层面**的断言，跟 lint 无关。
+    #
+    # 为什么值得专门守：前端产物原本放在仓库根的 `web/dist`，而
+    # `[tool.hatch.build.targets.wheel] packages = ["src/novaloc"]`
+    # 只收包目录，于是 wheel 里**没有前端** —— `pip install nova-loc`
+    # 装完所有 API 正常、只有根路径 404。构建时毫无警告，
+    # GitHub 自动生成的 wheel 更不会因此报错。
+    #
+    # 关键点：**必须在仓库之外**建/验，否则 `_web_dist()` 会命中源码树里
+    # 那份，测试照样全绿而 wheel 仍然是残的（第一次就是这么被骗过去的）。
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: 断言 wheel 内有前端，装上后也能定位到它
+        # 两步都要做：
+        #   1. 直接看 zip 内容 —— 最直接的"文件在不在"证据；
+        #   2. **真装一遍再导入** —— 只有这样才能确认运行时
+        #      `_web_dist()` 能在**安装位置**找到前端。
+        # 第 2 步曾经漏掉，导致第一次写完的 CI 步骤一跑就
+        # `ModuleNotFoundError: No module named 'fastapi'`：
+        # 直接从临时目录 import，绕过了依赖安装。
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          web = [n for n in names if "web_dist" in n]
+          print("wheel:", wheel)
+          print("web_dist 条目:", web)
+          if not web:
+              sys.exit("wheel 里没有前端 —— pip install 出来的界面会 404")
+          if not any("web_dist/index.html" in n for n in names):
+              sys.exit("wheel 里缺少 web_dist/index.html")
+          if not any("web_dist/assets/" in n for n in names):
+              sys.exit("wheel 里缺少 web_dist/assets/")
+          PY
+
+          # 装到 site-packages，然后**在仓库之外**导入，确保命中的是
+          # 已安装的那份。在仓库里导入会找到源码树里的
+          # src/novaloc/web_dist，测了等于没测（这个错误第一次就犯过）。
+          python -m pip install --no-deps "$(ls dist/*.whl)"
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+
+          import novaloc
+          from novaloc.api.app import VERSION, _web_dist
+
+          pkg = Path(novaloc.__file__).resolve()
+          print("已安装的包:", pkg)
+          assert "site-packages" in str(pkg), f"导入到的不是已安装的包：{pkg}"
+
+          d = _web_dist()
+          assert d is not None, "已安装的包里 _web_dist() 返回 None（前端没打进去）"
+          assert (d / "index.html").is_file(), f"缺少 index.html：{d}"
+          assert (d / "assets").is_dir(), f"缺少 assets/：{d}"
+          assert "site-packages" in str(d.resolve()), f"定位到了包外目录：{d}"
+
+          assert VERSION == novaloc.__version__, (
+              f"版本不一致：api={VERSION} pkg={novaloc.__version__}"
+          )
+          print("OK 已安装的包自带前端：", d)
+          print("OK 版本一致：", VERSION)
+          PY
+
