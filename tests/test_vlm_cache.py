@@ -39,16 +39,23 @@ pytest.importorskip("cv2", reason="需要 OpenCV")
 
 
 class FakeVLM:
-    """按裁剪内容返回固定文字的假 VLM，并记录被问了几次。"""
+    """按裁剪内容返回固定文字的假 VLM，并记录被问了几次。
+
+    ``calls`` 是**次数**（整数），``seen`` 才保存每次的裁剪字节。
+    之前只留了字节列表，测试里写 ``vlm.calls == 1`` 就变成拿列表比整数，
+    断言信息也变成一大坨像素，难读到看不出问题。
+    """
 
     def __init__(self, answers: dict[bytes, str] | None = None, default: str = "") -> None:
         self.answers = answers or {}
         self.default = default
-        self.calls: list[bytes] = []
+        self.calls = 0
+        self.seen: list[bytes] = []
 
     def read_text(self, crop, hint: str = "") -> str:  # noqa: ARG002
         raw = memoryview(np.ascontiguousarray(crop).tobytes()).tobytes()
-        self.calls.append(raw)
+        self.calls += 1
+        self.seen.append(raw)
         return self.answers.get(raw, self.default)
 
 
@@ -94,7 +101,7 @@ def test_identical_crops_asked_once() -> None:
     for q in quads:
         svc._vlm_reconsider(img, _block(q))
 
-    assert len(vlm.calls) == 1, f"应只问一次，实际 {len(vlm.calls)} 次"
+    assert vlm.calls == 1, f"应只问一次，实际 {vlm.calls} 次"
     assert svc.vlm_reads == 1
     assert svc.vlm_cache_hits == 2, f"应命中 2 次，实际 {svc.vlm_cache_hits}"
 
@@ -113,7 +120,7 @@ def test_different_crops_each_asked() -> None:
     svc._vlm_reconsider(img, _block(_quad(10, 10)))
     svc._vlm_reconsider(img, _block(_quad(80, 10)))
 
-    assert len(vlm.calls) == 2, f"应各问一次，实际 {len(vlm.calls)} 次"
+    assert vlm.calls == 2, f"应各问一次，实际 {vlm.calls} 次"
     assert svc.vlm_cache_hits == 0
 
 
@@ -129,7 +136,7 @@ def test_empty_result_is_cached() -> None:
         out = svc._vlm_reconsider(img, _block(_quad(0, 0, 20, 20)))
         assert out == ""
 
-    assert len(vlm.calls) == 1, f"读不出来也只该问一次，实际 {len(vlm.calls)} 次"
+    assert vlm.calls == 1, f"读不出来也只该问一次，实际 {vlm.calls} 次"
     assert svc.vlm_cache_hits == 3
 
 
@@ -167,7 +174,7 @@ def test_cache_persists_across_images() -> None:
     svc._vlm_reconsider(img_a, _block(_quad(5, 5)))
     svc._vlm_reconsider(img_b, _block(_quad(30, 20)))
 
-    assert len(vlm.calls) == 1, f"跨图应复用，实际 {len(vlm.calls)} 次"
+    assert vlm.calls == 1, f"跨图应复用，实际 {vlm.calls} 次"
     assert svc.vlm_cache_hits == 1
 
 
@@ -181,3 +188,92 @@ def test_crop_key_is_deterministic_and_content_sensitive() -> None:
     assert ka and kb and kc
     assert ka == kb
     assert ka != kc
+
+
+# ----------------------------------------------------------------------
+# 兜底整条链路（比上面几个只测缓存更上层）
+# ----------------------------------------------------------------------
+
+
+def _service_with_threshold(threshold: float):
+    from novaloc.images.service import TextureTranslator
+
+    cfg = Config()
+    cfg.ocr.vlm_threshold = threshold
+    cfg.ocr.vlm_fallback = True
+    return TextureTranslator(Context(config=cfg, events=EventBus()))
+
+
+def test_rescue_replaces_text_and_warns() -> None:
+    """低置信度块应被 VLM 改写，并留下 ``vlm_reread`` 警告。
+
+    这是"OCR → 判低置信度 → 裁图 → 问 VLM → 改写文字（不动框）"
+    的完整路径。之所以要测到这一层：视觉适配器曾经有两个
+    AttributeError 让整条路径**从来没通过**，而每个组件的单元测试
+    都是绿的 —— 因为没人把两头接起来跑过。
+    """
+    svc = _service_with_threshold(0.999)
+    vlm = FakeVLM(default="CORRECTED")
+    svc._vlm = vlm
+    svc._vlm_tried = True
+
+    img = np.full((40, 120, 3), 255, dtype=np.uint8)
+    img[10:26, 20:100] = 0
+    block = _block(_quad(20, 10, 80, 16), source="WRONG", conf=0.1)
+    out = svc._vlm_rescue(img, [block])
+
+    assert vlm.calls == 1, "兜底没被触发"
+    assert out[0].source == "CORRECTED"
+    assert "vlm_reread" in out[0].warnings
+    # **框必须原样保留**：VLM 的定位精度比专用 OCR 差两个数量级
+    assert out[0].quad == block.quad, "兜底改动了文字框 —— 排版会毁"
+    assert out[0].box == block.box, "兜底改动了外接框"
+
+
+def test_rescue_keeps_ocr_result_when_vlm_says_same() -> None:
+    """VLM 给出相同文字时不应替换（避免无意义的"已修正"记录）。"""
+    svc = _service_with_threshold(0.999)
+    vlm = FakeVLM(default="Same")
+    svc._vlm = vlm
+    svc._vlm_tried = True
+
+    img = np.full((40, 120, 3), 255, dtype=np.uint8)
+    block = _block(_quad(20, 10, 80, 16), source="Same", conf=0.1)
+    svc._vlm_rescue(img, [block])
+
+    assert vlm.calls == 1
+    assert svc.vlm_fixes == 0, "文字没变却计入了修正"
+    assert "vlm_reread" not in (block.warnings or [])
+
+
+def test_rescue_keeps_ocr_result_when_vlm_returns_empty() -> None:
+    """VLM 读不出来（空串）时必须保留 OCR 原结果。
+
+    这是"兜底把好结果搞坏"的防线：空串绝不能当成"更正"去覆盖。
+    实测视觉模型在描述样式时确实会返回空。
+    """
+    svc = _service_with_threshold(0.999)
+    vlm = FakeVLM(default="")
+    svc._vlm = vlm
+    svc._vlm_tried = True
+
+    img = np.full((40, 120, 3), 255, dtype=np.uint8)
+    block = _block(_quad(20, 10, 80, 16), source="KEEP ME", conf=0.1)
+    svc._vlm_rescue(img, [block])
+
+    assert block.source == "KEEP ME", "空结果覆盖掉了原本正确的 OCR 文字"
+    assert svc.vlm_fixes == 0
+
+
+def test_rescue_skipped_when_confidence_high() -> None:
+    """置信度高于阈值时**不应**调用 VLM（省时间，也避免无故改动）。"""
+    svc = _service_with_threshold(0.5)
+    vlm = FakeVLM(default="X")
+    svc._vlm = vlm
+    svc._vlm_tried = True
+
+    img = np.full((40, 120, 3), 255, dtype=np.uint8)
+    block = _block(_quad(20, 10, 80, 16), source="Good", conf=0.99)
+    svc._vlm_rescue(img, [block])
+
+    assert vlm.calls == 0, "高置信度不该触发兜底"

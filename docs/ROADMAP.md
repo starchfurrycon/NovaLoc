@@ -392,6 +392,7 @@ API 也已经有 `GET /api/projects/{pid}/images/{uid}/annotated`。
 | 9 | ~~视觉兜底**逐块串行、无缓存**~~ | **已修（缓存部分）**：新增裁剪图缓存 `_vlm_cache`，键为裁剪像素的 sha1。键用像素而非文字，因为这里的问题恰恰是「我们还不知道文字是什么」；而「像素完全相同 ⇒ 文字相同」是充分条件且可精确判定。缓存**跨图片**存活（与图片无关），因为同一套 UI 图形在不同图里反复出现。空结果也缓存 —— 读不出来时重问通常还是读不出来，而重复的失败重问正是最浪费的部分。实测一张图里三处相同按钮：VLM 调用 3 次 → 1 次。**串行部分保留**：并发会争抢 GPU，与 #8 一起属于有意保守，见该项 | 🟡 部分完成（缓存已加，并发仍串行） |
 | 10 | `novaloc serve --reload` 曾是空操作 | **已修**：uvicorn 的 reload 需要可导入字符串才能起子进程；传 app 实例时它只打一行 warning 然后静默忽略。已改为 `"novaloc.api.app:create_app"` + `factory=True` | ✅ 已完成 |
 | 11 | `Providers.diagnostics()` 把四个引擎全报成不可用 | **已修**：对 `kind == "engine"` 也调 `available()`，而 `EngineAdapter` 没有该方法，于是 detail 是 `'RpgMakerAdapter' object has no attribute 'available'`。用户看到"四个引擎全部不可用"会以为工具坏了 | ✅ 已完成 |
+| 12 | ~~`translate/vision_ollama.py` 的视觉兜底**从来没有工作过**（四个叠加的 bug）~~ | **已修**。四个 bug 全被 `available()` 的 `except Exception` 吞成「Ollama 探测失败：…」，而 `doctor` 只显示「不可用」，看起来像环境问题：① `OllamaClient(cfg)` —— 构造函数收的是 **host 字符串**，不是配置对象，于是 `host.rstrip('/')` 抛 `'OllamaConfig' object has no attribute 'rstrip'`；② `client.ping()` —— 方法是 `is_running()`，没有 `ping()`；③ `cfg.timeout_s` —— 字段名是 `request_timeout_s`；④ **最隐蔽的一个**：`_extract_text()` 只认 JSON **对象**，而 `VISION_READ_PROMPT` 明确要求模型「只输出 JSON **数组**」。数组解析不出来就一路降级到「裸文本」，把**整段原始 JSON 字符串**当识别结果返回 ——文字非空，于是 `_vlm_rescue` 会把它当作「更可信的读数」**覆盖掉原本正确的 OCR 结果**（静默损坏，且日志显示「兜底生效」）。顺带修了客套前缀剥离「试一遍就结束」的问题：前缀会叠着出现（`好的，图中文字是：…`），已改为循环到收敛。`tests/test_vision_ollama.py` 20 项守住（含「源码里不得再出现 `ping(`」与「绝不返回原始 JSON」），`tests/test_vlm_cache.py` 里另有 4 项跑通完整兜底链路并断言**文字框不被改动** | ✅ 已完成 |
 
 ---
 
@@ -419,9 +420,9 @@ API 也已经有 `GET /api/projects/{pid}/images/{uid}/annotated`。
 
 | 顺序 | 事项 | 理由 |
 |---|---|---|
-| 1 | 修第 3 节的第 6 项（`testpaths` 失配） | 半天工作量，直接决定"改代码后能不能自动发现回归" |
-| 2 | 修第 3 节的第 1、2 项（`_pick_font`、`stage_apply` 的补丁过滤） | 直接影响"字体/贴图能不能用上"，属于正确性 bug |
-| 3 | 修第 3 节的第 9 项（视觉兜底加缓存） | 改动很小，但能显著减少重复的模型调用 |
+| 1 | ~~修第 3 节的第 6 项（`testpaths` 失配）~~ **已完成** | 现在有 21 个套件 / 81 个用例，CI 也按 marker 跑其中的纯逻辑部分 |
+| 2 | ~~修第 3 节的第 1、2 项（`_pick_font`、`stage_apply` 的补丁过滤）~~ **已完成** | 两项都是正确性 bug，已修并有回归测试守住 |
+| 3 | ~~修第 3 节的第 9 项（视觉兜底加缓存）~~ **已完成** | 裁剪图缓存已加（键为像素 sha1，跨图存活）。同时发现并修掉视觉适配器四个叠加的 bug —— 该链路**此前从未工作过**（见第 3 节 #12）。并发仍串行（有意保守，见 #8） |
 | 4 | 第 2.5 节的 **RPG Maker VX Ace / XP** | 与现有 MV/MZ 代码高度复用，解锁一整类游戏 |
 | 5 | 第 2.6 节 `review.py` 接触印样 | 纯提升可用性，工作量小，直接缓解"审校效率低" |
 | 6 | 第 2.4 节通用归档解压 | 复用已有的 `extract_archive()`，中等工作量 |
