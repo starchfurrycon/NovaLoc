@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .coverage import FontInfo, load_font_info
+from .textutil import NON_RENDERING
+from .textutil import is_ignorable as _is_ignorable_impl
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +157,16 @@ def build_required_charset(
 
     默认把**原文**也算进去 —— 因为游戏里总有没被翻译的串（人名、型号、代码），
     它们仍然要用这个字体渲染出来。
+
+    ⚠️ **换行/制表/零宽字符在这里就被剔掉**（见 :func:`is_ignorable`）。
+    以前这里不过滤，而下游 `merge.py` 会把译文里的 ``\\n`` 当成
+    "字体缺这个字形"，导致覆盖率永远差一点点、补丁判定失败、
+    整个字体阶段中止。真实游戏上表现就是"字体适配失败，流程走不下去"，
+    而报错信息完全指不到真正的原因。
+
+    在**源头**过滤（而不是只在下游容忍）是刻意的：字符集是这个模块的
+    对外产物，会落盘到 `fonts/charset.json` 供审校与报告用，
+    里面不该出现"永远不可能有字形"的字符。
     """
     parts: list[str] = []
     for group in (translated_texts or [], source_texts or []):
@@ -162,7 +174,8 @@ def build_required_charset(
     if include_ui_safe:
         parts.append(UI_SAFE_CHARS)
     parts.append(extra)
-    return "".join(sorted(set("".join(parts))))
+    chars = {c for c in "".join(parts) if not is_ignorable(c)}
+    return "".join(sorted(chars))
 
 
 def plan_charset(
@@ -233,11 +246,23 @@ def plan_charset(
     return plan
 
 
-_NON_RENDERING = set("\t\n\r\u200b\u200c\u200d\ufeff")
+_NON_RENDERING = NON_RENDERING
+
+
+def is_ignorable(ch: str) -> bool:
+    """这个字符是不是**不需要字形**的（控制/换行/零宽）。
+
+    实现在 :mod:`novaloc.fonts.textutil` —— 放在那里是因为
+    `coverage.py` 也要用同一个判定，而它不能再从本模块导入（会循环）。
+
+    保留这个别名是为了让 `charset.is_ignorable` 这个既有调用点继续可用。
+    """
+    return _is_ignorable_impl(ch)
 
 
 def _is_ignorable(ch: str) -> bool:
-    return not ch or ch in _NON_RENDERING
+    """``is_ignorable`` 的旧名，保留以兼容既有调用。"""
+    return _is_ignorable_impl(ch)
 
 
 def assert_plannable(plan: CharsetPlan) -> None:

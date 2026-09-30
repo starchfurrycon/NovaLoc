@@ -36,6 +36,7 @@ from fontTools.ttLib.scaleUpem import scale_upem
 from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
 from .coverage import load_font_info
+from .textutil import is_ignorable
 
 log = logging.getLogger(__name__)
 
@@ -135,6 +136,67 @@ def _as_ttf_path(path: Path) -> Path:
     if path.suffix.lower() in (".ttc", ".otc"):
         return path.with_suffix(".ttf")
     return path
+
+
+#: 已知的 fontTools 包装格式。'woff' 内置于 fontTools；
+#: 'woff2' 需要可选的 ``brotli`` 依赖。
+_PACKAGED_FLAVORS = ("woff", "woff2")
+
+
+def _detect_flavor(path: Path) -> str | None:
+    """读一个字体文件的包装格式（``'woff'`` / ``'woff2'`` / ``None``）。
+
+    实测真实 RPG Maker MZ 游戏用的是 ``.woff``：
+
+    * 原文件头 ``77 4f 46 46``（``wOFF``）、``flavor='woff'``；
+    * 补丁后的产物头 ``00 01 00 00``、``flavor=None`` ——
+      **格式变了**。
+
+    为什么必须保住原格式：游戏是用
+    ``new FontFace(family, "url(fonts/xxx.woff)")`` 加载的，
+    **浏览器只按文件内容识别格式，不看扩展名**。所以纯 sfnt 内容
+    通常也能加载（这也是为什么它没在测试里立刻暴露）。但把一个
+    ``.woff`` 扩展名的文件换成 sfnt 内容是没必要的风险 ——
+    有加载器会看 MIME/扩展名，也有工具链会按扩展名解析。
+
+    更直接的理由：``fontTools`` 支持写回 woff，代价为零，
+    那就没有理由不保持原样。
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return None
+    if head == b"wOFF":
+        return "woff"
+    if head == b"wOF2":
+        return "woff2"
+    return None
+
+
+def _apply_flavor(font: TTFont, flavor: str | None, out_path: Path) -> str | None:
+    """把包装格式设到 ``font`` 上，让 ``save()`` 产出与原文件一致的格式。
+
+    返回**实际**会用的 flavor（可能因为缺 ``brotli`` 而降级为 ``None``）。
+
+    只对 ``.woff`` / ``.woff2`` 扩展名的产物生效，避免把 ``.ttf``
+    也包成 woff（那会让 Pillow / Unity 之外的加载器困惑）。
+    """
+    if flavor is None or out_path.suffix.lower() not in (".woff", ".woff2"):
+        font.flavor = None
+        return None
+    if flavor == "woff2":
+        try:
+            import brotli  # noqa: F401
+        except ImportError:
+            log.warning(
+                "原字体是 WOFF2，但本机没装 brotli，无法写回 WOFF2 —— "
+                "产物将写成纯 sfnt（内容仍是完整字体，多数浏览器按内容识别仍可加载）"
+            )
+            font.flavor = None
+            return None
+    font.flavor = flavor
+    return flavor
 
 
 def subset_font(
@@ -509,6 +571,7 @@ def merge_fonts(
     report = MergeReport(ok=False, method="merge")
     required = set(required_chars) | set(extra_symbols)
     required_cps = {ord(c) for c in required}
+    base_flavor = _detect_flavor(base_path)
 
     base_info = load_font_info(base_path, base_face_index)
     if base_info is None or not base_info.cmap:
@@ -523,6 +586,7 @@ def merge_fonts(
         report.out_path = _as_ttf_path(out_path)
         report.out_path.parent.mkdir(parents=True, exist_ok=True)
         font = open_font(base_path, base_face_index)
+        _apply_flavor(font, base_flavor, report.out_path)
         font.save(report.out_path)
         font.close()
         report.ok = True
@@ -621,6 +685,8 @@ def merge_fonts(
         # Merger 总是产出 TTF 风格的 sfnt；若基础是 TTC，强制以 .ttf 落盘
         final_out = _as_ttf_path(out_path)
         final_out.parent.mkdir(parents=True, exist_ok=True)
+        # 保住基础字体的包装格式（.woff 不要变成裸 sfnt），见 _detect_flavor
+        _apply_flavor(merged, base_flavor, final_out)
         merged.save(final_out)
         out_path = final_out
 
@@ -631,7 +697,10 @@ def merge_fonts(
     report.coverage_after = after.coverage_ratio("".join(sorted(required)))
     report.added_glyphs = max(0, after.num_glyphs - base_info.num_glyphs)
     report.out_path = out_path
-    report.ok = report.coverage_after >= 0.999
+    # 判定同时看覆盖率与 missing_chars：只卡覆盖率会让
+    # "缺 1 个字但基数很大"（例如 549 字里缺 1 个 = 99.82%）漏过阈值检查；
+    # 只卡 missing_chars 又会忽略"覆盖率不足"。
+    report.ok = report.coverage_after >= 0.999 and not report.missing_chars
 
     if not report.ok:
         missing = after.missing("".join(sorted(required)))
@@ -664,10 +733,14 @@ def merge_fonts_multi(
     所以必须按优先级回退，让每个字符取"第一个拥有它的字体"。
 
     ``sources`` 顺序即优先级；靠前的字体覆盖靠后的。
+
+    **产物会保持基础字体的包装格式**（``.woff`` 仍是 ``wOFF`` 头），
+    理由见 :func:`_detect_flavor`。
     """
     report = MergeReport(ok=False, method="merge_multi")
     required = set(required_chars) | set(extra_symbols)
     required_cps = {ord(c) for c in required}
+    base_flavor = _detect_flavor(base_path)
 
     base_info = load_font_info(base_path, base_face_index)
     if base_info is None or not base_info.cmap:
@@ -680,6 +753,7 @@ def merge_fonts_multi(
         report.out_path = _as_ttf_path(out_path)
         report.out_path.parent.mkdir(parents=True, exist_ok=True)
         f = open_font(base_path, base_face_index)
+        _apply_flavor(f, base_flavor, report.out_path)
         f.save(report.out_path)
         f.close()
         report.ok = True
@@ -745,6 +819,14 @@ def merge_fonts_multi(
             raise MergeError("没有任何补充字体提供缺失字形，无法补齐")
 
         if remaining:
+            # 二次防线：控制/零宽字符永远不会有字形，不算"缺字"。
+            # 正常路径上 `build_required_charset` 已经把它们滤掉了，
+            # 但 `patch_font` 是可以被单独调用的公开接口，调用方传进来的
+            # 字符集不一定干净。曾经就是译文里的一个 `\n` 让覆盖率卡在
+            # 99.934%、补丁判定失败、整个字体阶段中止。
+            remaining = {cp for cp in remaining if not is_ignorable(chr(cp))}
+
+        if remaining:
             sample = "".join(chr(c) for c in sorted(remaining)[:60])
             report.warnings.append(f"所有补充字体合计仍缺 {len(remaining)} 个字符：{sample}")
             report.missing_chars = "".join(chr(c) for c in sorted(remaining))
@@ -794,6 +876,8 @@ def merge_fonts_multi(
 
         final_out = _as_ttf_path(out_path)
         final_out.parent.mkdir(parents=True, exist_ok=True)
+        # 保住基础字体的包装格式（.woff 不要变成裸 sfnt），见 _detect_flavor
+        _apply_flavor(merged, base_flavor, final_out)
         merged.save(final_out)
         out_path = final_out
 
@@ -870,11 +954,20 @@ def subset_font_for_chars(
     face_index: int = 0,
     keep_symbols: str = " 0123456789.,:;!?'\"()[]{}%+-–—_/@#&*=<>&·…、。！？：；「」『』（）《》【】—～",
 ) -> Path:
-    """把字体裁剪到只含 ``chars``（外加基础符号），用于减小注入体积。"""
+    """把字体裁剪到只含 ``chars``（外加基础符号），用于减小注入体积。
+
+    ⚠️ 这里**不**再把 ``0x09/0x0A/0x0D`` 塞进要保留的码点里。
+    它们是 :func:`~novaloc.fonts.textutil.is_ignorable` 认定的"不需要字形"
+    字符 —— 引擎用排版处理换行，不靠字体里的字形。硬塞进去会和
+    "覆盖率的分子分母都用同一套过滤"这条约定打架
+    （覆盖率会显示永远差几个字）。
+    """
     font = open_font(src, face_index)
-    cps = {ord(c) for c in set(chars) | set(keep_symbols)} | {0x20, 0x09, 0x0A, 0x0D}
+    cps = {ord(c) for c in set(chars) | set(keep_symbols)}
     subset_font(font, cps, retain_gids=False, drop_layout=True)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # 保住原字体的包装格式（.woff 不要变成裸 sfnt），见 _detect_flavor
+    _apply_flavor(font, _detect_flavor(src), out)
     font.save(out)
     return out
 

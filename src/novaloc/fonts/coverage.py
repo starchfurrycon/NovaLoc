@@ -18,6 +18,7 @@ from fontTools.ttLib import TTFont, TTLibError
 
 from ..models import FontCoverage
 from . import catalog
+from .textutil import is_ignorable
 
 log = logging.getLogger(__name__)
 
@@ -83,20 +84,40 @@ class FontInfo:
         return bool(self.cmap) and ord(ch) in self.cmap
 
     def missing(self, chars: str) -> list[str]:
+        """列出 ``chars`` 里这个字体没有字形的字符。
+
+        **不渲染的字符（``\\n`` / ``\\t`` / 零宽）不算缺字** ——
+        没有任何字体有它们的字形。以前这里不过滤，于是译文里的换行
+        会被报成"缺 1 个字符"，覆盖率停在 99.93%，触发"缺字就硬失败"
+        的契约、让整个字体阶段中止。真实游戏上就是"字体适配永远失败"。
+        """
         if not self.cmap:
-            return sorted(set(chars))
+            return sorted({c for c in chars if not is_ignorable(c)})
         seen: dict[str, None] = {}
         for ch in chars:
+            if is_ignorable(ch):
+                continue
             if ord(ch) not in self.cmap:
                 seen.setdefault(ch, None)
         return sorted(seen)
 
     def coverage_ratio(self, chars: str) -> float:
+        """覆盖率 = 有字形的字符数 / **需要字形的**字符数。
+
+        ⚠️ 分子与分母必须用**同一套**过滤。
+        以前 :meth:`missing` 和这里的 ``set(chars)`` 各算各的：
+        ``missing`` 把 ``\\n`` 算进"缺"（因为 cmap 里没有），
+        分母却把 ``\\n`` 算进"总数"，两边同时对不上，
+        于是页面上/报告里显示的覆盖率**偏低**，而且和
+        `merge.py` 算出来的 ``coverage_after`` 不是同一个数。
+        """
         if not chars:
             return 1.0
-        uniq = set(chars)
+        uniq = {c for c in set(chars) if not is_ignorable(c)}
+        if not uniq:
+            return 1.0
         miss = len(self.missing(chars))
-        return 1.0 - miss / max(1, len(uniq))
+        return 1.0 - miss / len(uniq)
 
 
 def _name_of(font: TTFont, name_id: int) -> str:
