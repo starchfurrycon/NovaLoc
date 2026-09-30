@@ -142,6 +142,19 @@ class PPOcrV6Engine:
         return "DirectML" if bool(self._opt("use_directml", True)) else "CPU"
 
     def available(self) -> tuple[bool, str]:
+        """是否**可以离线**使用。
+
+        这里刻意**不**调用 :meth:`_ensure` —— 那会实例化 RapidOCR，而
+        RapidOCR 在模型文件缺失时会**联网下载**。本工具承诺全离线可用，
+        所以"自检说可用"必须在断网时也成立：
+
+        * 模型文件齐全 → 真加载一次确认能跑（此时不会联网）；
+        * 模型文件缺失 → 直接报不可用，并说清缺什么、怎么补。
+
+        之前的实现只 `import rapidocr` 就算可用，
+        于是 `doctor` 显示 ✅，但首次识别才去下载/失败 —— 离线环境下
+        用户会看到一个成功自检跟着一个莫名其妙的运行时错误。
+        """
         if self._ready is not None:
             return self._ready
         try:
@@ -152,12 +165,39 @@ class PPOcrV6Engine:
         if self._load_error:
             self._ready = (False, self._load_error)
             return self._ready
+
+        missing = self.missing_models()
+        if missing:
+            self._ready = (
+                False,
+                f"缺少 {len(missing)} 个离线模型：{'、'.join(missing)}；"
+                f"请放到 {self.model_dir()}（首次联网运行会自动下载，"
+                f"或见 README 的手动下载说明）",
+            )
+            return self._ready
+
         try:
             self._ensure()
             self._ready = (True, f"PP-OCRv6 {self.tier}（{self._ep_label()}）")
         except Exception as exc:  # noqa: BLE001
             self._ready = (False, f"PP-OCRv6 初始化失败：{exc}")
         return self._ready
+
+    def missing_models(self) -> list[str]:
+        """列出当前档位缺哪些模型文件（空列表 = 齐全）。
+
+        按档位查：RapidOCR 的 `Global.model_root_dir` 下按固定文件名存放
+        （如 ``PP-OCRv6_det_medium.onnx``），所以可以直接按名判断，
+        不必去猜它的下载逻辑。
+        """
+        d = self.model_dir()
+        want: list[str] = []
+        tier = self.tier
+        for prefix in ("det", "rec"):
+            want.append(f"PP-OCRv6_{prefix}_{tier}.onnx")
+        if bool(self._opt("use_cls", False)):
+            want.append("ch_ppocr_mobile_v2.0_cls_mobile.onnx")
+        return [n for n in want if not (d / n).is_file()]
 
     # ------------------------------------------------------------------
     # 引擎构造

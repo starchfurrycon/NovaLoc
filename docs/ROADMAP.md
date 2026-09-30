@@ -138,13 +138,13 @@ API 文档页：`/api/docs`。
 
 ### 1.7 测试现状（重要）
 
-**测试代码在 `tests/` 下。** 共 16 个套件，覆盖
+**测试代码在 `tests/` 下。** 共 20 个套件，覆盖
 占位符、JSON 解析、字体合并、字体接线、字符集合并、
 贴图管线、贴图服务、翻译集成、四个引擎的抽取、端到端 API（含 WebSocket）、
 流水线端到端，以及**用真实字体**验证字体合并的 `test_font_real.py`。
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q          # 全量 18/18
+.\.venv\Scripts\python.exe -m pytest tests -q          # 全量 57/57
 .\.venv\Scripts\python.exe tests\test_font_real.py     # 单跑，输出实测数字
 ```
 
@@ -383,13 +383,13 @@ API 也已经有 `GET /api/projects/{pid}/images/{uid}/annotated`。
 |---|---|---|---|
 | 1 | ~~`images/service.py::_pick_font()` 用硬编码路径列表找中文字体；`FontSpec.local_path` 属性不存在，所以目录查找分支实际不生效~~ | **已修**：改走 `FontService`（系统字体索引 → 缓存 → 可再分发下载）。顺带发现 `_find_system_font()` 每次要 rglob 并逐个解析整个字体目录（实测 0.3~1.5 秒/次），而 `_pick_font` 会按十几个家族名各找一次 —— 每张贴图白花十几秒。已加进程级索引缓存（首次 2.2 秒，之后 0.000 秒） | ✅ 已完成 |
 | 2 | ~~`pipeline/stage_apply` 只把 `action == "merge"` 的字体补丁传给适配器~~ | **已修**。这里有两个叠加的错：`stage_fonts` 把 `action` 硬编码成 `"merge"`（与 `cfg.font.strategy` 无关），`stage_apply` 又按 `action == "merge"` 过滤 —— 于是 `replace` / `fallback_only` 的产物虽然 `ok=True`、`out_path` 也有值，却**永远不会回写**，文件躺在工作区里而游戏毫无变化，且不报错。现在 `stage_fonts` 记录真实的 `pr.merge.method`，`stage_apply` 改用 `font_patch_records()` 按"注入成功且有产物"判断（只排除 `none`）。`tests/test_pipeline_e2e.py` 第 7a 节直接喂四种 action 守住它 | ✅ 已完成 |
-| 3 | `engines/unity.py` 与 `engines/loose.py` **没有覆写 `wire_fonts()`** | 字体文件放进了输出目录，但引擎不会去用它（需要用户手工处理，或等第 2.3 节） | 🔜 待修（依赖 2.1） |
+| 3 | ~~`engines/unity.py` 与 `engines/loose.py` **没有覆写 `wire_fonts()`**~~ | **已修**：两个适配器都覆写了 `wire_fonts()`，并抽出公共的 `EngineAdapter.copy_fonts_into()`。**但刻意如实说明限制**：Unity 的 UI 文字走 TextMeshPro，渲染用的是**预烘焙图集**（`m_AtlasTextures` 指向一张贴图，字形是位图块），换 TTF 对已烘焙资源**没有任何影响** —— 重新烘焙需要解析 `TMP_FontAsset` 序列化格式、按原字号重新光栅化并重算 `m_GlyphTable`/`m_CharacterTable`/`m_FaceInfo`，且必须用 Unity 自身的排版度量才能与游戏一致，是独立的大工程，本版**未实现**。所以 Unity 的处理是：字体复制到 `*_Data/StreamingAssets/_novaloc_fonts/`（StreamingAssets 会被原样打进构建，是运行时最可能读到的位置）+ 检测到 TMP 资源时明确输出「需要重新烘焙」与 Font Asset Creator 的具体步骤 + 提到动态（Dynamic）TMP 资源这一真实例外（那种情况换 StreamingAssets 里的字体确实有效）。散装模式则是：就地替换同名文件 + 集中放到 `_fonts/` + 说明无法自动改字体指向。**宁可明确告知需要人工介入，也不产出「看着成功、实际没用」的结果。** `tests/test_font_wiring_engines.py` 13 项守住（含「必须覆写」与「必须如实说明」） | ✅ 已完成 |
 | 4 | ~~`translate` 包没有 `__init__.py`~~ | 已修：`src/novaloc/translate/__init__.py` 已加入。它刻意**不在 `__init__` 里即时导入子模块**（避免循环依赖与"一 import 就注册 provider"的副作用），改用 `__getattr__` 做懒加载 | ✅ 已完成 |
 | 5 | ~~配置有两套格式：`<data_root>/config.json` 与 `<config_dir>/config.toml`~~ | **已修**：统一到 `<data_root>/config.json`。`Config.load/save` 是唯一实现，API 与 CLI 都委托给它；旧 TOML 只在 JSON 缺失时作只读回退并**自动迁移**，老用户不丢配置 | ✅ 已完成 |
-| 6 | ~~`tests/` 目录不存在，而 `testpaths = ["tests"]`~~ | **已修**：16 个套件搬进 `tests/`，`pytest tests -q` 全量 18/18。CI 也改为按 marker 跑无需模型/GPU 的 12 个（之前 CI **完全不跑 pytest**，纯逻辑回归只能靠人肉发现） | ✅ 已完成 |
-| 7 | `ocr_ppocrv6.py::available()` 只检查 `import rapidocr`，不检查模型是否已下载 | `doctor` 的适配器表里 OCR 会显示"可用"，但首次识别会去联网下载模型；离线环境下会失败 | 🔜 待修 |
+| 6 | ~~`tests/` 目录不存在，而 `testpaths = ["tests"]`~~ | **已修**：套件搬进 `tests/`，`pytest tests -q` 全量 57/57。CI 也改为按 marker 跑无需模型/GPU 的 12 个（之前 CI **完全不跑 pytest**，纯逻辑回归只能靠人肉发现） | ✅ 已完成 |
+| 7 | ~~`ocr_ppocrv6.py::available()` 只检查 `import rapidocr`，不检查模型是否已下载~~ | **已修**：新增 `missing_models()` 按档位检查 `PP-OCRv6_{det,rec}_{tier}.onnx` 是否在 `model_root_dir` 下，`available()` 在**进入 RapidOCR 之前**就据此返回，并点明缺哪个文件、该放哪里。这条对「全离线优先」是硬伤：自检显示 ✅ 但首次识别才联网下载（断网则直接失败），用户完全无法自查。`tests/test_ocr_available.py` 3 项守住，其中一项断言`available()` **不产生任何下载文件** | ✅ 已完成 |
 | 8 | `stage_images_localize` 逐图串行 | 贴图多的大项目耗时长。并发会争抢 GPU，所以是有意保守，但可以做成"OCR 与重绘流水线化" | 🔍 调研中 |
-| 9 | 视觉兜底**逐块串行、无缓存** | 一张图里低置信度块多时会连发多次 `/api/chat`；同一文字在别的图上重复出现要重问 | 🔜 待修（低成本高收益） |
+| 9 | ~~视觉兜底**逐块串行、无缓存**~~ | **已修（缓存部分）**：新增裁剪图缓存 `_vlm_cache`，键为裁剪像素的 sha1。键用像素而非文字，因为这里的问题恰恰是「我们还不知道文字是什么」；而「像素完全相同 ⇒ 文字相同」是充分条件且可精确判定。缓存**跨图片**存活（与图片无关），因为同一套 UI 图形在不同图里反复出现。空结果也缓存 —— 读不出来时重问通常还是读不出来，而重复的失败重问正是最浪费的部分。实测一张图里三处相同按钮：VLM 调用 3 次 → 1 次。**串行部分保留**：并发会争抢 GPU，与 #8 一起属于有意保守，见该项 | 🟡 部分完成（缓存已加，并发仍串行） |
 | 10 | `novaloc serve --reload` 曾是空操作 | **已修**：uvicorn 的 reload 需要可导入字符串才能起子进程；传 app 实例时它只打一行 warning 然后静默忽略。已改为 `"novaloc.api.app:create_app"` + `factory=True` | ✅ 已完成 |
 | 11 | `Providers.diagnostics()` 把四个引擎全报成不可用 | **已修**：对 `kind == "engine"` 也调 `available()`，而 `EngineAdapter` 没有该方法，于是 detail 是 `'RpgMakerAdapter' object has no attribute 'available'`。用户看到"四个引擎全部不可用"会以为工具坏了 | ✅ 已完成 |
 

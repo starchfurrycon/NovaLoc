@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 
 from ..core.registry import register
@@ -28,6 +29,7 @@ log = logging.getLogger(__name__)
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tga", ".gif")
 TEXT_SUFFIXES = (".txt", ".json", ".csv", ".tsv", ".xml", ".lang", ".properties", ".ini")
+FONT_SUFFIXES = (".ttf", ".otf", ".ttc", ".woff", ".woff2")
 
 _NOT_TEXT_RE = re.compile(r"^[\s\d\W_]+$", re.UNICODE)
 
@@ -185,6 +187,56 @@ class LooseFilesAdapter(EngineAdapter):
                 rel = self._rel(game_dir, p)
                 out.append(FontCoverage(font_id=rel, path=rel, family=p.stem, is_game_font=True))
         return out
+
+    def wire_fonts(self, out_dir: Path, installed: dict[str, str]) -> list[str]:
+        """散装模式的字体接线：**就地替换**同名文件，并给出人工步骤。
+
+        散装模式没有引擎配置可改 —— 字体被谁加载、从哪个路径加载，
+        只有用户（或游戏本身）知道。所以能做的、也确实有用的是：
+
+        1. 把补好的字体复制到输出目录的 ``_fonts/``，让用户一眼能找到；
+        2. 如果输出目录里本来就存在**同名**的字体文件，直接替换它 ——
+           这是散装导出最常见的情形（用户导出的资源里带着原字体），
+           替换同名文件就有相当大概率被游戏读到；
+        3. 明确说明"这一步不保证生效"，以及不生效时该怎么手工处理。
+
+        刻意**不**去猜游戏的字体加载逻辑：猜错会产出"看起来改了但没生效"
+        的结果，比明确告知需要人工介入更糟。
+        """
+        notes: list[str] = []
+        if not installed:
+            return notes
+
+        # ① 集中放到 _fonts/ 便于查找
+        notes.extend(self.copy_fonts_into(out_dir, installed, out_dir / "_fonts"))
+
+        # ② 同名文件就地替换
+        by_name: dict[str, Path] = {}
+        for p in out_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in FONT_SUFFIXES:
+                by_name.setdefault(p.name.lower(), p)
+
+        replaced = 0
+        for new_rel in installed.values():
+            src = Path(new_rel)
+            if not src.is_file():
+                continue
+            dst = by_name.get(src.name.lower())
+            if dst is None or dst.resolve() == src.resolve():
+                continue
+            shutil.copy2(src, dst)
+            replaced += 1
+            notes.append(f"已用补好的字体替换同名文件：{self._rel(out_dir, dst)}")
+        if replaced:
+            notes.append(f"共就地替换 {replaced} 个同名字体文件")
+
+        # ③ 说清楚边界
+        notes.append(
+            "⚠️ 散装模式无法自动改游戏的字体指向：以上只是「把正确字体放到它可能被读取的位置」。"
+            "若游戏仍显示口口口，请按游戏自身的方式指定字体"
+            "（常见做法：改游戏配置里的字体名/路径，或把新字体改名成原字体名后覆盖回去）。"
+        )
+        return notes
 
     # ------------------------------------------------------------------
     # 回写

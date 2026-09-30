@@ -344,6 +344,114 @@ class UnityAdapter(EngineAdapter):
                 out.append(FontCoverage(font_id=rel, path=rel, family=p.stem, is_game_font=True))
         return out
 
+    #: TMP 字体资源的扩展名。``.asset`` 是文本序列化的 TMP_FontAsset，
+    #: ``.bytes`` / 无扩展名的是烘焙进 AssetBundle 的版本。
+    TMP_ASSET_SUFFIXES = (".asset",)
+
+    def _find_tmp_assets(self, game_dir: Path) -> list[Path]:
+        """找出目录里像 TMP 字体资源（含图集）的文件。
+
+        TextMeshPro 的字体资源由两部分组成：``TMP_FontAsset``（字形表 +
+        ``m_AtlasTextures`` 引用）和一张**预渲染的图集贴图**。只换 TTF 是
+        **无效**的：游戏渲染时直接用图集里的位图，根本不会去读 TTF。
+        所以这里要先探测有没有图集，再决定怎么说。
+        """
+        hits: list[Path] = []
+        for p in game_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            s = p.suffix.lower()
+            if s in self.TMP_ASSET_SUFFIXES:
+                # .asset 里出现 TMP 关键字才算（避免把普通资源当字体）
+                try:
+                    head = p.read_bytes()[:4096]
+                except OSError:
+                    continue
+                if b"TMP_FontAsset" in head or b"m_AtlasTextures" in head or b"m_FaceInfo" in head:
+                    hits.append(p)
+            elif s in (".png",) and "atlas" in p.name.lower():
+                hits.append(p)
+        return hits
+
+    def wire_fonts(self, out_dir: Path, installed: dict[str, str]) -> list[str]:
+        """Unity 的字体接线：放好字体，并**如实说明 TMP 图集这道坎**。
+
+        为什么不能像 Ren'Py / RPG Maker 那样自动改配置：
+
+        Unity 的 UI 文字几乎都走 TextMeshPro，而 TMP 渲染用的是**预烘焙
+        图集**（``m_AtlasTextures`` 指向一张贴图，字形是这张贴图上的
+        位图块）。换掉 TTF 文件对已烘焙的资源**没有任何影响** ——
+        游戏不会去读那个 TTF。要让中文出现，必须重新烘焙图集，
+        而重新烘焙需要：
+        * 解析 ``TMP_FontAsset`` 的二进制/文本序列化格式，
+        * 按原有字号/图集尺寸把新字体的字形重新光栅化并排进图集，
+        * 重算 ``m_GlyphTable`` / ``m_CharacterTable`` / ``m_FaceInfo``。
+
+        这是一个独立的、相当大的工程（且必须用 Unity 自身的排版度量才能
+        和游戏完全一致），本项目当前**没有**实现。所以这里：
+
+        1. 把补好的字体复制到 ``StreamingAssets/_novaloc_fonts/`` ——
+           ``StreamingAssets`` 会被原样打进构建，是**运行时能被读到**
+           的最稳妥位置；
+        2. 如果探测到 TMP 图集资源，明确指出"需要重新烘焙"，并给出用
+           Unity 编辑器一键重建的步骤；
+        3. 绝不假装已经修好 —— 虚假的成功比明确的失败更浪费时间。
+
+        有一个真实存在的例外情形值得说明：如果游戏用的是
+        **动态（Dynamic）TMP 字体资源**（``m_AtlasPopulationMode`` 为
+        ``Dynamic``），它运行时会按需把字形加进图集，此时把
+        ``StreamingAssets`` 里的 TTF 换掉**是**有效的。探测到这种情况
+        时下面会提示用户优先尝试。
+        """
+        notes: list[str] = []
+        if not installed:
+            return notes
+
+        sa = self._streaming_assets(out_dir)
+        notes.extend(self.copy_fonts_into(out_dir, installed, sa / "_novaloc_fonts"))
+
+        tmp_assets = self._find_tmp_assets(out_dir)
+        if tmp_assets:
+            shown = ", ".join(self._rel(out_dir, p) for p in tmp_assets[:3])
+            more = f" 等 {len(tmp_assets)} 个" if len(tmp_assets) > 3 else ""
+            notes.append(
+                f"检测到 TextMeshPro 字体资源（{shown}{more}）："
+                "TMP 用**预烘焙图集**渲染文字，替换 TTF 不会生效，必须重新烘焙图集。"
+            )
+            notes.append(
+                "手动做法：用 Unity 编辑器打开工程 → Window > TextMeshPro > "
+                "Font Asset Creator → Source Font File 选本目录下 _novaloc_fonts/ 里的补字字体 "
+                "→ Character Set 选 Custom Characters 并粘贴项目用到的字符集 "
+                "→ Generate Font Atlas → Save 覆盖原字体资源。"
+            )
+            notes.append(
+                "⚠️ 重烘焙会改变字体的排版度量，界面可能出现轻微错位；"
+                "建议先在副本上验证。"
+            )
+        else:
+            notes.append(
+                "未检测到 TMP 字体资源。若游戏界面出现口口口，说明字体烘焙在 "
+                "AssetBundle / .assets 二进制里：请先用 AssetStudio/UABEA 导出，"
+                "再用 Unity 编辑器重新烘焙，或改用散装文件模式处理。"
+            )
+
+        notes.append(
+            f"补好的字体已放在 {self._rel(out_dir, sa / '_novaloc_fonts')}。"
+            "若游戏使用**动态（Dynamic）** TMP 字体资源，它会在运行时按需取字，"
+            "把该目录下的字体替换进去即可能直接生效。"
+        )
+        return notes
+
+    def _streaming_assets(self, out_dir: Path) -> Path:
+        """定位输出目录里的 ``StreamingAssets``（没有就用 ``*_Data`` 下新建）。"""
+        for cand in out_dir.glob("*/StreamingAssets"):
+            if cand.is_dir():
+                return cand
+        for cand in out_dir.glob("*_Data"):
+            if cand.is_dir():
+                return cand / "StreamingAssets"
+        return out_dir / "StreamingAssets"
+
     # ------------------------------------------------------------------
     # 回写
     # ------------------------------------------------------------------

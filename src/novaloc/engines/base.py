@@ -108,6 +108,50 @@ class EngineAdapter:
         return []
 
     # ------------------------------------------------------------------
+    # 字体接线的公共实现
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def copy_fonts_into(
+        out_dir: Path,
+        installed: dict[str, str],
+        target_dir: Path,
+        *,
+        stem_suffix: str = "",
+    ) -> list[str]:
+        """把补好的字体复制到 ``target_dir``，返回人类可读说明。
+
+        给"引擎会在某几个固定目录里找字体、但我们无法自动改它的配置"
+        这类情况用（Unity 的 TMP 与散装文件模式都是这样）。
+
+        返回值刻意写成**给人看的步骤**而不是"已修复"：如果这一步其实
+        不足以让游戏用上新字体，就必须说清楚，否则用户会以为已经好了。
+        """
+        notes: list[str] = []
+        if not installed:
+            return notes
+
+        srcs = [Path(v) for v in installed.values()]
+        target_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[str] = []
+        for src in srcs:
+            if not src.is_file():
+                notes.append(f"⚠️ 找不到已注入的字体文件：{src}")
+                continue
+            name = src.name
+            if stem_suffix and src.suffix:
+                name = f"{src.stem}{stem_suffix}{src.suffix}"
+            dst = target_dir / name
+            if dst.resolve() == src.resolve():
+                copied.append(name)
+                continue
+            shutil.copy2(src, dst)
+            copied.append(name)
+        if copied:
+            notes.append(f"已复制 {len(copied)} 个补好的字体到 {target_dir.name}/：{', '.join(copied)}")
+        return notes
+
+    # ------------------------------------------------------------------
     # 回写
     # ------------------------------------------------------------------
 

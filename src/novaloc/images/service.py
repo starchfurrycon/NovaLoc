@@ -194,10 +194,15 @@ class TextureTranslator:
         self._lama_tried = False
         self._vlm: Any = None
         self._vlm_tried = False
+        #: VLM 裁剪图缓存：裁剪像素 sha1 → 读出的文字。
+        #: 键存活于整个 service 实例（跨图片），因为"像素相同 ⇒ 文字相同"
+        #: 与图片无关，重复的按钮/图标文字能直接复用。
+        self._vlm_cache: dict[str, str] = {}
         self.calls = 0
         self.cache_hits = 0
         self.vlm_reads = 0
         self.vlm_fixes = 0
+        self.vlm_cache_hits = 0
 
     # ------------------------------------------------------------------
     # 依赖惰性加载
@@ -251,6 +256,12 @@ class TextureTranslator:
         差两个数量级（实测旋转文本 Hmean 2.1 vs 93.8），
         一旦让它决定位置，排版就毁了。所以这里只取文本，
         四边形坐标原样保留。
+
+        带**裁剪图缓存**：同一个按钮/图标在一张图（甚至多张图）里
+        重复出现时，裁剪出的像素完全一样，VLM 的回答必然一样。
+        缓存键用像素内容的 sha1 而不是文本，因为此时我们**还不知道
+        文本是什么**（知道就不用问了）—— 而"像素完全相同"是"文字相同"
+        的充分条件。命中的代价从一次 `/api/chat` 降为一次哈希。
         """
         vlm = self.vlm
         if vlm is None:
@@ -267,9 +278,47 @@ class TextureTranslator:
         if crop is None or getattr(crop, "size", 0) == 0:
             return ""
 
+        key = self._vlm_crop_key(crop)
+        if key is not None and key in self._vlm_cache:
+            self.vlm_cache_hits += 1
+            return self._vlm_cache[key]
+
         self.vlm_reads += 1
         text = vlm.read_text(crop, hint="这是游戏贴图里的文字，请只输出文字本身")
-        return (text or "").strip()
+        out = (text or "").strip()
+        # 空结果也缓存：读不出来时再问一次通常还是读不出来，
+        # 而重复的失败重问正是最浪费的那部分。
+        if key is not None:
+            self._vlm_cache[key] = out
+        return out
+
+    def _vlm_crop_key(self, crop: Any) -> str | None:
+        """裁剪图的稳定性缓存键；算不出来时返回 ``None``（退化为不缓存）。
+
+        用 PNG 编码而不是 ``tobytes()`` 作首选：裁剪尺寸或通道数稍有
+        差异时，裸内存缓冲仍有极小概率撞上同样的字节序列，而 PNG 带
+        尺寸与通道信息，且无损可复现。
+        """
+        try:
+            import hashlib  # noqa: PLC0415
+
+            buf: bytes | None = None
+            try:
+                import cv2  # noqa: PLC0415
+
+                ok, enc = cv2.imencode(".png", crop)
+                if ok:
+                    buf = bytes(enc.tobytes())
+            except Exception:  # noqa: BLE001 - 编码失败就用裸字节
+                buf = None
+            if not buf:
+                buf = memoryview(crop.tobytes()).tobytes()
+            if not buf:
+                return None
+            return hashlib.sha1(buf).hexdigest()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("计算 VLM 缓存键失败（本次不缓存）：%s", exc)
+            return None
 
     @property
     def lama(self) -> Any:
