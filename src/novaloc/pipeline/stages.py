@@ -966,10 +966,17 @@ class Pipeline:
                     "coverage_before": pr.audit_before.coverage if pr.audit_before else 0.0,
                     "coverage_after": pr.audit_after.coverage if pr.audit_after else 0.0,
                     "warnings": list(pr.warnings),
-                    # 记下"剔掉了哪些只有原文才用的字符"。
+                    # 记下"为了合并成功剔掉了哪些补不上的字符"。
                     # 不记的话，日后看到"字体覆盖率不是 100%"就无从判断
                     # 到底是真的缺中文字形，还是剔掉了几个噪声字符。
-                    "dropped_source_only_chars": dropped_for_retry,
+                    #
+                    # 字段名**刻意不叫** `dropped_source_only_chars`：
+                    # 早先只剔"只在源文侧"的字符时那个名字是对的，
+                    # 现在判据放宽成"影响条目数 ≤ 阈值"，
+                    # **译文侧**的跑偏字符也会被剔（实测 11 条坏译文就是这样）。
+                    # 名字留着"source_only"会让维护者以为译文侧不会被剔，
+                    # 于是在别处按这个假设写逻辑。
+                    "dropped_chars": dropped_for_retry,
                 }
                 patches.append(entry)
                 for w in pr.warnings:
