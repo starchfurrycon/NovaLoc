@@ -978,35 +978,74 @@ class TextureTranslator:
         path: Path,
         dry_run: bool,
     ) -> dict[int, str]:
-        """调翻译层；带既有译文命中，避免重复问模型。"""
+        """调翻译层；带既有译文命中，避免重复问模型。
+
+        ## 三个来源的**优先级**（这里踩过一个坑）
+
+        1. **引擎术语确定性表**（`ATK`→`攻击力`）—— 最高优先；
+        2. 已保存的贴图译文缓存（`existing`）；
+        3. 模型。
+
+        ## 为什么 1 必须高于 2
+
+        `_existing_image_translations()` 会把**上一轮跑出来的译文**读回来
+        当缓存（名字叫 `localize.json` 里的 `blocks[].target`）。
+        于是修好了 `engine_label_target('LUK')` → `'幸运'` 之后重跑，
+        图上**还是 `'卢克'`** —— 因为缓存里存着上一轮模型给的那个错答案，
+        而它在引擎表之前被命中。
+
+        教训：**缓存只该缓存"猜"，不该缓存"事实"。**
+        引擎术语是确定性事实（有限闭集、写死的标准译法），
+        优先级必须高于"上一轮模型的猜测"，否则纠正永远无法生效 ——
+        表现就是"改了代码、重跑了、结果一模一样"。
+
+        ## 另一个同类坑：缓存里的坏值也必须过检查
+
+        `_translation_is_usable` 原先**只在模型结果上调用**，
+        缓存命中直接 `out[i] = hit` 就返回了。于是
+        `'[o]' → '[o]中文译文'` 这个坏译文存在 `localize.json` 里，
+        重跑时从缓存被拾回来，**永远挡不掉** ——
+        自动检查形同虚设。
+
+        所以修法是把**三个来源全部**送进 `_accept()` 统一校验。
+        """
         out: dict[int, str] = {}
         pending: list[tuple[int, str]] = []
 
-        lookup = {k.strip().lower(): v for k, v in existing.items()}
-        for i, t in enumerate(texts):
-            hit = lookup.get(t.strip().lower())
-            if hit:
-                out[i] = hit
-                self.cache_hits += 1
-            else:
-                pending.append((i, t))
+        def _accept(i: int, text: str) -> bool:
+            """候选译文能不能用？缓存、查表、模型都走这一关。"""
+            if not text:
+                return False
+            if not self._translation_is_usable(texts[i], text):
+                return False
+            out[i] = text
+            return True
 
-        # ---- 引擎术语：确定性译法，根本不问模型 ----
+        # ---- 1. 引擎术语：确定性译法，根本不问模型，也不看缓存 ----
         # 贴图上的属性缩写是**有限闭集**（`ATK`/`DEF`/`MAT`/`MDF`/`AGI`/`LUK`…），
         # 而这些块的实测表现是：48% 原样返回英文（写着"已翻译"其实没翻），
         # 且 `'LUK'` 被音译成 `'卢克'`（人名）。
         # 同一个模型、同一批缩写，8 个里只有 2 个对 —— 所以这类词
         # **不该依赖模型**，走确定性表更快也更准。
-        if pending:
-            still: list[tuple[int, str]] = []
-            for i, t in pending:
-                label = engine_label_target(t)
-                if label:
-                    out[i] = label
-                    self.engine_label_hits += 1
-                else:
-                    still.append((i, t))
-            pending = still
+        for i, t in enumerate(texts):
+            label = engine_label_target(t)
+            if not label:
+                pending.append((i, t))
+            elif _accept(i, label):
+                self.engine_label_hits += 1
+
+        # ---- 2. 既有译文缓存（只对非引擎术语生效）----
+        # 注意也过 `_accept`：缓存里可能存着**上一轮规则还没修好时**
+        # 落盘的坏译文（真实案例 `'[o]' → '[o]中文译文'`）。
+        lookup = {k.strip().lower(): v for k, v in existing.items()}
+        still: list[tuple[int, str]] = []
+        for i, t in pending:
+            hit = lookup.get(t.strip().lower())
+            if hit is not None and _accept(i, hit):
+                self.cache_hits += 1
+            else:
+                still.append((i, t))
+        pending = still
 
         if dry_run or not pending:
             return out
@@ -1050,12 +1089,12 @@ class TextureTranslator:
             text = self._entry_text(res)
             if not text:
                 continue
-            if not self._translation_is_usable(_t, text):
-                # 丢弃：宁可不翻译（保留原样），也不要把一句"我读不出来"
-                # 或者占位符垃圾画到游戏画面上。
+            # 丢弃：宁可不翻译（保留原样），也不要把一句"我读不出来"
+            # 或者占位符垃圾画到游戏画面上。
+            # 走 `_accept` 而不是直接 `out[i] = text` —— 保证
+            # "校验规则对三个来源一视同仁"，将来加规则不会漏掉某条路径。
+            if not _accept(i, text):
                 log.debug("丢弃不可用的贴图译文：%r → %r", _t, text)
-                continue
-            out[i] = text
         return out
 
     def _rejections(self) -> dict[str, int]:
