@@ -436,6 +436,28 @@ class TextureTranslator:
                 return False
         return True
 
+    @staticmethod
+    def _text_area_ratio(blocks: list[Any], img_w: int, img_h: int) -> float:
+        """所有文字块的**框面积之和**占整图的比例。
+
+        用框面积而不是像素面积：框是 OCR 给的，稳定、可比，
+        不需要再多读一遍像素。
+
+        注意框之间可能重叠（分组逻辑就是为重叠而存在的），
+        所以这里会略微**高估** —— 对这个用途是安全方向：
+        高估只会让"该跳过的"更少跳过，不会误跳真文字。
+        """
+        if img_w <= 0 or img_h <= 0 or not blocks:
+            return 0.0
+        area = 0
+        for b in blocks:
+            box = getattr(b, "box", None)
+            if box and len(box) == 4:
+                bw = max(0, int(box[2]) - int(box[0]))
+                bh = max(0, int(box[3]) - int(box[1]))
+                area += bw * bh
+        return min(1.0, (area / float(img_w * img_h)) if img_w and img_h else 0.0)
+
     def process(
         self,
         image_path: str | Path,
@@ -509,6 +531,28 @@ class TextureTranslator:
         asset.analyzed = True
         if not blocks:
             # 没文字，原图返回，不算失败
+            result.image = raw
+            result.total_ms = (time.time() - t_start) * 1000
+            return result
+
+        # ---- 1c. 文字占比过小 → 当成"没字"跳过 ----
+        # 覆盖 `cfg.ocr.skip_if_no_text_ratio`（这个开关以前只在配置里
+        # 声明、**从来没人读**，等于没有）。
+        #
+        # 为什么需要它：真实 RPG Maker 游戏开了加密之后候选贴图会从
+        # 十几张涨到几百张（实测 BeyondPortal 0 → 750）。其中绝大多数是
+        # 背景图和地图图块，OCR 偶尔会在噪点上读出一两个短词。
+        # 那种"文字只占画面万分之几"的结果几乎必然是幻觉，但它会让
+        # 整张图走完 inpaint + 重绘（比单纯 OCR 贵一个数量级），
+        # 还有可能把乱字画到背景上。
+        ratio = self._text_area_ratio(blocks, asset.width, asset.height)
+        if ratio < float(getattr(self.cfg.ocr, "skip_if_no_text_ratio", 0.0) or 0.0):
+            result.warnings.append(
+                f"文字面积占比仅 {ratio:.5%}（低于阈值 "
+                f"{self.cfg.ocr.skip_if_no_text_ratio:.5%}），"
+                f"判定为无文字/误检，跳过重绘："
+                + "、".join(repr(str(getattr(b, "source", ""))[:12]) for b in blocks[:5])
+            )
             result.image = raw
             result.total_ms = (time.time() - t_start) * 1000
             return result
