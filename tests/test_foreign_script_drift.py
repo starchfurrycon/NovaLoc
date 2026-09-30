@@ -41,13 +41,46 @@
 
 ## 阈值是拿真实数据校准的
 
-`max_ratio=0.25` 且要求**至少 2 个**外来字符：
+`max_ratio=0.25` 且要求**至少 2 个**外来字符
+（这一条现在只作**兜底**，见下）：
 
 * `'伤害 3π'` → 17% → **放行**（希腊字母在数值里是正常写法）
 * `'我现在就想让你 دخول我!!!'` → 27% → **挡住**
 * `'<right>苏 กี้</right>'` → 75% → **挡住**
 
 单个外来字符**绝不**触发，避免把"长句里一个希腊字母"误杀。
+
+## 主判据换成了"有没有出现一个**外来词**"
+
+比例判据不够用，因为它**落在了边界上**。实测大量真跑偏恰好是 25.0%：
+
+    '而且你竟然饶了它们 ജീവ'          3/12 = 25.0%  → 旧判据放过
+    '你…？我 دیگه不用说了，对吧？'     4/16 = 25.0%  → 旧判据放过
+
+**判据落在边界上，就说明判据选错了。**
+真正的区分不是"外来字符占多少"，而是**"有没有混进来一个外文词"**：
+
+* 单个外来字符（`π`/`β`/`Ω`）→ 正常符号，玩家认得；
+* 连续 ≥3 个外来字符 → 那是**一个词**，中译里绝不该有。
+
+在 **24,882 条真实译文**上实测（BeyondPortal 跑完一轮之后）：
+
+=============================== ====== ====
+判据                             命中   误报
+=============================== ====== ====
+旧：比例 > 25% 且 >= 2 个字符         3    0
+新：连续外来段 >= 3 个字符             7    0
+新 + 比例兜底（数单字符）              9    0
+=============================== ====== ====
+
+后 2 条是比例兜底补上的，都是真跑偏：
+
+* `'¿Reina de las arañas?…'` → `'¿ملكة العنكبوت...؟ …'`
+  —— 西语原文被译成了**整句阿拉伯语**（33 个外来字符）；
+* `'…no permitiré que mis arañas te moleste'`
+  → `'…我不会让你受到我的蜘蛛的 தொல்லை。'` —— 夹了个泰米尔词。
+
+**误报 0 条**（24,882 条里一条正常译文都没被误杀）。
 """
 
 from __future__ import annotations
@@ -63,6 +96,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from novaloc.lang import (  # noqa: E402
     count_foreign_script,
     foreign_script_ratio,
+    foreign_script_runs,
+    has_foreign_word,
     longest_foreign_run,
     visible_text,
 )
@@ -201,3 +236,146 @@ def test_escape_codes_are_also_stripped() -> None:
 )
 def test_longest_foreign_run(text: str, expect: str) -> None:
     assert longest_foreign_run(text) == expect
+
+
+# ----------------------------------------------------------------------
+# 六、主判据："有没有出现一个外来词"
+# ----------------------------------------------------------------------
+
+#: 全部 7 条真实跑偏（用"连续外来段"判据就能抓到的那些）
+ALL_REAL_DRIFTS = [
+    ("而且你竟然饶了它们 ജീവ", "而且你還饒了它們的性命。"),
+    ("在你离开之前，我还有 кое-что, 也许能帮到你。", "Antes de que te vayas, tengo algo…"),
+    ("我现在就想让你 دخول我!!!", "I want you inside me right now!!!"),
+    ("你…？我 دیگه不用说了，对吧？", "你……？我不需要再說什麼……對吧？"),
+    ("我 دیگه没时间了。", "我不会再耽误你了。"),
+    ("不过你总是 таком不可思议的样子，", "但你總是一副了不起的樣子，"),
+    ("这只 الوحش 无懈可击，任何攻击都无法伤害它。", "这只野兽是不可阻挡的，什么都无法杀死它。"),
+]
+
+#: 另外 2 条：**只能**靠比例兜底抓到的真跑偏
+#: （一条整句阿拉伯语、一条夹了泰米尔词）
+FALLBACK_ONLY_DRIFTS = [
+    ("¿ملكة العنكبوت...؟ الآن فهمت معنى الخاضعين.", "¿Reina de las arañas?…"),
+    ("我可以向你保证，我不会让你受到我的蜘蛛的 தொல்லை。", "Podría prometerte que…"),
+]
+
+
+@pytest.mark.parametrize("target,source", FALLBACK_ONLY_DRIFTS)
+def test_fallback_only_drifts_are_also_caught(target: str, source: str) -> None:
+    """这两条是**比例兜底**补上的真实跑偏（段判据抓不到或抓不全）。
+
+    留着它们是为了证明"兜底判据不是摆设" ——
+    如果哪天有人觉得兜底多余、把它删了，这两条会立刻红。
+    """
+    assert check_foreign_script(target, source=source), f"漏掉了：{target!r}"
+
+
+@pytest.mark.parametrize("target,source", ALL_REAL_DRIFTS)
+def test_all_seven_real_drifts_are_caught(target: str, source: str) -> None:
+    """**核心回归**：全部 7 条真实跑偏都必须在守卫里判坏。
+
+    其中 4 条**旧的纯比例判据抓不到**（它们恰好是 25.0%），
+    这条测试就是那次修复的钉子。
+    """
+    assert check_foreign_script(target, source=source), (
+        f"漏掉了真实跑偏：{target!r}"
+    )
+
+
+def test_ratio_alone_would_have_missed_half_of_them() -> None:
+    """说明"为什么要换判据"：4 条真跑偏的比例**恰好是 25.0%**。
+
+    旧判据是"比例 > 25%"，所以它们全被放过。
+    这里把那个数字钉下来 —— 如果哪天有人把阈值调回 `>=`，
+    这条测试会提醒他"边界上还站着 4 条真事故"。
+    """
+    border = [
+        "而且你竟然饶了它们 ജീവ",
+        "你…？我 دیگه不用说了，对吧？",
+    ]
+    for t in border:
+        assert foreign_script_ratio(t) == pytest.approx(0.25), (
+            f"{t!r} 的比例不再是 25%？请重新校准阈值"
+        )
+        # 新判据仍然抓得到它
+        assert check_foreign_script(t)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "伤害 3π",
+        "物理攻击 3π, 魔法防御 2Ω",
+        "半径 r=5β",
+        "穿过传送门",
+        "载入中……",
+    ],
+)
+def test_single_math_symbols_are_never_drift(target: str) -> None:
+    """**单个**希腊字母是正常写法，绝不能误杀（实测 0 误报）。"""
+    assert not check_foreign_script(target)
+    assert has_foreign_word(target) == []
+
+
+def test_source_containing_the_word_is_allowed() -> None:
+    """原文本来就有那个外文词（专有名词/引文）→ 译文保留是**对的**。
+
+    实测 7 条真跑偏的外来段**没有一条**出现在源文里（都是模型自己编的），
+    所以"源文里没有"是一条干净的判据。
+    """
+    src = "падеж means grammatical case"
+    tgt = "падеж 是格的意思"
+    assert foreign_script_runs(tgt) == ["падеж"], "段要能被切出来"
+    assert has_foreign_word(tgt, source=src) == [], "源文里有 → 不算跑偏"
+    assert not check_foreign_script(tgt, source=src)
+    # 但源文里**没有**的时候要判坏
+    assert check_foreign_script(tgt, source="grammatical case")
+
+
+def test_run_minimum_is_three() -> None:
+    """`min_run=3`：实测最短的真跑偏段正好是 3（`'ജീവ'`、`'кое'`）。
+
+    所以 3 既能覆盖全部真实案例，又能保住单字符符号。
+    """
+    # 单字符进不了"段"（段正则本身要求 >= 2），这正是我们要的
+    assert foreign_script_runs("伤害 3π") == [], "单字符不该构成段"
+    assert has_foreign_word("伤害 3π", min_run=3) == []
+    assert has_foreign_word("伤害 3π", min_run=1) == [], "单字符永远进不了段判据"
+    # 两字符段能切出来，但 `min_run=3` 会放过它（刻意的：`'3π'` 太容易误伤）
+    assert foreign_script_runs("攻击力 ΩΩ") == ["ΩΩ"]
+    assert has_foreign_word("攻击力 ΩΩ", min_run=3) == []
+    assert has_foreign_word("攻击力 ΩΩ", min_run=2) == ["ΩΩ"], "min_run=2 才抓得到"
+    # 三字符段：真实跑偏的最短长度
+    assert has_foreign_word("攻击力 ΩΩΩ", min_run=3) == ["ΩΩΩ"]
+
+
+def test_runs_are_split_by_punctuation_and_spaces() -> None:
+    """段是**连续**的：`'кое-что'` 会被连字符切成两段，各自仍 >= 3。"""
+    assert foreign_script_runs("我还有 кое-что, 也许") == ["кое", "что"]
+
+
+def test_foreign_run_regex_shares_the_character_class() -> None:
+    """段正则必须和单字符正则**用同一份区段**。
+
+    踩过的坑：早先想省事，用 `_FOREIGN_SCRIPT_RE.pattern.strip("[]")`
+    去拼段正则 —— `strip` 会把区段里的 `-` 也切掉，
+    于是段正则**静默匹配不到任何东西**，判据等于没写。
+    改法是抽一个 `_FOREIGN_SCRIPT_RANGES` 常量给两边共用。
+    """
+    from novaloc.lang import _FOREIGN_RUN_RE, _FOREIGN_SCRIPT_RE
+
+    for ch in "πജدกЖ":
+        assert _FOREIGN_SCRIPT_RE.match(ch), ch
+        # 同一字符重复 3 次必须能被段正则认出
+        assert _FOREIGN_RUN_RE.search(ch * 3), f"段正则认不出 {ch!r} 的连续段"
+
+
+def test_fallback_ratio_catches_spaced_out_characters() -> None:
+    """兜底：模型若把外文**拆成单个字符加空格**，段判据会失效，比例判据顶上。
+
+    这就是为什么两条判据都要留着（任一命中即判坏）。
+    """
+    spaced = "a ส ุ ข ี b"  # 段被空格打散
+    assert foreign_script_runs(spaced) == [], "段判据确实失效了"
+    assert check_foreign_script(spaced), "比例判据应当兜住"

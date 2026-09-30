@@ -43,6 +43,7 @@ from ..models import (
     TextUnit,
 )
 from ..translate.glossary import engine_label_target
+from ..translate.guards import check_foreign_script
 from .inpaint import InpaintResult, inpaint_boxes, load_lama
 from .io import imread_bgr, imwrite_bgr
 from .ocr_ppocrv6 import PPOcrV6Engine
@@ -1162,6 +1163,18 @@ class TextureTranslator:
         ``[ ]``/``" "`` 是典型的"我把它当词条了"痕迹），剥离后再比较。
         剥的时候**原文和译文都要剥**，否则会把 `'[o]' → '[o]'`
         这种正常保留误判成回声。
+
+        ## 3. 模型跑到别的文字系统去了（泰文/阿拉伯文当译文）
+
+        和文本路径同一个病（见 `translate/guards.py` 的
+        `check_foreign_script`）。实测文本侧有 11 条译文混进了泰文/阿拉伯文，
+        而**贴图侧更严重**：文本译文坏了可以在下一轮重译，
+        贴图译文坏了是**直接画进像素**的 ——
+        玩家会在游戏画面上看到一句夹着泰文的乱码，
+        而且这个错误被烘焙进 PNG 之后**再也不会被追问**。
+
+        所以这里必须和文本路径用**同一条判据**，
+        不能因为"贴图量小"就省掉。
         """
         src = _norm(source)
         tgt = _norm(target)
@@ -1176,6 +1189,10 @@ class TextureTranslator:
 
         if self._is_source_echo(src, tgt):
             self._note_rejection("source_echo_with_junk")
+            return False
+
+        if check_foreign_script(target, source=source):
+            self._note_rejection("foreign_script")
             return False
 
         return True

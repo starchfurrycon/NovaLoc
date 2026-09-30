@@ -169,3 +169,59 @@ def test_rejection_reasons_are_counted() -> None:
     reasons = t._rejections()
     assert reasons.get("source_echo_with_junk"), reasons
     assert reasons.get("meta_answer"), reasons
+
+
+# ----------------------------------------------------------------------
+# 五、模型跑到别的文字系统（文本路径已有，贴图路径**更**需要）
+# ----------------------------------------------------------------------
+
+#: 真实跑偏记录（文本侧实测到的同一批）
+DRIFT_TARGETS = [
+    "苏 กี้",
+    "我现在就想让你 دخول我!!!",
+    "我们ค่อยๆ ก็ได้",
+    "Entonces, придется тебе подняться.",
+    "而且你竟然饶了它们 ജീവ",
+]
+
+
+@pytest.mark.parametrize("target", DRIFT_TARGETS)
+def test_drift_is_never_drawn_onto_a_texture(target: str) -> None:
+    """**核心**：混进别的文字系统的译文绝不能画到贴图上。
+
+    贴图路径比文本路径**更**不能放过这类错误：
+    文本译文坏了可以在下一轮重译；贴图译文坏了是**直接烘焙进像素**的，
+    玩家会在游戏画面上看到夹着泰文的乱码，
+    而这个错误被写进 PNG 之后**再也不会被追问**。
+    """
+    t = _t()
+    assert t._translation_is_usable("Suki", target) is False, (
+        f"跑偏译文被放行、会画到贴图上：{target!r}"
+    )
+
+
+def test_drift_rejection_is_counted_under_its_own_reason() -> None:
+    """原因要单独计数 —— 和"原文回声"混在一起就查不出是哪个病。"""
+    t = _t()
+    t._translation_is_usable("Suki", "苏 กี้")
+    assert t._rejections().get("foreign_script"), t._rejections()
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [
+        ("ATK", "攻击力"),
+        ("Now Loading...", "载入中……"),
+        ("Damage 3", "伤害 3"),
+        # 单个希腊字母是正常的（数学/单位符号），不能误杀
+        ("Damage 3\u03c0", "伤害 3\u03c0"),
+        # 属性缩写保留是允许的
+        ("AGI", "AGI"),
+    ],
+)
+def test_normal_texture_translations_still_pass(source: str, target: str) -> None:
+    """加守卫不能把正常译文一起挡掉（`π` 那类单字符最容易被误杀）。"""
+    t = _t()
+    assert t._translation_is_usable(source, target) is True, (
+        f"正常译文被误杀：{source!r} → {target!r}"
+    )

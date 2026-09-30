@@ -475,7 +475,7 @@ class Pipeline:
                     # 这里对"含外来文字系统"的条目**强制重译**，
                     # 但**限制次数**（最多 2 次）：模型可能反复给出同样的错答案，
                     # 不限次数就会每次重跑都白烧时间。
-                    if check_foreign_script(prev.target):
+                    if check_foreign_script(prev.target, source=prev.source):
                         tries = int((prev.meta or {}).get("drift_retry", 0))
                         if tries < 2:
                             prev.meta = {**(prev.meta or {}), "drift_retry": tries + 1}
@@ -1316,7 +1316,7 @@ class Pipeline:
                 # 于是"修好了代码、重跑了、坏数据还在"。
                 #
                 # 回写阶段是**最后一道**能拦住它的地方，所以这里必须再查一次。
-                if check_foreign_script(e.target):
+                if check_foreign_script(e.target, source=e.source):
                     drifted.append(u.uid)
                     continue
                 translations[u.uid] = e.target

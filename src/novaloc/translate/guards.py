@@ -16,12 +16,15 @@ from ..lang import (
     count_foreign_script,
     extract_placeholders,
     foreign_script_ratio,
+    foreign_script_runs,
+    has_foreign_word,
     has_hangul,
     has_kana,
     has_latin,
     longest_foreign_run,
     normalize_for_compare,
     strip_placeholders,
+    visible_text,
 )
 
 # 模型偶尔会把提示词要求也照抄进译文。
@@ -97,40 +100,94 @@ def clean_translation(text: str) -> str:
     return t
 
 
-def check_foreign_script(target: str, *, max_ratio: float = 0.25) -> list[str]:
+def check_foreign_script(
+    target: str,
+    *,
+    max_ratio: float = 0.25,
+    source: str = "",
+) -> list[str]:
     """译文里混进了"绝不该出现"的文字系统吗？
 
     目标语言是中文，合法字母只有 **汉字 / 拉丁 / 数字**。
     其余任何文字都说明**模型跑偏了**。真实记录（BeyondPortal）：
+    共 7 条，模型把整句改成别的语言，或者按发音硬凑了一个外文词：
 
-    * 说话人名 `'Suky'` → `'<right>苏 กี้</right>'`（**泰文**，
-      模型按发音硬凑了一个泰文拼写）
-    * 台词 → `'我现在就想让你 دخول我!!!'`（**阿拉伯文**）
-    * 台词 → `'...ജവീ...'`（**马拉雅拉姆文**）
+    * `'Suky'` → `'<right>苏 กี้</right>'`（**泰文**）
+    * → `'我现在就想让你 دخول我!!!'`（**阿拉伯文**）
+    * → `'在你离开之前，我还有 кое-что, …'`（**西里尔**）
+    * → `'而且你竟然饶了它们 ജീവ'`（**马拉雅拉姆文**）
 
     这些译文**通过了原先所有检查** —— 非空、长度合理、
-    占位符完好、也含汉字。玩家看到的是夹杂阿拉伯/泰文的乱码句。
+    占位符完好、也含汉字。玩家看到的是夹杂外文的乱码句。
 
-    ## 阈值怎么定的（都拿真实数据校准过）
+    ## 主判据：出现了**成串的外来文字**（即"混进来一个词"）
 
-    * **至少 2 个**：单个外来字符多半是**正常写法** ——
-      希腊字母 `π`/`β` 在数值和术语里很常见，玩家也认得。
-      模型跑偏时是**成串**出现的。
-      实测 `'伤害 3π'` 的比值**恰好等于** 0.25，
-      真正救下它的是这一条（只有一个外来字符），不是比例条件。
-    * **比例 > 25%**：分母是"玩家可见字符"（见 `lang.visible_text`）。
-      实测校准：`'我现在就想让你 دخول我!!!'` 是 26.7%（挡住），
-       `'<right>苏 กี้</right>'` 是 75%（挡住）。
+    见 `lang.has_foreign_word`。实测 24,234 条真实译文里：
 
-    两个条件**必须同时满足**，避免"长句里夹一个希腊字母"被误杀。
+        旧判据（比例 > 25% 且外来字符 >= 2）  命中 3 条
+        新判据（连续外来段 >= 3 个字符）        命中 7 条
+        新判据多抓 4 条、**漏掉 0 条**、误报 0 条
+
+    为什么比例判据不够：真跑偏**大量恰好落在 25.0%** 这个边界上
+    （`'而且你竟然饶了它们 ജീവ'` 3/12、`'你…？我 دیگه…'` 4/16）。
+    **判据落在边界上，就说明判据选错了。**
+    真正的区分不是"外来字符占多少"，而是"有没有出现一个外来词"——
+    一个 4 字的马拉雅拉姆词混在中文句子里，
+    哪怕整句只有它 3 个字符，也绝不可能是正常译文。
+
+    `source` 传进来时会排除"原文本来就有"的外来词
+    （专有名词、引文 → 保留是对的）。
+
+    ## 保留比例判据作为兜底
+
+    如果模型改用**单个外来字符乱凑**（把 `'Suky'` 写成 `'ส ุ ข ี'`），
+    段判据会被空格/组合记号打散。这时比例判据仍然有效。
+    两个条件**任一命中**就判坏。
     """
-    n = count_foreign_script(target)
-    if n < 2:
+    bad = has_foreign_word(target, source=source)
+    if bad:
+        joined = "".join(bad)
+        n = count_foreign_script(target)
+        ratio = foreign_script_ratio(target)
+        return [f"foreign_script:{joined}({len(bad)}段/{n}字符/{ratio:.0%})"]
+
+    # ---- 兜底：比例判据 ----
+    #
+    # 用于"段判据被空格/拆字打散"的情况（见
+    # `test_fallback_ratio_catches_spaced_out_characters`）。
+    #
+    # 阈值都拿真实数据校准过：
+    # * **至少 2 个**：单个外来字符多半是**正常写法** ——
+    #   希腊字母 `π`/`β` 在数值和术语里很常见，玩家也认得。
+    # * **比例 > 25%**：分母是"玩家可见字符"（见 `lang.visible_text`）。
+    #
+    # ⚠️ 这里**必须也排除"原文里本来就有"的外来字符**，
+    # 否则会把 `'падеж means case'` → `'падеж 是格的意思'`
+    # 这种**正确**的译文判坏（实测比例 50%，远超阈值）。
+    # 段判据排除了源文，兜底判据却不排除 —— 两条判据口径不一致，
+    # 就会在"段判据没命中、比例判据命中"的缝隙里误杀。
+    # 数**所有**外来字符，再扣掉"已经由段判据处理过"的部分
+    # （长度 >= 3 的段）—— 它们要么已判坏、要么已在源文里被放行，
+    # 两种情况都不该在这里重复计数。
+    #
+    # 剩下的就是被空格/拆字打散的单个字符。
+    # 真实样本：`'<right>د ه گ ی</right>'` —— 模型把阿拉伯词拆成单字符加空格，
+    # 段判据完全失效（每段只有 1 个字符），只有比例判据救得回来。
+    #
+    # ⚠️ 不能用"把单字符段加起来"来算：`_FOREIGN_RUN_RE` 要求连续 >= 2 个，
+    # 所以被空格隔开的单字符**根本不会形成段**，加起来永远是 0。
+    # 必须从 `count_foreign_script()`（按字符类直接数）里扣。
+    long_runs = [r for r in foreign_script_runs(target) if len(r) >= 3]
+    stray = count_foreign_script(target) - sum(len(r) for r in long_runs)
+    if stray < 2:
         return []
-    ratio = foreign_script_ratio(target)
+    visible = [ch for ch in visible_text(target) if not ch.isspace()]
+    if not visible:
+        return []
+    ratio = stray / len(visible)
     if ratio > max_ratio:
         run = longest_foreign_run(target)
-        return [f"foreign_script:{run}({n}字符/{ratio:.0%})"]
+        return [f"foreign_script:{run}({stray}字符/{ratio:.0%})"]
     return []
 
 
@@ -275,7 +332,7 @@ def guard(
     warnings += check_placeholders(source, target)
     warnings += check_length(source, target, max_chars, length_ratio)
     warnings += check_language_residue(source, target, target_lang)
-    warnings += check_foreign_script(target)
+    warnings += check_foreign_script(target, source=source)
     if check_repeat:
         warnings += check_repetition(source, target)
 
