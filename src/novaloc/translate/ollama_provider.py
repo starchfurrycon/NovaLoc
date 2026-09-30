@@ -67,6 +67,12 @@ class OllamaTranslationProvider:
             "placeholder_fatal": 0,
             "placeholder_repaired": 0,
             "cross_item_leak": 0,
+            # 批量调用成功、但个别条目返回空串时的补救次数。
+            # 实测这种"空"与整批失败无关；不补就是静默漏译。
+            "empty_retry": 0,
+            # 补空救回来的条目数。与 empty_retry 的差值反映模型在
+            # "短串 + 占位符"结构上的真实弱点。
+            "empty_recovered": 0,
             "items": 0,
         }
 
@@ -332,6 +338,35 @@ class OllamaTranslationProvider:
                         if singles:
                             raw_by_index, err = singles, single_err
                             break
+
+            # ---- 2.5 补空 ----
+            # _call_batch 只重试"整批失败"和"漏掉的条目"，但**批量调用成功、
+            # 个别条目却返回空串**时它不重试 —— 那种情况在它看来批处理是好的。
+            # 实测：`MP: {mp}`、`Gold: {gold}` 这类"短词 + 占位符"的结构
+            # 会在批量里被返回成空串（3 次运行里 3 次复现，与术语表无关）。
+            #
+            # 不补的后果是**静默漏译**：条目以 FAILED/空译文写回游戏，
+            # 玩家看到的是一个没被翻译的 UI 元素，而质检只会说"有条目未翻译"。
+            # 逐条重试对这类短串几乎总能救回来。
+            empty = [
+                li for li, gi in enumerate(batch)
+                if not raw_by_index.get(li, "").strip()
+            ]
+            if empty and len(batch_items) > 1:
+                self.stats["empty_retry"] = self.stats.get("empty_retry", 0) + 1
+                for li in empty:
+                    if raw_by_index.get(li, "").strip():
+                        continue
+                    try:
+                        got = self._call_single(batch_items[li], masked_all[li])
+                    except (ProviderError, OllamaError, ModelMissing, OllamaNotRunning) as exc:
+                        log.debug("补空第 %d 条失败：%s", li, exc)
+                        continue
+                    if got:
+                        raw_by_index[li] = got
+                        self.stats["empty_recovered"] = (
+                            self.stats.get("empty_recovered", 0) + 1
+                        )
 
             # ---- 3. 还原 + 校验 + 守卫 ----
             for local_i, global_i in enumerate(batch):

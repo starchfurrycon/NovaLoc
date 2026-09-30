@@ -40,8 +40,13 @@
 | `test_engines_all.py` | 39 | 四个引擎适配器（RPG Maker / Ren'Py / Unity / 散装）的统一行为 |
 | `test_font_wiring.py` | 26 | 字体接线：RPG Maker CSS `src` 改写、Ren'Py 生成 `novaloc_fonts.rpy` |
 | `test_vlm_fallback.py` | 28 | 低置信度文字的视觉兜底（含"读到更差结果时不许替换"） |
-| `test_pipeline_e2e.py` | 45 | 八阶段流水线端到端 + 质检 |
+| `test_pipeline_e2e.py` | 45 | 九阶段流水线端到端 + 质检 |
 | `test_api_e2e.py` | 58 | 32 条 HTTP 路由、WebSocket 事件流、设置深合并与拒收未知键 |
+| `test_archives_rpa.py` | 22 | `.rpa` 归档读写：版本 v2.0/v3.0/v3.2 往返、XOR 前缀、受限反序列化、路径穿越（纯标准库，CI 里跑） |
+| `test_archives_service.py` | 31 | 归档服务层：目录结构保持、按后缀过滤、探测、**只回写改动的条目**、备份、炸弹限额 |
+| `test_archives_pipeline_e2e.py` | 6 | 归档**穿过整条流水线**：解包 → 翻译 → 回写 → 归档里真的是中文（`.rpa`/`.zip`/`.tar`） |
+| `test_ocr_lang_router.py` | 36 | OCR 按语种路由：映射表、大小写变体、清单一致性、离线不联网；1 项真实识别对比（标 `needs_models`+`needs_gpu`） |
+| `test_qa_label_collision.py` | 5 | 质检"反向碰撞"：不同的**短标签**撞成同一译文必须报 ERROR（纯本地，CI 里跑） |
 | `test_font_real.py` | 21 | **用真实字体**验证字体合并：覆盖率、八个确定性不变量、UPEM 度量换算、渲染墨迹 |
 | `test_charset_merge.py` | — | 字符集规划与合并 |
 | `test_merge.py` | 5 | 底层 `merge_fonts` 多组合冒烟（依赖 Windows 自带字体） |

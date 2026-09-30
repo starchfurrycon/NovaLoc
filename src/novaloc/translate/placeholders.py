@@ -444,6 +444,18 @@ def repair_dropped_masks(
     # 关键：位置必须一次性算完再插。边插边算会让后面的下标全部偏移，
     # 实测会把结果搞成 `500⟦0⟦1⟧⟧` 这种坏标记。
     # 落在同一位置的记号按原顺序一起插。
+    #
+    # "尾部记号"：在遮蔽原文里位于最后一个记号之后的内容里**没有任何非空白字符**
+    # （即 `⟦i⟧` 之后什么都不剩，或只剩空格）。
+    # 这类记号的插入位置是**唯一确定**的 —— 译文末尾。见下面 459 行附近的说明。
+    src_mark_ids = mask_indices(masked_source)
+    tail_after: dict[int, str] = {}
+    for idx in missing:
+        start = _mask_start(masked_source, idx)
+        end = masked_source.find("⟧", start)
+        tail_after[idx] = masked_source[end + 1:] if end != -1 else ""
+    last_mark_id = max(src_mark_ids) if src_mark_ids else -1
+
     by_pos: dict[int, list[int]] = {}
     for idx in src_order:
         slot = slots[idx] if 0 <= idx < len(slots) else ""
@@ -461,8 +473,24 @@ def repair_dropped_masks(
             if snapped is None or _glues_tokens(
                 translated_raw, snapped, _is_free_anywhere(slot)
             ):
-                # 找不到安全边界 → 不补。宁可整条不译，也不产出粘连文本
-                # （`%dgold`）或把中文词劈开的换行。
+                # 找不到安全边界，通常是"译文里全是汉字，一个空格和标点都没有"
+                # 的纯中文短串（实测 `Gold: {gold}` → `'黄金'`：
+                # `_snap_to_boundary('黄金', 2)` 返回 None，于是整条被判
+                # placeholder_broken 而**完全不产出译文**，用户看到的是
+                # "这个词没翻译"）。
+                #
+                # 但若该记号在原文里就是**最后一个记号**，且它后面再没有
+                # 非空白内容，那么它的位置是**唯一确定**的：译文末尾。
+                # 追加到末尾不可能劈开中文词，也不可能造成 `%dgold` 粘连
+                # （粘连只在插到词中间时发生），所以这条是安全的。
+                #
+                # 注意只对"最后一个记号"这么做：如果一个更靠后的记号还没
+                # 定位，先插它会让顺序错乱。
+                is_trailing = idx == last_mark_id and not tail_after[idx].strip()
+                if is_trailing:
+                    by_pos.setdefault(len(translated_raw), []).append(idx)
+                # 否则不补。宁可整条不译，也不产出粘连文本（`%dgold`）
+                # 或把中文词劈开的换行。
                 continue
             pos: int | None = snapped
         else:

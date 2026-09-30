@@ -203,9 +203,29 @@ class PPOcrV6Engine:
     # 引擎构造
     # ------------------------------------------------------------------
 
-    def _ensure(self) -> Any:
+    def _ensure(self, src_lang: str | None = None) -> Any:
+        """构造（或复用）OCR 引擎。
+
+        ## 为什么要带 `src_lang`
+
+        PP-OCRv6 的识别器**不含韩语与西里尔文字**（官方文档写明）。
+        对这类语言，v6 不是"读得差"，而是**读不出来** —— 而症状是
+        "识别结果为空"，与"这张图本来没文字"无法区分，属于最坏的一类
+        静默失败。所以这里按语种路由：中日英拉丁用 v6（日文在 v6 上
+        90.5% vs v5 73.7%，明显更准），韩语/俄语换成 PP-OCRv5 的分语种模型。
+
+        检测**始终**用 v6 medium —— 旋转文本 Hmean 93.8，没有理由动。
+
+        引擎按 (档位, 识别模型) 组合缓存：同一批贴图通常同语种，
+        不该每张图都重建引擎。
+        """
+        from . import rec_models
+
         want = self.tier
-        if self._engine is not None and self._tier == want:
+        rec = rec_models.resolve(src_lang)
+        rec_key = rec.lang if rec else "MULTI_V6"
+        cache_key = f"{want}|{rec_key}"
+        if self._engine is not None and self._tier == cache_key:
             return self._engine
 
         from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
@@ -223,10 +243,35 @@ class PPOcrV6Engine:
             "Det.model_type": model_type,
             "Det.lang_type": LangDet.CH,
             "Rec.engine_type": EngineType.ONNXRUNTIME,
-            "Rec.ocr_version": OCRVersion.PPOCRV6,
-            "Rec.model_type": model_type,
-            "Rec.lang_type": LangRec.CHINESE_CHT,
         }
+
+        if rec is None:
+            params["Rec.ocr_version"] = OCRVersion.PPOCRV6
+            params["Rec.model_type"] = model_type
+            params["Rec.lang_type"] = LangRec.CHINESE_CHT
+        else:
+            # 分语种模型走 `Rec.model_path` 直接指到文件，**不走 RapidOCR 的
+            # 版本+语种查找**。原因（读 rapidocr 3.9.2 源码确认）：
+            #   1. `utils/model_resolver.py` 的 MODEL_ROUTES **只注册了
+            #      PPOCRV6**，所以 `Rec.ocr_version=PPOCRV5` 会让
+            #      `resolve_model_key` 返回 None，随后查不到 model_dict，
+            #      直接抛 "Invalid OCR configuration." —— v5 模型**根本
+            #      无法通过常规配置路径到达**；
+            #   2. 就算能查到，PP-OCRv6 的 model_type 有 MEDIUM 而 v5 分语种
+            #      只有 mobile，组合对不上。
+            # 指定 model_path 时 RapidOCR 会跳过下载与校验，直接用这个文件。
+            allow_dl = bool(self._opt("allow_model_download", True))
+            path = rec_models.ensure_model(rec, self._data_root(), allow_download=allow_dl)
+            params["Rec.model_path"] = str(path)
+            # 这两项一起关掉，RapidOCR 就不会去下载检测模型或字典：
+            #   * `Global.model_root_dir` 已给 → 检测模型按 v6 清单解析；
+            #   * 识别模型的**字符集内嵌在 ONNX 里**（已实测：韩语模型的
+            #     metadata `character` 有 23890 项，以谚文字母开头），
+            #     所以 `get_character_dict()` 走 have_key() 分支，不需要字典文件。
+            params["Rec.lang_type"] = getattr(LangRec, rec.lang) \
+                if hasattr(LangRec, rec.lang) else rec.lang
+            log.info("识别语种 %s → %s（%.1f MB）", src_lang, rec.filename, rec.mb)
+
         if bool(self._opt("use_directml", True)):
             # 关键键名：RapidOCR 从 EngineConfig.onnxruntime 读 EP 配置。
             # 实测 DirectML 比 CPU 快 40~140 倍，是本工具可用性的前提。
@@ -236,16 +281,32 @@ class PPOcrV6Engine:
         if threads > 0:
             params["EngineConfig.onnxruntime.intra_op_num_threads"] = threads
 
-        log.info("加载 PP-OCRv6 %s 模型（%s）", want, self.model_dir())
+        log.info("加载 PP-OCR OCR 引擎（%s / 识别=%s，%s）", want, rec_key, self.model_dir())
         t0 = time.time()
         try:
             self._engine = RapidOCR(params=params)
         except Exception as exc:  # noqa: BLE001
-            self._load_error = f"PP-OCRv6 加载失败：{exc}"
+            self._load_error = f"PP-OCR 加载失败：{exc}"
             raise
-        self._tier = want
-        log.info("PP-OCRv6 %s 就绪，用时 %.1fs", want, time.time() - t0)
+        self._tier = cache_key
+        log.info("PP-OCR %s/%s 就绪，用时 %.1fs", want, rec_key, time.time() - t0)
         return self._engine
+
+    def _data_root(self) -> Path:
+        """分语种识别模型的落盘根目录（`<data_root>/models`）。
+
+        注意是 `models_dir()` 而不是 `data_root()` —— 后者少一层 `models/`，
+        会让模型落到 `<data_root>/rapidocr/rec/`，与 `model_dir()` 里
+        RapidOCR 实际查找的 `<data_root>/models/rapidocr/` 对不上，
+        表现为"明明下载成功了却还说缺模型"。
+        """
+        from ..core.paths import models_dir
+
+        try:
+            return Path(models_dir())
+        except Exception:  # noqa: BLE001
+            # 拿不到就退回 RapidOCR 模型目录的上一级，保证仍可下载
+            return self.model_dir().parent
 
     def unload(self) -> None:
         self._engine = None
@@ -281,7 +342,7 @@ class PPOcrV6Engine:
             arr = resize_rgb(arr, scale)
             log.debug("图像过大，缩放至 %.0f%% 再识别", scale * 100)
 
-        engine = self._ensure()
+        engine = self._ensure(self._source_lang())
         t0 = time.time()
         try:
             # text_score 是 RapidOCR 的置信度下限，低于它的框直接丢掉
@@ -299,17 +360,47 @@ class PPOcrV6Engine:
             tier=self._tier,
         )
 
+    def _source_lang(self) -> str | None:
+        """当前项目/配置里的源语言。
+
+        优先用 `ocr.lang`（显式覆盖），否则用翻译配置的 `source_lang` ——
+        用户为翻译选的语言，正是识别需要的语言，没必要让他填两遍。
+        """
+        explicit = self._opt("lang", "")
+        if explicit and str(explicit).lower() not in ("", "auto"):
+            return str(explicit)
+        tr = getattr(self.cfg, "translate", None)
+        src = getattr(tr, "source_lang", "") if tr is not None else ""
+        return str(src) if src else None
+
     def detect_and_recognize(
         self, image: Any, *, lang_hint: str | None = None
     ) -> list[ImageTextBlock]:
         """:class:`~novaloc.core.registry.OcrEngine` 协议入口。
 
-        ``lang_hint`` 目前只做日志记录：PP-OCRv6 的中英混排模型
-        本身就能处理多语种，不需要按语言换模型。
+        ``lang_hint`` 会覆盖配置里的源语言 —— 调用方（例如某个特定贴图）
+        比全局配置更清楚这张图是什么语言。
         """
-        if lang_hint:
-            log.debug("OCR 语言提示 %s（当前模型已支持中英混排，忽略）", lang_hint)
-        return self.read(image).blocks
+        return self.read(image).blocks if not lang_hint else self.read_with_lang(
+            image, lang_hint
+        )
+
+    def read_with_lang(self, image: Any, lang: str) -> list[ImageTextBlock]:
+        """按指定语种识别（临时切引擎，识别完切回）。"""
+        ok, why = self.available()
+        if not ok:
+            raise RuntimeError(why)
+        prev = self._tier
+        try:
+            engine = self._ensure(lang)
+            from .io import as_rgb_array
+
+            arr = as_rgb_array(image)
+            result = engine(arr)
+            return self._to_blocks(result, None, 1.0, "")
+        finally:
+            if prev:
+                self._tier = prev
 
     def _to_blocks(
         self, result: Any, score: float, scale: float, asset_uid: str

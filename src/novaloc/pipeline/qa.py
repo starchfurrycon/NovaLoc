@@ -136,6 +136,41 @@ def run_qa(ws: Workspace, ctx: Context) -> dict[str, Any]:
             samples=[{"source": k, "targets": v} for k, v in sample],
         ))
 
+    # ---- 2b. 反向碰撞：**不同的短标签**被译成了**同一个词** ----
+    #
+    # 这是上一条的镜像问题，而上面那条抓不到它。
+    #
+    # 实测来源：本机 `translategemma:4b` 把 `MP` 译成"生命值"（应为"魔法值"）。
+    # 原因很清楚：单条 UI 缩写几乎不携带上下文，模型只能猜。两种译法都
+    # "像那么回事"，既不是漏译、也不是占位符丢失、源文也各不相同，
+    # 所以传统的规则质检**挑不出任何毛病** —— 但玩家一眼就能看出是错的，
+    # 而一旦写回游戏就是既成事实。
+    #
+    # 只查"短标签"（无空格、长度 <= 4）：这类条目是 UI 上的独立标签，
+    # 语义几乎必然互不相同，撞成同词基本等于错译。长句撞词可能是正常的
+    # 同义表述，所以不查，避免用规则压住合理的翻译自由度。
+    #
+    # 判为 ERROR 而不是 WARN：撞词的短标签**一定**是用户可见的缺陷，
+    # 不存在"这样也可以"的解释空间。
+    _COLLIDE_MAX_LEN = 4
+    by_target: dict[str, set[str]] = defaultdict(set)
+    for e in entries:
+        src, tgt = e.source.strip(), e.target.strip()
+        if not src or not tgt:
+            continue
+        if len(src) > _COLLIDE_MAX_LEN or " " in src:
+            continue  # 只查 UI 短标签
+        by_target[tgt].add(src)
+    collisions = {t: sorted(s) for t, s in by_target.items() if len(s) > 1}
+    if collisions:
+        sample_c = [{"target": t, "sources": s} for t, s in list(collisions.items())[:10]]
+        issues.append(_issue(
+            Severity.ERROR, "consistency",
+            f"{len(collisions)} 个译文被多个不同的短标签共用（缩写很可能译错）："
+            + "；".join(f"{t} ← {'/'.join(s)}" for t, s in list(collisions.items())[:5]),
+            samples=sample_c,
+        ))
+
     # ---- 3. 字体覆盖：本工具的核心承诺 ----
     charset = ws.load_charset()
     n_missing_total = 0
