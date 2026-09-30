@@ -277,11 +277,34 @@ def _merge_via_files(fonts: list[TTFont], workdir: Path) -> TTFont:
     return Merger().merge(paths)
 
 
+#: 垂直度量字段的"正负号"语义。
+#: ``usWinDescent`` 在规范里是**正数**（表示基线下方的高度），
+#: 而 ``descent`` / ``sTypoDescender`` 是负数。缩放到别的 UPEM 时
+#: 必须保持符号，否则会让字体度量出现"下沿跑到基线上方"这种荒谬值。
+_METRIC_FIELDS = (
+    ("hhea", "ascent", +1),
+    ("hhea", "descent", -1),
+    ("hhea", "lineGap", +1),
+    ("OS/2", "sTypoAscender", +1),
+    ("OS/2", "sTypoDescender", -1),
+    ("OS/2", "sTypoLineGap", +1),
+    ("OS/2", "usWinAscent", +1),
+    ("OS/2", "usWinDescent", +1),
+)
+
+
 def _snapshot_metrics(font: TTFont) -> dict[str, dict[str, int]]:
     """在任何会改动字体的操作之前，把垂直度量抓成纯数值字典。
 
     必须快照，因为 Merger 会取两边度量的**最大值**，
     而我们需要的是 CJK 侧的原始值。
+
+    快照里的数值处于**该字体自己的 ``unitsPerEm`` 坐标系**。
+    调用方若要写进别的 UPEM 的字体，必须先用
+    :func:`_scale_metrics_snapshot` 换算 —— 直接写会造成
+    "UPEM 256 的字体带着 2048 的 ascender"，
+    渲染时文字被推到画布外，游戏里表现为**文字完全不可见**，
+    比缺字形（口口口）更难排查。
     """
     snap: dict[str, dict[str, int]] = {}
     hhea = font.get("hhea")
@@ -300,6 +323,37 @@ def _snapshot_metrics(font: TTFont) -> dict[str, dict[str, int]]:
             if hasattr(os2, a)
         }
     return snap
+
+
+def _scale_metrics_snapshot(
+    snap: dict[str, dict[str, int]], factor: float
+) -> dict[str, dict[str, int]]:
+    """把度量快照从一个 UPEM 坐标系线性换算到另一个。
+
+    ``factor = 目标 UPEM / 来源 UPEM``。
+
+    **为什么要按比例而不是直接沿用原值**：我们想要的是"CJK 字体的
+    行高**比例**"（例如 ascender/em ≈ 0.93），而不是它的绝对数值。
+    合并后的字体用自己的 UPEM，度量必须用同一坐标系表达。
+    """
+    if abs(factor - 1.0) < 1e-9:
+        return {t: dict(v) for t, v in snap.items()}
+
+    out: dict[str, dict[str, int]] = {}
+    for table_tag, attrs in snap.items():
+        new_attrs: dict[str, int] = {}
+        for attr, value in attrs.items():
+            sign = next(
+                (s for t, a, s in _METRIC_FIELDS if t == table_tag and a == attr), None
+            )
+            if sign is None:
+                new_attrs[attr] = value
+                continue
+            scaled = int(round(abs(value) * factor))
+            # 规范化符号：descent 类字段必须是负的，其余保持原符号
+            new_attrs[attr] = -scaled if sign < 0 else scaled
+        out[table_tag] = new_attrs
+    return out
 
 
 def _apply_metrics(font: TTFont, snap: dict[str, dict[str, int]]) -> dict[str, tuple[int, int]]:
@@ -636,6 +690,7 @@ def merge_fonts_multi(
         fonts: list[TTFont] = [base]
 
         metrics_snap: dict[str, dict[str, int]] = {}
+        metrics_snap_upem: int = base_upem
         remaining = set(needed)
 
         for idx, src in enumerate(sources):
@@ -656,7 +711,13 @@ def merge_fonts_multi(
             try:
                 extra = open_font(src)
                 if idx == 0 or not metrics_snap:
+                    # 快照发生在缩放**之前**，所以必须记下它当时所处的
+                    # UPEM 坐标系，稍后按比例换算到合并字体的 UPEM。
                     metrics_snap = _snapshot_metrics(extra)
+                    extra_head = extra.get("head")
+                    metrics_snap_upem = (
+                        extra_head.unitsPerEm if extra_head is not None else base_upem
+                    )
                 subset_font(extra, takes | {0x20}, retain_gids=False, drop_layout=True)
                 scaled = False
                 if extra.get("head") is not None and extra["head"].unitsPerEm != base_upem:
@@ -699,7 +760,14 @@ def merge_fonts_multi(
 
         if metrics_snap:
             try:
-                changed = _apply_metrics(merged, metrics_snap)
+                # 关键：快照是在补充字体**自己的 UPEM** 下抓的，
+                # 而合并且字体用的是 base_upem。不换算就写回去会得到
+                # "UPEM 256 却带 ascender 2210" 的字体 —— 渲染时文字被
+                # 推到画布外，游戏里表现为文字完全不可见（比口口口更难查）。
+                scaled_snap = _scale_metrics_snapshot(
+                    metrics_snap, base_upem / float(metrics_snap_upem or base_upem)
+                )
+                changed = _apply_metrics(merged, scaled_snap)
                 if changed:
                     report.metrics_changed = changed
             except Exception as exc:  # noqa: BLE001

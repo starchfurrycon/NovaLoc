@@ -1215,13 +1215,12 @@ def run(
     if failed is not None:
         label = STAGE_LABELS.get(failed.stage, failed.stage)
         console.print(f"[bold red]✗ 阶段「{label}」失败：{failed.message}[/bold red]")
-        if results:
-            last_ok = [r for r in results if r.ok]
-            console.print(
-                f"已完成 {len(last_ok)}/{len(todo)} 个阶段。"
-                f"修掉上面的问题后可以只重跑该阶段："
-                f"[bold]novaloc run {ws.project.id} --stage {failed.stage}[/bold]"
-            )
+        done = sum(1 for r in results if r.ok)
+        console.print(
+            f"计划 {len(todo)} 个阶段，成功 {done} 个后中止。"
+            f"修掉上面的问题后可以只重跑失败的那个阶段："
+            f"[bold]novaloc run {ws.project.id} --stage {failed.stage}[/bold]"
+        )
         raise typer.Exit(code=1)
 
     if results and all(r.ok for r in results):
