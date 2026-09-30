@@ -182,8 +182,14 @@ def main() -> int:
     check("修正后四边形（quad）完全没变",
           fixed is not None and [tuple(p) for p in fixed.quad] == [tuple(p) for p in orig_quad],
           f"{fixed.quad if fixed else None}")
-    check("修正后置信度被抬到阈值以上",
-          fixed is not None and fixed.confidence >= 0.6, str(fixed.confidence if fixed else None))
+    # 这一条以前断言"置信度被抬到阈值以上"，那是在**保护一个 bug**：
+    # 旧代码写 `b.confidence = max(原值, thr)`，把 VLM 的答案（很可能是
+    # 垃圾，实测它真回过 `'? ? ? ? ? ? ?'`）凭空提升到"可信"档，
+    # 下游质检和审校页就再也看不出这块可疑了。
+    # VLM 给不出置信度，所以正确的做法是**保持 OCR 的原值**。
+    check("修正后置信度保持 OCR 原值（不凭空抬高）",
+          fixed is not None and fixed.confidence == 0.31,
+          str(fixed.confidence if fixed else None))
     check("高置信度的块未被牵连",
           got.get("Options") is not None and "vlm_reread" not in got["Options"].warnings,
           str(got.get("Options").warnings if got.get("Options") else None))

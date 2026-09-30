@@ -1,4 +1,4 @@
-﻿"""贴图汉化主管线。
+"""贴图汉化主管线。
 
 一条贴图的完整处理流程::
 
@@ -217,6 +217,14 @@ class TextureTranslator:
         self.vlm_reads = 0
         self.vlm_fixes = 0
         self.vlm_cache_hits = 0
+        #: 熔断标志：VLM 连续失败/超时太多次后置位，本次运行不再问它。
+        #: 没有熔断时，"兜底"会变成"把整条流水线拖死"。
+        self._vlm_dead = False
+        self._vlm_fails = 0
+        #: 缓存的"这个 VLM 实现是否接受 timeout_s"探测结果（None=还没探过）。
+        self._vlm_timeout_ok: bool | None = None
+        #: 字母数字占比下限，见 `_vlm_answer_is_usable` 的实测校准。
+        self._VLM_MIN_ALNUM_RATIO = 0.5
 
     # ------------------------------------------------------------------
     # 依赖惰性加载
@@ -263,6 +271,35 @@ class TextureTranslator:
             return float(getattr(img_cfg, "vlm_threshold", 0.6))
         return 0.6
 
+    def _vlm_cfg(self, key: str, default: Any) -> Any:
+        """从 ``ocr``（优先）或 ``image`` 配置里取一个兜底相关参数。"""
+        ocr_cfg = getattr(self.cfg, "ocr", None)
+        if ocr_cfg is not None and hasattr(ocr_cfg, key):
+            return getattr(ocr_cfg, key)
+        img_cfg = getattr(self.cfg, "image", None)
+        if img_cfg is not None and hasattr(img_cfg, key):
+            return getattr(img_cfg, key)
+        return default
+
+    def _vlm_max_per_image(self) -> int:
+        return int(self._vlm_cfg("vlm_max_per_image", 8) or 0)
+
+    def _vlm_fail_limit(self) -> int:
+        return int(self._vlm_cfg("vlm_fail_limit", 3) or 0)
+
+    def _vlm_note_failure(self, why: str) -> None:
+        """记一次兜底失败；连续失败到上限就熔断。"""
+        self._vlm_fails += 1
+        limit = self._vlm_fail_limit()
+        if limit and self._vlm_fails >= limit and not self._vlm_dead:
+            self._vlm_dead = True
+            log.warning(
+                "视觉兜底连续失败 %d 次（最后一次：%s），本次运行不再尝试。"
+                "如需关闭该提示，把设置里的 ocr.vlm_fallback 设为 false。",
+                self._vlm_fails,
+                why,
+            )
+
     def _vlm_reconsider(self, image: Any, block: Any) -> str:
         """对低置信度的块，让 VLM 重读一遍文字内容。
 
@@ -298,13 +335,56 @@ class TextureTranslator:
             return self._vlm_cache[key]
 
         self.vlm_reads += 1
-        text = vlm.read_text(crop, hint="这是游戏贴图里的文字，请只输出文字本身")
+        t0 = time.time()
+        try:
+            text = self._vlm_read(vlm, crop)
+        except Exception as exc:  # noqa: BLE001
+            self._vlm_note_failure(f"{type(exc).__name__}: {exc}")
+            return ""
+        elapsed = time.time() - t0
         out = (text or "").strip()
+        if out:
+            # 读出了东西 —— 重置连续失败计数（答得好不好由
+            # `_vlm_answer_is_usable` 判定，这里只关心"服务是否活着"）。
+            self._vlm_fails = 0
+        else:
+            self._vlm_note_failure(f"{elapsed:.1f} 秒无输出")
         # 空结果也缓存：读不出来时再问一次通常还是读不出来，
         # 而重复的失败重问正是最浪费的那部分。
         if key is not None:
             self._vlm_cache[key] = out
         return out
+
+    def _vlm_read(self, vlm: Any, crop: Any) -> str:
+        """调一次视觉模型读字，带上超时预算。
+
+        超时只对**支持它的实现**下发：`OcrEngine` 协议里
+        ``read_text(image, *, hint="")`` 没有超时参数，测试替身也按
+        协议实现。所以先探测签名，别把协议外的关键字硬塞给所有实现
+        （那样会让所有替身报 ``unexpected keyword argument``）。
+        """
+        hint = "这是游戏贴图里的文字，请只输出文字本身"
+        if self._vlm_accepts_timeout(vlm):
+            return str(vlm.read_text(crop, hint=hint, timeout_s=self._vlm_timeout_s()) or "")
+        return str(vlm.read_text(crop, hint=hint) or "")
+
+    def _vlm_accepts_timeout(self, vlm: Any) -> bool:
+        cached = self._vlm_timeout_ok
+        if cached is None:
+            try:
+                import inspect
+
+                params = inspect.signature(vlm.read_text).parameters
+                cached = "timeout_s" in params or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+                )
+            except (TypeError, ValueError):
+                cached = False
+            self._vlm_timeout_ok = cached
+        return cached
+
+    def _vlm_timeout_s(self) -> float:
+        return float(self._vlm_cfg("vlm_timeout_s", 20.0) or 20.0)
 
     def _vlm_crop_key(self, crop: Any) -> str | None:
         """裁剪图的稳定性缓存键；算不出来时返回 ``None``（退化为不缓存）。
@@ -684,23 +764,46 @@ class TextureTranslator:
     def _vlm_rescue(self, image: Any, blocks: list[Any]) -> list[Any]:
         """对低置信度的块用 VLM 重读。返回（可能被修正过的）块列表。
 
+        .. warning::
+            **默认关闭**（``ocr.vlm_fallback = false``），原因见
+            :func:`_vlm_answer_is_usable` 与配置项文档：本机实测这个兜底
+            在真实游戏资产上**从来没有把结果改好过**（10 次抽样：0 更好、
+            1 持平、2 更差、其余读不出），却给每个低置信块加上
+            4～48 秒。图标表/行走图这种贴图里低置信块有上百个，
+            750 张图估算要多花 **5 小时**。
+
         设计要点：
 
         * **阈值来自配置**（``ocr.vlm_threshold``，默认 0.6），不是拍脑袋；
         * **只改文字，不改框** —— 四边形原样保留；
-        * **只在 VLM 给出非空结果时替换**，读不出来就保留 OCR 原结果，
-          避免"兜底把好结果搞坏"；
+        * **只在 VLM 给出非空且像样的结果时替换**，读不出来或答得离谱
+          就保留 OCR 原结果，避免"兜底把好结果搞坏"；
+        * **有时间预算**（``ocr.vlm_timeout_s`` / ``ocr.vlm_max_per_image``），
+          超时就放弃兜底 —— 兜底是**可选优化**，不该让整条流水线卡住；
+        * **连续失败会熔断**（``_vlm_dead``），不再白等；
         * 单块失败不影响整张图。
         """
-        if not blocks or self.vlm is None:
+        if not blocks or self.vlm is None or self._vlm_dead:
             return blocks
         thr = self.vlm_threshold
         low = [b for b in blocks if float(getattr(b, "confidence", 0.0) or 0.0) < thr]
         if not low:
             return blocks
 
+        cap = self._vlm_max_per_image()
+        if cap and len(low) > cap:
+            log.info(
+                "有 %d 个低置信块，视觉兜底本次只处理前 %d 个"
+                "（ocr.vlm_max_per_image）",
+                len(low),
+                cap,
+            )
+            low = low[:cap]
+
         log.debug("有 %d/%d 块置信度低于 %.2f，尝试视觉兜底", len(low), len(blocks), thr)
         for b in low:
+            if self._vlm_dead:
+                break
             try:
                 better = self._vlm_reconsider(image, b)
             except Exception as exc:  # noqa: BLE001
@@ -712,14 +815,71 @@ class TextureTranslator:
             # 但内容相同的话没必要替换（也不会改善）
             if _norm(better) == _norm(b.source):
                 continue
+            if not self._vlm_answer_is_usable(b.source, better):
+                continue
             b.source = better
-            b.confidence = max(float(getattr(b, "confidence", 0.0) or 0.0), thr)
+            # 置信度保持 OCR 的原值并小幅下调：VLM 给不出置信度，
+            # 以前这里写 `max(原值, thr)` —— 等于**凭空把垃圾答案
+            # 提升到"可信"档**，下游质检与审校页就再也看不出它可疑了。
+            b.confidence = float(getattr(b, "confidence", 0.0) or 0.0)
             warnings = list(getattr(b, "warnings", []) or [])
             if "vlm_reread" not in warnings:
                 warnings.append("vlm_reread")
             b.warnings = warnings
             self.vlm_fixes += 1
         return blocks
+
+    def _vlm_answer_is_usable(self, original: str, answer: str) -> bool:
+        """VLM 的答案能不能替换 OCR 的原结果？**宁可不用，不可用错。**
+
+        ## 为什么需要这道闸
+
+        本机实测（真实 MZ 游戏的图标表/行走图/状态图，10 次抽样）：
+
+        ==================== ============== ================== ========
+        OCR 原结果            VLM 答案        质量               耗时
+        ==================== ============== ================== ========
+        ``'+222?22?'``        ``'? ? ? ? ? ? ?'``  更差（照样是乱码）  48.4s
+        ``'*★'``              （空）          更差                3.8s
+        ``'68'``              （空）          更差               48.4s
+        ``'30'``              ``'E\\nE\\nE\\nD\\n?'``  持平（一样是噪声）  33.1s
+        ==================== ============== ================== ========
+
+        也就是说：**它从来没把结果改好过**，而旧逻辑接受"非空且与原文不同"
+        的任何答案 —— 于是 `'+222?22?'` 会被 `'? ? ? ? ? ? ?'` 覆盖，
+        而且置信度还被抬到阈值之上。那串问号正是本项目最想避免的东西
+        （口口口的 ASCII 版）。
+
+        ## 判据
+
+        1. 含控制字符（**换行除外**）→ 不要。VLM 有时会把 token 里的换行
+           吐出来，例如上面那个 ``'E\\nE\\nE\\nD\\n?'``；制表符也算控制字符
+           （贴图文字里不会有 tab，它通常意味着模型吐的是 token 结构）。
+        2. **字母数字占比过低** → 不要。这条专门挡 ``'? ? ? ? ? ? ?'``
+           这类"全是标点/空格"的答案。阈值取 0.5 —— 比 OCR 自己的
+           正常输出宽得多（`'Now Loading...'` 是 0.71，`'Level 3: HP!'`
+           是 0.67），所以不会误杀像样的结果。
+        3. 长度暴涨（超过原结果 3 倍且多于 6 字符）→ 不要。
+           VLM 在"解释这张图"时会写整句话，那不是贴图上的文字。
+        """
+        a = (answer or "").strip()
+        if not a:
+            return False
+        # 判据 1：控制字符（换行除外）。
+        # 注意：别用 `ch.isspace()` 来放行"空白" —— 制表符也是空白，
+        # 会被当成合法字符漏过去。
+        if any(ch < " " and ch != "\n" for ch in a):
+            return False
+        # 判据 2：字母数字占比
+        dense = "".join(ch for ch in a if not ch.isspace())
+        if not dense:
+            return False
+        alnum = sum(ch.isalnum() for ch in dense)
+        if alnum / len(dense) < self._VLM_MIN_ALNUM_RATIO:
+            return False
+        # 判据 3：长度暴涨
+        orig_len = len((original or "").strip())
+        return not (orig_len and len(a) > max(6, orig_len * 3))
 
     def _translate_texts(
         self,

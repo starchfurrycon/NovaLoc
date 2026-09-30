@@ -139,8 +139,13 @@ class OllamaVisionEngine:
 
     # ------------------------------------------------------------------
 
-    def read_text(self, image: Any, *, hint: str = "") -> str:
-        """读图里的文字。失败返回空串（调用方会保留原 OCR 结果）。"""
+    def read_text(self, image: Any, *, hint: str = "", timeout_s: float | None = None) -> str:
+        """读图里的文字。失败返回空串（调用方会保留原 OCR 结果）。
+
+        ``timeout_s`` 是读取超时（秒）；超时**不抛异常**，返回空串，
+        调用方保留原 OCR 结果。贴图兜底会传一个较短的值，
+        避免 thinking 模型拖死整条流水线。
+        """
         ok, why = self.available()
         if not ok:
             log.debug("视觉模型不可用：%s", why)
@@ -151,8 +156,11 @@ class OllamaVisionEngine:
             prompt = f"{prompt}\n\n补充线索：{hint}"
 
         try:
-            raw = self._chat_vision(prompt, image)
+            raw = self._chat_vision(prompt, image, read_timeout=timeout_s)
         except Exception as exc:  # noqa: BLE001
+            # 这里的异常也包含 httpx.ReadTimeout（它继承自 Exception，
+            # 没有更专用的基类）。保持"失败返回空串"的契约不变 ——
+            # `OcrEngine` 协议就是这么定的，调用方靠空串判断"没读到"。
             log.warning("视觉模型读字失败：%s", exc)
             return ""
 
@@ -179,8 +187,16 @@ class OllamaVisionEngine:
 
     # ------------------------------------------------------------------
 
-    def _chat_vision(self, prompt: str, image: Any) -> str:
-        """Ollama 的 ``/api/chat`` 支持在 message 里带 ``images``（base64）。"""
+    def _chat_vision(self, prompt: str, image: Any, *, read_timeout: float | None = None) -> str:
+        """Ollama 的 ``/api/chat`` 支持在 message 里带 ``images``（base64）。
+
+        ``read_timeout`` 覆盖读取超时（秒）。调用方（贴图兜底）会传一个
+        比全局 ``ollama.request_timeout_s`` 短得多的值：全局超时是按
+        "翻译一整段文字"定的，而兜底是**可有可无**的逐块重读 ——
+        实测本机 ``qwen3-vl:4b`` 对 389x57 的小裁剪要 10～48 秒
+        （thinking 模型，一次回答生成 600～750 个推理 token），
+        让每个低置信块都能等 48 秒会把整个贴图阶段拖死。
+        """
         import httpx
 
         o = self.cfg.ollama
@@ -191,7 +207,12 @@ class OllamaVisionEngine:
             "stream": False,
             "options": {"temperature": 0.0},
         }
-        timeout = httpx.Timeout(connect=5.0, read=o.request_timeout_s, write=60.0, pool=5.0)
+        timeout = httpx.Timeout(
+            connect=5.0,
+            read=float(read_timeout if read_timeout is not None else o.request_timeout_s),
+            write=60.0,
+            pool=5.0,
+        )
         with httpx.Client(timeout=timeout) as client:
             r = client.post(f"{host}/api/chat", json=payload)
             r.raise_for_status()
