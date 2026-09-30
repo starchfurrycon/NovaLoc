@@ -158,10 +158,13 @@
   否则开发态沿用仓库里的 `data/`，非开发态在 Windows 上遍历 `D:`~`H:` **挑可用空间最大的
   分区**（`_pick_big_disk_base()`）。这个设计的原因是明确的：C 盘是本机最紧张的分区，
   而模型 + 工作区副本动辄几十 GB。
-- **配置文件**实际是 `<data_root>/config.json`（见 `cli.py:config_path()` 与
-  `api/jobs.py:load_config()`），不是 `core/config.py` 里的 TOML 路径。
-  `Config.load()` 的 TOML 路径属于早期格式，`cli.load_config()` 只在 JSON 不存在时
-  才回退去读它。
+- **配置文件的唯一权威位置是 `<data_root>/config.json`（JSON）**，
+  由 `core/paths.py:config_json()` 给出，`Config.load()` / `Config.save()`
+  直接读写它（`api/jobs.py:load_config()` 与 CLI 都委托给这两个方法）。
+  早期还有一条 `<config_dir>/config.toml` 的路径，现已**降级为只读回退**：
+  若 JSON 不存在而 TOML 存在，会读它并**自动迁移**成 JSON，老用户不丢配置。
+  统一之前两边会各写各的（同一个 JSON 路径，一边用 `tomli_w`、一边用
+  `model_dump_json`），用户在网页设置里改的项命令行看不到。
 - **写入是原子的**：`_atomic_write()` 与 `_write_jsonl()` 都先写 `.tmp` 再 `replace()`。
 - **单行损坏不会毁掉整个列表**：`_read_jsonl()` 对解析失败的行 `continue`。
 - `Workspace.delete()` 有一个安全判断：只有当 `root.parent == paths.workspaces_dir()`
@@ -643,7 +646,8 @@ class MyProvider:
 | `ocr_ppocrv6.py` | `available()` 只检查 `import rapidocr`，不检查模型是否已下载 | `doctor` 能报出模型目录为空，但 OCR 适配器本身会显示"可用" |
 | `pipeline/stages.py::stage_apply` | 只把 `action == "merge"` 的补丁传给适配器 | `replace` / `fallback_only` 策略产出的字体不会通过这条路径回写 |
 | `engines/base.py::wire_fonts` 默认实现 | 返回空列表（不改任何东西） | **只有 `rpgmaker` 与 `renpy` 覆写了它**；`unity` 与 `loose` 没有。Unity 的字体指向需要处理 TMP，见 `docs/FONTS.md` |
-| `api/jobs.py` 与 `core/config.py` | 配置实际是 `<data_root>/config.json`，而 `core/config.py` 的读写走 `<config_dir>/config.toml` | 两套格式并存；`cli.load_config()` 做了 JSON → TOML 的回退，但 `core.get_config()` 只读 TOML |
+| ~~`api/jobs.py` 与 `core/config.py` 配置格式一分为二~~ | **已修**：统一到 `<data_root>/config.json`，`Config.load/save` 是唯一实现，API 与 CLI 都委托给它；旧 TOML 只在 JSON 缺失时作只读回退并自动迁移 | — |
 | `pipeline/stage_images_localize` | 逐图串行处理 | 大项目贴图多时耗时长；并发会争抢 GPU，所以是有意保守 |
 | `images/service.py::_vlm_rescue` | 逐块串行调用视觉模型，且**没有缓存** | 一张图里低置信度的块多时会连续发多次 `/api/chat`；同一文字块在别的图上重复出现也要重问。`vlm_reads` / `vlm_fixes` 两个计数器可用于观察命中率 |
-| `tests/` 目录 | 不存在，而 `pyproject.toml` 的 `testpaths = ["tests"]` | `pytest` 收集不到测试；真实测试在 `.scratch/` 下（见 `docs/ROADMAP.md` 第 1.7 节） |
+| ~~`tests/` 目录不存在~~ | **已修**：16 个套件在 `tests/`，`pytest tests -q` 全量 18/18；CI 按 marker 跑无需模型/GPU 的 12 个（见 `tests/README.md`） | 少数套件在固定目录留产物并被后续断言读取，套件之间有轻微顺序耦合（README 里已注明） |
+| `images/service.py::_pick_font` 的字体解析 | 已改为走 `FontService`（系统字体索引 + 缓存 + 可再分发下载） | `_system_font_index()` 用"目录 mtime 摘要"做缓存键，进程内只扫一次 |

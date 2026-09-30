@@ -223,9 +223,19 @@ novaloc run <id> --stage apply
 
 ```powershell
 pip install -e ".[dev]"
-pytest                      # 单元测试
-python .scratch/test_api_e2e.py   # 后端端到端（含 WebSocket）
+
+# 全量测试（16 个套件 / 18 个 pytest 项，约 3 分钟）
+pytest tests -q
+
+# 单个套件也能直接当脚本跑，输出带实测数字的分节报告
+python tests\test_font_real.py      # 用真实字体验证合并（覆盖率、UPEM 度量、渲染墨迹）
+python tests\test_api_e2e.py        # 后端端到端（32 条路由 + WebSocket）
 ```
+
+有些套件需要本机资源（中文字体、DirectML、OCR 模型），**缺失时会 skip
+而不是失败**。CI 只跑无需这些前提的子集，所以"CI 绿了"不等于"功能正确" ——
+字体合并与贴图重绘只有在本机才能验证。细节见
+[tests/README.md](tests/README.md)。
 
 架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，
 字体机制见 [docs/FONTS.md](docs/FONTS.md)，

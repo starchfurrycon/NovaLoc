@@ -138,29 +138,54 @@ API 文档页：`/api/docs`。
 
 ### 1.7 测试现状（重要）
 
-**测试代码在 `.scratch/` 下，不在 `tests/`。** 共 20 余个脚本，覆盖
-占位符、JSON 解析、字体合并、字体子系统、字体接线、字符集合并、OCR 适配器、
+**测试代码在 `tests/` 下。** 共 16 个套件，覆盖
+占位符、JSON 解析、字体合并、字体接线、字符集合并、
 贴图管线、贴图服务、翻译集成、四个引擎的抽取、端到端 API（含 WebSocket）、
-流水线端到端。
+流水线端到端，以及**用真实字体**验证字体合并的 `test_font_real.py`。
 
-但 `pyproject.toml` 里的 pytest 配置是：
-
-```toml
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests -q          # 全量 18/18
+.\.venv\Scripts\python.exe tests\test_font_real.py     # 单跑，输出实测数字
 ```
 
-**而 `tests/` 目录不存在。** 所以：
+（早期这些脚本散在 `.scratch/` 下，而 `pyproject.toml` 的
+`testpaths = ["tests"]` 指向一个不存在的目录 —— pytest 会以
+"no tests ran"（退出码 5）静默通过，看起来是绿的其实一条没跑。
+现已修正，详见 [tests/README.md](../tests/README.md)。）
 
-- `pytest`（README 里"开发"一节推荐的命令）当前会**收集不到任何测试**；
-- README 里写的 `python .scratch/test_api_e2e.py` 是有效的用法。
+CI 现在会跑**不需要模型与 GPU** 的那部分：
 
-这是一个应当修的不一致：要么把测试移进 `tests/`，要么改 `testpaths`。
-**本路线图把它列为待办，但不擅自移动文件。**
+```
+pytest tests -q -m "not needs_fonts and not needs_gpu and not needs_models"
+```
 
-为什么要说明这一点：CI 里**故意不跑完整测试套件**，因为真实测试需要 OCR 模型
-和 GPU（见 [.github/workflows/ci.yml](../.github/workflows/ci.yml) 的注释）。
-所以"CI 绿了"**不等于**"功能正确"。
+需要模型 / GPU / 系统字体的套件在本地跑。**所以"CI 绿了"仍然不等于
+"功能正确"** —— 字体合并、OCR、贴图重绘这些核心环节只有在本机才能验证。
+
+---
+
+## 1.8 字体合并的垂直度量必须按 UPEM 换算（已修，记录以备回归）
+
+实测数据（`tests/test_font_real.py`）：
+
+| 字体 | unitsPerEm | hhea.ascender | asc/upem |
+| --- | --- | --- | --- |
+| `simhei.ttf`（基准） | 256 | 220 | 0.86 |
+| `lxgw-wenkai-screen.ttf`（补充） | 2048 | 1900 | 0.93 |
+| 合并产物（**修复前**） | 256 | **2210** | **8.63** ← 错 |
+| 合并产物（修复后） | 256 | 238 | 0.93 |
+
+根因：`_snapshot_metrics()` 在补充字体**自己的 UPEM 坐标系**下抓度量，
+随后被原样写进 UPEM=256 的合并字体；`fontTools` 的 `Merger` 会把字形
+缩放到 `base_upem`，但度量没人管。
+
+后果比缺字形更糟：Pillow 把文字排到 y=399（48px 画布之外），
+游戏里表现为**文字彻底不可见**，而所有静态检查（cmap、轮廓数、
+水平度量、FreeType 可加载）**全部通过** —— 也就是"QA 说没问题，
+游戏里什么都看不到"。这正是本项目最想避免的那类假成功。
+
+现在的判据：`ascender / unitsPerEm` 的比值必须与基准字体同量级。
+静态不变量查不出这类错误，必须**实际渲染并检查墨迹**。
 
 ---
 
@@ -356,15 +381,17 @@ API 也已经有 `GET /api/projects/{pid}/images/{uid}/annotated`。
 
 | # | 问题 | 影响 | 状态 |
 |---|---|---|---|
-| 1 | `images/service.py::_pick_font()` 用硬编码路径列表找中文字体；`FontSpec.local_path` 属性不存在，所以目录查找分支实际不生效 | 非 Windows 或字体不在默认路径时，贴图重绘抛"找不到可用的中文字体" | 🔜 待修 |
+| 1 | ~~`images/service.py::_pick_font()` 用硬编码路径列表找中文字体；`FontSpec.local_path` 属性不存在，所以目录查找分支实际不生效~~ | **已修**：改走 `FontService`（系统字体索引 → 缓存 → 可再分发下载）。顺带发现 `_find_system_font()` 每次要 rglob 并逐个解析整个字体目录（实测 0.3~1.5 秒/次），而 `_pick_font` 会按十几个家族名各找一次 —— 每张贴图白花十几秒。已加进程级索引缓存（首次 2.2 秒，之后 0.000 秒） | ✅ 已完成 |
 | 2 | `pipeline/stage_apply` 只把 `action == "merge"` 的字体补丁传给适配器 | `replace` / `fallback_only` 策略的产物不会通过这条路径回写，需要手工放置 | 🔜 待修 |
 | 3 | `engines/unity.py` 与 `engines/loose.py` **没有覆写 `wire_fonts()`** | 字体文件放进了输出目录，但引擎不会去用它（需要用户手工处理，或等第 2.3 节） | 🔜 待修（依赖 2.1） |
 | 4 | ~~`translate` 包没有 `__init__.py`~~ | 已修：`src/novaloc/translate/__init__.py` 已加入。它刻意**不在 `__init__` 里即时导入子模块**（避免循环依赖与"一 import 就注册 provider"的副作用），改用 `__getattr__` 做懒加载 | ✅ 已完成 |
-| 5 | 配置有两套格式：`<data_root>/config.json`（CLI 与 API 实际使用）与 `<config_dir>/config.toml`（`core/config.py` 的 `Config.load/save`） | `cli.load_config()` 做了 JSON → TOML 的回退，但 `core.get_config()` 只读 TOML。两条路径可能看到不同的配置 | 🔜 待修 |
-| 6 | `tests/` 目录不存在，而 `pyproject.toml` 的 `testpaths = ["tests"]` | `pytest` 收集不到测试；真实测试在 `.scratch/` 下 | 🔜 待修 |
+| 5 | ~~配置有两套格式：`<data_root>/config.json` 与 `<config_dir>/config.toml`~~ | **已修**：统一到 `<data_root>/config.json`。`Config.load/save` 是唯一实现，API 与 CLI 都委托给它；旧 TOML 只在 JSON 缺失时作只读回退并**自动迁移**，老用户不丢配置 | ✅ 已完成 |
+| 6 | ~~`tests/` 目录不存在，而 `testpaths = ["tests"]`~~ | **已修**：16 个套件搬进 `tests/`，`pytest tests -q` 全量 18/18。CI 也改为按 marker 跑无需模型/GPU 的 12 个（之前 CI **完全不跑 pytest**，纯逻辑回归只能靠人肉发现） | ✅ 已完成 |
 | 7 | `ocr_ppocrv6.py::available()` 只检查 `import rapidocr`，不检查模型是否已下载 | `doctor` 的适配器表里 OCR 会显示"可用"，但首次识别会去联网下载模型；离线环境下会失败 | 🔜 待修 |
 | 8 | `stage_images_localize` 逐图串行 | 贴图多的大项目耗时长。并发会争抢 GPU，所以是有意保守，但可以做成"OCR 与重绘流水线化" | 🔍 调研中 |
 | 9 | 视觉兜底**逐块串行、无缓存** | 一张图里低置信度块多时会连发多次 `/api/chat`；同一文字在别的图上重复出现要重问 | 🔜 待修（低成本高收益） |
+| 10 | `novaloc serve --reload` 曾是空操作 | **已修**：uvicorn 的 reload 需要可导入字符串才能起子进程；传 app 实例时它只打一行 warning 然后静默忽略。已改为 `"novaloc.api.app:create_app"` + `factory=True` | ✅ 已完成 |
+| 11 | `Providers.diagnostics()` 把四个引擎全报成不可用 | **已修**：对 `kind == "engine"` 也调 `available()`，而 `EngineAdapter` 没有该方法，于是 detail 是 `'RpgMakerAdapter' object has no attribute 'available'`。用户看到"四个引擎全部不可用"会以为工具坏了 | ✅ 已完成 |
 
 ---
 
