@@ -1,4 +1,4 @@
-"""贴图汉化主管线。
+﻿"""贴图汉化主管线。
 
 一条贴图的完整处理流程::
 
@@ -486,9 +486,34 @@ class TextureTranslator:
             return result
         if raw.ndim == 2:
             raw = np.stack([raw] * 3, axis=-1)
+            alpha = None
         elif raw.shape[2] == 4:
-            raw = raw[:, :, :3]
+            # ---- alpha 必须单独留一份 ----
+            # 整条处理链（inpaint / 重绘 / 色调统计）都只吃 3 通道，
+            # 所以这里要把 alpha 摘掉。但**不能丢掉**：
+            # RPG Maker 的 UI 贴图（Window / ButtonSet / 各种图标）大量
+            # 依赖透明通道，写回一张不透明的图会让本来透明的地方变成
+            # 黑块或实心方块 —— 那是很显眼的画面损坏。
+            #
+            # 关键细节：`raw[:, :, :3]` 拿到的是**视图**，之后任何
+            # `canvas[y1:y2, x1:x2] = ...` 都会连 alpha 一起截断成 3 通道；
+            # 所以这里必须先 copy 出来，且 alpha 也单独存。
+            alpha = raw[:, :, 3].copy()
+            raw = np.ascontiguousarray(raw[:, :, :3])
+        else:
+            alpha = None
         asset.width, asset.height = raw.shape[1], raw.shape[0]
+
+        def _restore_alpha(img: np.ndarray) -> np.ndarray:
+            """把原图 alpha 贴回处理结果（尺寸一致才贴，否则原样返回）。"""
+            if alpha is None or img is None or img.ndim != 3:
+                return img
+            if img.shape[0] != alpha.shape[0] or img.shape[1] != alpha.shape[1]:
+                return img
+            if img.shape[2] == 4:
+                return img
+            return np.dstack([img[:, :, :3], alpha])
+
 
         # ---- 1. OCR ----
         t0 = time.time()
@@ -531,7 +556,7 @@ class TextureTranslator:
         asset.analyzed = True
         if not blocks:
             # 没文字，原图返回，不算失败
-            result.image = raw
+            result.image = _restore_alpha(raw)
             result.total_ms = (time.time() - t_start) * 1000
             return result
 
@@ -553,7 +578,7 @@ class TextureTranslator:
                 f"判定为无文字/误检，跳过重绘："
                 + "、".join(repr(str(getattr(b, "source", ""))[:12]) for b in blocks[:5])
             )
-            result.image = raw
+            result.image = _restore_alpha(raw)
             result.total_ms = (time.time() - t_start) * 1000
             return result
 
@@ -591,7 +616,7 @@ class TextureTranslator:
             texts, lang, existing or {}, glossary or [], context_lines or [], p, dry_run
         )
         if dry_run:
-            result.image = raw
+            result.image = _restore_alpha(raw)
             result.outcomes = [
                 BlockOutcome(block_id=b.id, source=b.source, target="")
                 for b in blocks
@@ -650,7 +675,7 @@ class TextureTranslator:
                 )
                 result.outcomes.append(outcome)
 
-        result.image = canvas
+        result.image = _restore_alpha(canvas)
         result.total_ms = (time.time() - t_start) * 1000
         return result
 
