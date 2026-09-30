@@ -53,6 +53,7 @@ from ..models import (
     json_dumps,
 )
 from . import paths
+from .sanitize import sanitize_tree
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -80,13 +81,48 @@ def _read_jsonl(path: Path, model: type[T]) -> list[T]:
     return out
 
 
+def _json_safe(model: BaseModel) -> str:
+    """``model_dump_json()``，但把无法编码的孤立代理项替换掉。
+
+    `model_dump_json()` 在遇到孤立代理项时会抛
+    `PydanticSerializationError`（其内部 `to_json()` 用
+    `ensure_ascii=False`，直接编 UTF-8）。这里改用
+    `model_dump(mode="json")` + 净化 + `json.dumps`，
+    保证**永远**能写出合法 UTF-8。
+
+    只用 `errors="replace"` 之类的"事后补救"不行 —— 序列化那一步本身
+    就抛了，根本走不到写文件。必须在**序列化之前**把字符换掉。
+    """
+    data = sanitize_tree(model.model_dump(mode="json"))
+    # 必须和 `model_dump_json()` 的输出**逐字节一致**：
+    # `ensure_ascii=False` 让中文是明文（便于用户直接看和 diff），
+    # `separators=(",", ":")` 复现 pydantic 的紧凑格式（无空格）。
+    # 少了 separators 会给每个键值多一个空格，整仓库的 jsonl 产物
+    # 都会变样，用户已有的文件 diff 会炸开。
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
 def _write_jsonl(path: Path, items: Iterable[BaseModel]) -> int:
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     n = 0
     with tmp.open("w", encoding="utf-8", newline="\n") as fh:
         for it in items:
-            fh.write(it.model_dump_json())
+            # 产物落盘是**最后一道防线**：任何来源的孤立代理项都不能让
+            # 整个阶段崩掉。真实事故：一次翻译跑完 848 条后在
+            # `save_entries` 里炸了 ——
+            #   PydanticSerializationError: UnicodeEncodeError: 'utf-8'
+            #   codec can't encode character '\uddd1'
+            # （`model_dump_json()` 内部 `to_json()` 默认 `ensure_ascii=False`，
+            #   所以报错位置是明文里的偏移，看着像别处的问题）
+            # 848 条已经拿到手的译文因为一个字符全丢，不可接受。
+            #
+            # 净化放在 `model_dump_json()` **之后**：这样无论字段是
+            # `str` 还是 `list[str]`、无论模型定义怎么变，都覆盖得到，
+            # 也不必给每个模型加校验器。`sanitize_for_json` 只动孤立
+            # 代理项，真 emoji（单个码点）不受影响。
+            fh.write(_json_safe(it))
             fh.write("\n")
             n += 1
     tmp.replace(path)

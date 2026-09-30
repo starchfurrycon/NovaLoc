@@ -60,6 +60,14 @@ STAGES: tuple[tuple[str, str], ...] = (
 
 STAGE_LABELS = dict(STAGES)
 
+#: 翻译阶段增量落盘的间隔（秒）。
+#:
+#: 一次真实游戏的翻译跑到 **27 分钟**时因为一个孤立代理项崩掉，而产物
+#: 只在整个阶段结束时写一次 —— 27 分钟的成果全丢。改成每批之后按这个
+#: 间隔落盘，崩溃时最多丢这么久。取 15 秒是因为写一次 `entries.jsonl`
+#: 在千条量级上只要几毫秒，相对于单批 1~3 秒的模型耗时可以忽略。
+_CHECKPOINT_INTERVAL_S = 15.0
+
 
 @dataclass
 class StageResult:
@@ -410,7 +418,23 @@ class Pipeline:
                 f"待翻译 {len(todo)} 条（已有译文 {len(units) - len(todo)} 条）",
                 stage="translate",
             )
-            entries = self._translate_units(todo, glossary)
+
+            # 增量落盘：崩溃/断电时最多只丢 `_CHECKPOINT_INTERVAL_S` 秒的成果。
+            # 之前只在阶段结束时写一次，一次 27 分钟的翻译因一个孤立代理项
+            # 崩掉就全丢了。节流按时间而不是按批数 —— 批次大小差异很大
+            # （对白 12 条、UI 40 条，单条耗时更是差几十倍）。
+            last_save = [0.0]
+
+            def _checkpoint(partial: list[TranslationEntry], final: bool) -> None:
+                now = time.time()
+                if not final and now - last_save[0] < _CHECKPOINT_INTERVAL_S:
+                    return
+                last_save[0] = now
+                # 已有条目要合并保留：用户手工改过的译文不能被流水线覆盖
+                merged_now = {**existing, **{e.uid: e for e in partial}}
+                self.ws.save_entries(list(merged_now.values()))
+
+            entries = self._translate_units(todo, glossary, on_progress=_checkpoint)
             # 已有条目要合并保留：用户手工改过的译文不能被流水线覆盖
             merged = {**existing, **{e.uid: e for e in entries}}
             self.ws.save_entries(list(merged.values()))
@@ -441,9 +465,20 @@ class Pipeline:
         return self._run("translate", go)
 
     def _translate_units(
-        self, units: list[TextUnit], glossary: list[Any]
+        self,
+        units: list[TextUnit],
+        glossary: list[Any],
+        *,
+        on_progress: Callable[[list[TranslationEntry], bool], None] | None = None,
     ) -> list[TranslationEntry]:
-        """把文本单元交给翻译提供者，按类型分批并带进度。"""
+        """把文本单元交给翻译提供者，按类型分批并带进度。
+
+        ``on_progress(已完成的条目, 是否收尾)`` 每批之后调用一次，
+        用来**增量落盘**。加这个参数是因为一次真实游戏的翻译跑到
+        **27 分钟**时崩掉，而产物只在整个阶段结束时才写一次 ——
+        27 分钟的成果全丢了。重跑要再花 27 分钟（虽然 `only_pending`
+        能把已完成的部分跳过，但那次**一条都没存下来**）。
+        """
         from ..core.registry import Providers
 
         provider = None
@@ -509,7 +544,13 @@ class Pipeline:
                 out.extend(res)
                 done += len(chunk)
                 throttle(done / max(1, total), f"已翻译 {done}/{total}")
+                if on_progress is not None:
+                    # 每批之后给调用方一个落盘机会。回调自己负责节流，
+                    # 所以这里不必判断时间。
+                    on_progress(out, False)
 
+        if on_progress is not None:
+            on_progress(out, True)
         return out
 
     # ------------------------------------------------------------------
@@ -770,6 +811,12 @@ class Pipeline:
                 # 把逐块结果记回资产（供审校页显示与字符集统计）
                 rec = by_uid.get(asset.uid)
                 if rec is not None:
+                    # 尺寸也从 OCR 结果回填：以前只置 `analyzed = True`，
+                    # `width`/`height` 永远是 0 —— 审校页和报告里显示
+                    # "0x0"，看着像图片读取失败，其实只是没回填。
+                    if res.asset.width and res.asset.height:
+                        rec.width = res.asset.width
+                        rec.height = res.asset.height
                     rec.blocks = [
                         ImageTextBlock(
                             id=o.block_id,

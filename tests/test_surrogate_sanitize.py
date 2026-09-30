@@ -1,47 +1,60 @@
-"""孤立代理项（lone surrogate）必须在进入 HTTP 请求体之前被处理掉。
+"""孤立代理项（lone surrogate）必须在写入 JSON / 网络请求体之前被处理掉。
 
 ## 实测：一次真实游戏的翻译在跑到 27 分钟后整个崩掉
 
 `novaloc run <真实 MV 游戏> --stage translate` 在 1343 条上跑了 **27 分 6 秒**
-之后失败，报：
+之后失败，日志里是：
 
     Error serializing to JSON: UnicodeEncodeError: 'utf-8' codec can't
     encode character '\\uddd1' in position 8: surrogates not allowed
 
-## 定位过程（结论和直觉不一样，所以记下来）
+## ⚠️ 我第一版的定位是错的，这里记下正确的
 
-1. `Error serializing to JSON` **不在本仓库任何代码里**（全仓库搜不到），
-   所以它来自 Ollama 服务端的响应文本 —— 一开始以为是服务端的锅。
-2. 实际复现出来的是客户端异常：`OllamaClient._request` 把 `json=payload`
-   交给 httpx，httpx 在**发请求之前**就 `json.dumps(...).encode("utf-8")`，
-   于是 `UnicodeEncodeError` 在**我们这边**抛出。
-   （我一开始把这条归因给 Ollama，是错的。）
-3. 触发条件是：请求体里任何字符串含孤立代理项（U+D800–U+DFFF）。
-   实测最小复现：源文本 `"Rending Claw\\uddd1 deals damage."`。
-4. 源数据是**干净的**：重新抽取 1343 条、扫工作区所有 JSON、
-   扫内置术语表，都没有代理项；游戏 `www/data/*.json` 也是合法 UTF-8。
-   所以代理项是**运行期从模型回复里进来的**（模型偶尔会把 `\\uddd1`
-   当字面量吐出来，`json.loads` 忠实还原成孤立代理项）。
+看到 `Error serializing to JSON` 时我以为是 **Ollama 服务端**在序列化时炸了
+（这句话确实不在本仓库里）。**错了。** 后来拿到完整 traceback 才看清：
 
-## 为什么它致命（两个独立缺陷）
+    stages.py:416    self.ws.save_entries(list(merged.values()))
+    workspace.py:311 _write_jsonl(...)
+    workspace.py:89  fh.write(it.model_dump_json())
+    PydanticSerializationError: ...
 
-**缺陷 A —— 异常类型没被接住。** `_call_batch` / 逐条降级 / 补空
-三处的 `except` 只列了 `(ProviderError, OllamaError, ModelMissing,`
-`OllamaNotRunning)`。`UnicodeEncodeError` 继承自 `ValueError`，
-**一个都不匹配**，于是它穿过整个重试层逃到 `stage_translate`，
-让整轮翻译作废。
+崩点在**产物落盘**（pydantic 的 `model_dump_json()`），不在请求发送。
+而且当时 `entries.jsonl.tmp` 里已经躺着 **848 条完成的译文** ——
+全部白跑。真正的原因和修法见 `tests/test_entry_persistence_surrogate.py`。
 
-**缺陷 B —— 没有输入净化。** 模型回复里带回的孤立代理项被原样用作
-下一批的输入（也写进了条目），于是错误会**反复**发生：
-`批 11/39/36/1` 都在报同一个字符。
+真实的崩溃路径是「**解析→写入条目→落盘**」。请求体那条路（httpx 的
+`json=` 会在发请求前编码）**也**会抛同类异常，属于同一个根因的另一个
+出口，所以两端都要净化。本文件覆盖的是 `sanitize` 这一层本身的正确性。
+
+## 缺陷 A —— 异常类型没被接住
+
+`_call_batch` / 逐条降级 / 补空三处的 `except` 只列了
+`(ProviderError, OllamaError, ModelMissing, OllamaNotRunning)`。
+`UnicodeEncodeError` 继承自 `ValueError`，**一个都不匹配**，
+于是它穿过整个重试层逃到 `stage_translate`，让整轮翻译作废。
+
+## 缺陷 B —— 没有净化
+
+模型偶尔把 `\\uddd1` 当字面量吐出来，`json.loads` 会**忠实还原**成一个
+孤立代理项，然后它被写进条目、被当作下一批的输入发回去 ——
+错误会反复发生（实测 批 11/39/36/1 都在报同一个字符）。
 
 ## 为什么在"边界"净化而不是"发现就报错"
 
 孤立代理项是**无法表示的字节序列**，没有任何合法 UTF-8 编码。
-所以它不是"需要用户决策的数据问题"，而是"必须在写入网络层之前
-消除的编码污染"。做法与 Python 自身的 `errors="replace"` 一致：
-换成 U+FFFD（`�`），保留长度与位置，让译文其余部分仍可用。
-整条丢弃会让玩家看到一个**完全没翻译**的条目，比一个 `�` 更糟。
+所以它不是"需要用户决策的数据问题"，而是"必须在编码之前消除的污染"。
+做法与 Python 自身的 `errors="replace"` 一致：换成 U+FFFD（`�`），
+保留长度与位置，让译文其余部分仍可用。整条丢弃会让玩家看到一个
+**完全没翻译**的条目，比一个 `�` 更糟。
+
+## 踩过的坑：源码里不能写 `\\uXXXX` 字面量
+
+本文件第一版在 docstring 里写了单反斜杠的 `\\uddd1`。
+CPython 的词法分析会在**编译期**把它解码成真的代理项放进 code object，
+于是**这个测试文件自己 import 不进来**（写 `.pyc` 时
+`UnicodeEncodeError`），pytest 收集阶段直接报错。
+所有"扫字节""扫字符"的检查都说没问题 —— 问题在**编译产物**里。
+守卫见 `tests/test_no_source_surrogates.py`。
 """
 
 from __future__ import annotations
@@ -61,8 +74,8 @@ from novaloc.translate.sanitize import (  # noqa: E402
     sanitize_tree,
 )
 
-LONE_LOW = "\uddd1"
-LONE_HIGH = "\ud801"
+LONE_LOW = chr(0xDDD1)
+LONE_HIGH = chr(0xD801)
 REPLACEMENT = "\ufffd"
 
 
@@ -101,8 +114,15 @@ def test_valid_surrogate_pair_as_two_chars_is_still_lone() -> None:
     注意这和"一个 emoji"不同：emoji 在 Python 3 里就是 U+1F600 一个码点。
     有人可能以为 `"\\ud83d\\ude00"` 是 emoji —— 它不是，那是两个代理项，
     无法编码，必须净化。
+
+    ⚠️ 这里必须用 `chr()` 构造，**不能**写 `"\\ud83d\\ude00"` 字面量：
+    CPython 的词法分析会把 `\\uXXXX` 转义**在编译期**变成一个真的代理项，
+    放进 code object 的常量池 —— 随后写 `.pyc` 时
+    `UnicodeEncodeError: surrogates not allowed`，**这个测试文件自己都
+    import 不进来**。代理项只能存在于运行期字符串里。
+    （这不是理论：第一版就是这么写的，pytest 收集阶段直接报错。）
     """
-    s = "\ud83d\ude00"
+    s = chr(0xD83D) + chr(0xDE00)
     out = sanitize_for_json(s)
     assert out == REPLACEMENT * 2
 
