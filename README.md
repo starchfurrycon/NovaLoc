@@ -284,18 +284,27 @@ novaloc run <id> --stage apply
 ```powershell
 pip install -e ".[dev]"
 
-# 全量测试（21 个套件 / 81 个 pytest 项，约 2.5 分钟）
+# 全量测试（22 个套件 / 90 个 pytest 项，约 2.5 分钟）
 pytest tests -q
 
 # 单个套件也能直接当脚本跑，输出带实测数字的分节报告
 python tests\test_font_real.py      # 用真实字体验证合并（覆盖率、UPEM 度量、渲染墨迹）
 python tests\test_api_e2e.py        # 后端端到端（32 条路由 + WebSocket）
+
+# 逐个文件单独跑一遍：防止套件之间出现「只能全量跑」的隐式耦合
+python .scratch\_run_each_alone.py
 ```
 
 有些套件需要本机资源（中文字体、DirectML、OCR 模型），**缺失时会 skip
 而不是失败**。CI 只跑无需这些前提的子集，所以"CI 绿了"不等于"功能正确" ——
 字体合并与贴图重绘只有在本机才能验证。细节见
 [tests/README.md](tests/README.md)。
+
+> 关于最后那条自查：本项目真的踩过这个坑 —— 三个端到端套件都读同一个
+> 合成工程目录，而它里面 `data/` 是 git-ignored 的，**只有**另一个套件
+> 跑过才会有。于是"单独跑必红、跑全量永远绿"，其中一处甚至因为
+> `if not path.exists(): continue` 而**静默跳过**了整条断言。
+> 现在合成工程造在会话级临时目录里，谁先跑都一样。
 
 架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，
 字体机制见 [docs/FONTS.md](docs/FONTS.md)，
