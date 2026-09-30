@@ -27,6 +27,15 @@ from _fake_game import build_fake_game  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from novaloc.api.app import create_app  # noqa: E402
+from novaloc.pipeline.stages import STAGES  # noqa: E402
+
+#: 期望的阶段名与数量 —— **从产品代码里取**，不写死。
+#:
+#: 这里原本写死了 8。加"解包资源"阶段时它立刻变红，但那**不是**被测代码
+#: 的问题，是断言本身把"实现细节的数量"当成了契约。改成引用 STAGES 之后，
+#: 加减阶段只需要改一处（产品代码），测试仍然守得住
+#: "所有阶段都被广播了"这个真正的性质。
+EXPECTED_STAGES = [sid for sid, _label in STAGES]
 
 SB = FIXTURES
 
@@ -97,7 +106,11 @@ def main() -> int:
               f"engines={[e['id'] for e in h['engines']]}")
         print(f"    阶段：{[s['label'] for s in h['stages']]}")
         check("health 报告了引擎列表", len(h["engines"]) == 4, str(h["engines"]))
-        check("health 报告了 8 个阶段", len(h["stages"]) == 8, str(len(h["stages"])))
+        check(
+            f"health 报告了全部 {len(EXPECTED_STAGES)} 个阶段",
+            [s["id"] for s in h["stages"]] == EXPECTED_STAGES,
+            str([s["id"] for s in h["stages"]]),
+        )
         check("health 报告了 DirectML 状态", "directml" in h["gpu"])
         check("health 不因 Ollama 缺失而失败", h["ok"] is True)
 
@@ -195,11 +208,10 @@ def main() -> int:
         check("收到了阶段开始/结束事件",
               "stage_start" in kinds and "stage_end" in kinds, str(sorted(set(kinds))))
         check("收到了 log 事件", "log" in kinds, str(sorted(set(kinds))))
-        check("WebSocket 覆盖了全部 8 个阶段",
-              len([s for s in stages_seen if s in
-                   ("detect", "extract", "images_scan", "translate",
-                    "fonts", "images_localize", "qa", "apply")]) == 8,
-              str(sorted(stages_seen)))
+        missing = [s for s in EXPECTED_STAGES if s not in stages_seen]
+        check(f"WebSocket 覆盖了全部 {len(EXPECTED_STAGES)} 个阶段",
+              not missing,
+              f"缺少 {missing}；实际 {sorted(stages_seen)}")
         check("以 closed 消息收尾", "closed" in kinds, str(sorted(set(kinds))[-3:]))
 
         # ---------- 6. 任务状态与历史缓冲 ----------
@@ -210,9 +222,10 @@ def main() -> int:
               f"stages={len(job.get('result', {}).get('stages', []))}")
         check("任务状态为 done", job["status"] == "done", job.get("error", "")[:200])
         check("任务进度到 1.0", job["progress"] == 1.0, str(job["progress"]))
-        check("任务结果含 8 个阶段",
-              len(job.get("result", {}).get("stages", [])) == 8,
-              str(len(job.get("result", {}).get("stages", []))))
+        got_stages = [st["stage"] for st in job.get("result", {}).get("stages", [])]
+        check(f"任务结果含全部 {len(EXPECTED_STAGES)} 个阶段",
+              got_stages == EXPECTED_STAGES,
+              f"实际 {got_stages}")
         check("任务保留了历史事件（供刷新页面补发）",
               len(job.get("events", [])) > 10, str(len(job.get("events", []))))
         for st in job.get("result", {}).get("stages", []):

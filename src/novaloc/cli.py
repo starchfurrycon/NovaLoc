@@ -92,12 +92,18 @@ ollama_app = typer.Typer(
     help="本地推理服务（Ollama）状态检查与模型拉取。",
     no_args_is_help=True,
 )
+pack_app = typer.Typer(
+    name="pack",
+    help="游戏资源归档：查看有哪些封包、解包、回写。",
+    no_args_is_help=True,
+)
 
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(text_app, name="text")
 app.add_typer(fonts_app, name="fonts")
 app.add_typer(ollama_app, name="ollama")
+app.add_typer(pack_app, name="pack")
 
 
 def _version_callback(value: bool) -> None:
@@ -221,6 +227,16 @@ def _fmt_duration(seconds: float) -> str:
         return f"{seconds:.1f} s"
     m, s = divmod(int(seconds), 60)
     return f"{m} 分 {s} 秒"
+
+
+def _fmt_bytes(n: int) -> str:
+    """人类可读的体积。用 1024 进制（磁盘/文件大小的惯例）。"""
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
 
 
 def _echo_json(obj: Any) -> None:
@@ -1786,6 +1802,132 @@ def fonts_audit(
 # --------------------------------------------------------------------------
 # qa：质检
 # --------------------------------------------------------------------------
+
+
+@pack_app.command("list")
+def pack_list(
+    game_dir: str = typer.Argument(..., help="游戏根目录。"),
+    depth: int = typer.Option(3, "--depth", help="往下探测几层。"),
+    json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
+) -> None:
+    """列出游戏目录里的资源封包（按内容识别，不只看后缀）。"""
+    global _JSON_MODE
+    _JSON_MODE = json_output
+
+    root = Path(game_dir).expanduser()
+    if not root.is_dir():
+        _fail(f"游戏目录不存在或不是目录：{root}")
+
+    from .archives import probe  # noqa: PLC0415
+
+    infos = probe(root, max_depth=depth)
+    payload = [
+        {
+            "path": str(i.path),
+            "name": i.path.name,
+            "kind": i.kind,
+            "label": i.label,
+            "entries": i.entry_count,
+            "bytes": i.total_bytes,
+            "writable": i.writable,
+            "note": i.note,
+        }
+        for i in infos
+    ]
+    if json_output:
+        _echo_json({"game_dir": str(root.resolve()), "archives": payload})
+        return
+
+    if not infos:
+        console.print(
+            "[dim]没有发现资源封包 —— 这个游戏是明文目录，直接跑流水线即可。[/dim]"
+        )
+        return
+
+    table = Table(title=f"发现 {len(infos)} 个资源封包", show_lines=False)
+    table.add_column("文件", style="cyan", no_wrap=True)
+    table.add_column("格式")
+    table.add_column("条目", justify="right")
+    table.add_column("解压后", justify="right")
+    table.add_column("可回写", justify="center")
+    for i in infos:
+        table.add_row(
+            i.path.name,
+            i.label,
+            str(i.entry_count),
+            _fmt_bytes(i.total_bytes),
+            "[green]是[/green]" if i.writable else "[yellow]否[/yellow]",
+        )
+    console.print(table)
+    for i in infos:
+        if i.note:
+            console.print(f"[yellow]{i.path.name}：{i.note}[/yellow]")
+    if any(not i.writable for i in infos):
+        console.print(
+            "[dim]「可回写=否」的封包只能解包，改动不会自动装回游戏；"
+            "流水线会把完整产物放在 out/ 目录。[/dim]"
+        )
+
+
+@pack_app.command("extract")
+def pack_extract(
+    game_dir: str = typer.Argument(..., help="游戏根目录。"),
+    dest: str = typer.Option(..., "--dest", "-d", help="解包到哪个目录。"),
+    only: str = typer.Option("", "--only", help="只解这些后缀，逗号分隔（如 .rpy,.png）。"),
+    json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
+) -> None:
+    """把游戏目录里的资源封包解到指定目录（不动原游戏文件）。"""
+    global _JSON_MODE
+    _JSON_MODE = json_output
+
+    root = Path(game_dir).expanduser()
+    out = Path(dest).expanduser()
+    if not root.is_dir():
+        _fail(f"游戏目录不存在或不是目录：{root}")
+
+    from .archives import probe, unpack_into  # noqa: PLC0415
+    from .archives.base import UnsafeArchiveError  # noqa: PLC0415
+
+    infos = probe(root)
+    if not infos:
+        _fail("没有发现资源封包，无需解包")
+
+    suffixes = tuple(s.strip().lower() for s in only.split(",") if s.strip()) or None
+    results: list[dict[str, Any]] = []
+    for i, info in enumerate(infos):
+        target = out / f"{i:02d}_{info.path.stem}"
+        try:
+            res = unpack_into(info.path, target, only_suffixes=suffixes)
+        except UnsafeArchiveError as exc:
+            results.append({"name": info.path.name, "ok": False, "error": str(exc)})
+            continue
+        results.append({
+            "name": info.path.name,
+            "ok": True,
+            "dest": str(target),
+            "entries": res.entries,
+            "written": res.written,
+            "skipped": res.skipped,
+        })
+
+    if json_output:
+        _echo_json({"dest": str(out.resolve()), "results": results})
+        return
+
+    for r in results:
+        if r["ok"]:
+            console.print(
+                f"[green]✓[/green] {r['name']} → {r['dest']}"
+                f"（{r['written']}/{r['entries']} 个文件）"
+            )
+            if r["skipped"]:
+                console.print(
+                    f"  [yellow]跳过 {len(r['skipped'])} 个可疑条目"
+                    "（目录穿越等）[/yellow]"
+                )
+        else:
+            console.print(f"[red]✗[/red] {r['name']}：{r['error']}")
+    console.print(f"\n解包完成，产物在 {out.resolve()}")
 
 
 @app.command("qa")

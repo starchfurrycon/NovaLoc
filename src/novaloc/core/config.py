@@ -128,6 +128,23 @@ class OcrConfig(BaseModel):
 
     engine: str = "ppocrv6"
     model_tier: Literal["tiny", "small", "medium"] = "medium"
+
+    lang: str = ""
+    """识别语言覆盖。留空则跟随 `translate.source_lang`。
+
+    **为什么必须有这个选项**：PP-OCRv6 的识别器不含韩语与西里尔文字
+    （官方文档写明），这类语言会被静默读成空字符串。填 `ko` / `ru`
+    会切换到 PP-OCRv5 的分语种识别模型（检测仍用 v6）。
+    可取：`ko` / `ru` / `be` / `uk` / `bg` / `sr` / `latin` / `en`，
+    或留空跟随翻译设置。
+    """
+
+    allow_model_download: bool = True
+    """缺分语种识别模型时是否自动下载（韩语约 13.5 MB，俄语约 7.9 MB）。
+
+    关掉它则完全离线：缺模型时给出**带下载链接**的明确错误，
+    而不是让 RapidOCR 自己去联网（那会在断网时变成一句莫名其妙的失败）。
+    """
     """模型档位。medium 精度最好（也是研究结论推荐的档位），tiny 最快。"""
 
     use_directml: bool = True
@@ -189,6 +206,29 @@ class ImageConfig(BaseModel):
     """明显不含文字的贴图命名，跳过以省时间。"""
 
 
+class PackConfig(BaseModel):
+    """游戏资源解包/回写的行为。"""
+
+    no_unpack: bool = False
+    """完全跳过解包，一律按明文目录处理。
+
+    什么时候需要它：游戏目录很大、里面有个几十 GB 的资源包，而用户只想
+    改脚本 —— 解包会把磁盘吃满。这时跳过解包，让用户自己解。
+    """
+
+    repack: bool = True
+    """回写阶段要不要把改动打回原归档。
+
+    默认要。关掉它用于"我只想看 out/ 里的产物，别动我的游戏文件"。
+    """
+
+    max_depth: int = 3
+    """探测归档时最多往下走几层。"""
+
+    only_suffixes: list[str] = Field(default_factory=list)
+    """非空时只解这些后缀（例如只解 `.rpy`/`.png`），能省大量磁盘和时间。"""
+
+
 class UIConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8791
@@ -201,6 +241,7 @@ class Config(BaseModel):
     font: FontConfig = Field(default_factory=FontConfig)
     image: ImageConfig = Field(default_factory=ImageConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
+    pack: PackConfig = Field(default_factory=PackConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
     data_root: str = ""
     log_level: str = "INFO"

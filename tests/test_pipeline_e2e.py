@@ -378,7 +378,14 @@ def main() -> int:
         for rr in results:
             print(f"      {'✅' if rr.ok else '❌'} {rr.stage:18} {rr.duration_s:6.2f}s "
                   f"{rr.message[:50]}")
-        check("run_all 跑完所有阶段", len(results) == 8, str(len(results)))
+        # 阶段名与数量都从产品代码取，不写死 —— 写死会在"加了一个阶段"时
+        # 变成假红：它断言的是"实现细节有几个"，而不是"所有阶段都跑到了"。
+        from novaloc.pipeline.stages import STAGES as _STAGES
+
+        expect = [sid for sid, _l in _STAGES]
+        got = [rr.stage for rr in results]
+        check(f"run_all 跑完所有 {len(expect)} 个阶段", got == expect,
+              f"期望 {expect}，实际 {got}")
         check("所有阶段成功", all(x.ok for x in results),
               str([x.stage for x in results if not x.ok]))
     except PipelineError as exc:

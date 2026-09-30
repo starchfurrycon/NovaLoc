@@ -187,11 +187,96 @@ class Workspace:
 
     @property
     def source_dir(self) -> Path:
+        """用户给的**原始**游戏目录。**只读**，任何阶段都不许往里写。"""
         return Path(self.project.game_dir)
+
+    @property
+    def unpacked_root(self) -> Path:
+        """解包产物的容器目录。里面每个子目录对应一个归档。"""
+        return self.p("unpacked")
+
+    #: 判定"这个解包目录就是游戏根"的标志
+    _GAME_ROOT_MARKERS = ("game", "data", "www", "assets", "renpy", "Managed")
+
+    def resolve_effective_source(self) -> Path:
+        """算出各阶段真正该读的根目录，并把结论写进记录（可审计）。
+
+        ## 为什么不能简单地"返回 unpacked_root"
+
+        第一版就是那么写的，结果端到端测试抓到了：`unpacked_root` 是
+        **归档的容器**（`unpacked/00_resources/…`），把它当 `game_dir`
+        会让适配器算出的相对路径带上 `00_resources/` 前缀 ——
+        于是 `apply()` 在 `out/` 里找不到 `00_resources/game/script.rpy`，
+        译文一条都写不进去，而**所有阶段都报 ok**。
+
+        正确做法是把 `game_dir` 指向**归档解出来的那一层**，
+        这样 `game/script.rpy` 就是 `game/script.rpy`，与明文目录一致。
+
+        ## 多个归档怎么办
+
+        选"看起来最像游戏根"的那个（含 `game/`、`data/`、`www/` 等标志）。
+        如果都不像，取第一个并记一条警告。
+
+        **这是已知限制**：多个归档分别装脚本/贴图时，只有被选中的那个
+        会被汉化。与其猜（猜错会产出"看着成功、实际一半没翻"的结果），
+        不如明确记下来让用户看见。
+        """
+        records = self.load_unpacked()
+        if not records or not self.unpacked_root.is_dir():
+            return self.source_dir
+
+        dirs = [Path(r["dest"]) for r in records if r.get("dest")]
+        dirs = [d for d in dirs if d.is_dir()]
+        if not dirs:
+            return self.source_dir
+
+        chosen = dirs[0]
+        for d in dirs:
+            if any((d / m).exists() for m in self._GAME_ROOT_MARKERS):
+                chosen = d
+                break
+
+        if len(dirs) > 1:
+            self.project.notes = (
+                (self.project.notes + "\n") if self.project.notes else ""
+            ) + (
+                f"⚠️ 发现 {len(dirs)} 个归档，本次只处理 {chosen.name}"
+                "（其他归档的资源未纳入）。可先自己解包后用散装模式处理。"
+            )
+        return chosen
+
+    @property
+    def effective_source(self) -> Path:
+        """各阶段真正应该去读的根目录：解过包就是归档解出来的那一层。"""
+        return self.resolve_effective_source()
 
     @property
     def out_dir(self) -> Path:
         return self.p("out")
+
+    def load_unpacked(self) -> list[dict[str, Any]]:
+        """读回"哪些归档被解到哪儿了"的记录（`unpack` 阶段写的）。
+
+        没解过包时返回空列表 —— 这是**正常情况**（多数游戏是明文目录），
+        所以不报错、不警告。
+        """
+        try:
+            raw = self.read_json("unpacked.json", default=[])
+        except Exception:  # noqa: BLE001
+            return []
+        return list(raw) if isinstance(raw, list) else []
+
+    def archive_dest_for(self, rel_file: str) -> Path | None:
+        """给定一个相对文件路径，找出它属于哪个归档的解包树。
+
+        回写时要用：`out/game/script.rpy` 要写回"含 `game/script.rpy`
+        的那个归档"。多个归档时装脚本的那个才对得上。
+        """
+        for rec in self.load_unpacked():
+            dest = Path(rec.get("dest", ""))
+            if dest and (dest / rel_file).is_file():
+                return dest
+        return None
 
     # ------------------------------------------------------------------
     # 文本单元

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 import traceback
 from collections.abc import Callable
@@ -46,6 +47,7 @@ log = logging.getLogger(__name__)
 
 #: 阶段顺序与中文名（也用于 UI 展示）
 STAGES: tuple[tuple[str, str], ...] = (
+    ("unpack", "解包资源"),
     ("detect", "识别引擎"),
     ("extract", "抽取文本"),
     ("images_scan", "扫描贴图"),
@@ -139,11 +141,117 @@ class Pipeline:
     # 阶段实现
     # ==================================================================
 
+    def stage_unpack(self) -> StageResult:
+        """把游戏目录里的归档解到工作区，供后续阶段读写。
+
+        这一阶段**必须容忍"没有归档"**：多数游戏是明文目录，那才是常态。
+        所以"没找到归档"是成功（`ok=True`）且说明清楚，不是失败。
+
+        为什么解到工作区而不是就地解压：原游戏目录贯穿全项目的硬约束是
+        **只读**。解包树在工作区里，适配器可以就地改文件；回写阶段再把
+        改动过的文件打回归档，并给原归档留备份。
+        """
+
+        def go() -> StageResult:
+            from ..archives import probe, unpack_into
+            from ..archives.base import ArchiveError, UnsafeArchiveError
+
+            # 必须读**原始**目录：解包阶段自己不能去读上一次的解包树，
+            # 否则会"解包一个解包结果"，越滚越深。
+            src = self.ws.source_dir
+            pack_cfg = self.ctx.config.pack
+            forced_off = bool(pack_cfg.no_unpack)
+
+            # 先清掉上一次的解包树：否则"这次没有归档了"会读到上次的残留，
+            # 产出一个和当前游戏无关的成果 —— 这种串味很难被用户发现。
+            root = self.ws.unpacked_root
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
+            self.ws.write_json("unpacked.json", [])
+
+            if forced_off:
+                return StageResult(
+                    stage="unpack", ok=True,
+                    message="已按配置跳过解包（--no-unpack），按明文目录处理",
+                    stats={"unpacked": 0, "skipped_by_config": True},
+                )
+
+            try:
+                infos = probe(src, max_depth=pack_cfg.max_depth)
+            except Exception as exc:  # noqa: BLE001
+                # 探测失败不该让整条流水线挂掉：退回"明文目录"继续跑，
+                # 但要把原因记下来，用户能看见。
+                self.ws.log_line("unpack", f"归档探测失败，按明文目录处理：{exc}")
+                return StageResult(
+                    stage="unpack", ok=True,
+                    message=f"归档探测失败，已按明文目录处理：{exc}",
+                    stats={"unpacked": 0, "probe_error": str(exc)},
+                )
+
+            if not infos:
+                return StageResult(
+                    stage="unpack", ok=True,
+                    message="没有发现归档，按明文目录处理",
+                    stats={"unpacked": 0, "archives": 0},
+                )
+
+            records: list[dict[str, Any]] = []
+            notes: list[str] = []
+            for i, info in enumerate(infos):
+                dest = root / f"{i:02d}_{info.path.stem}"
+                only = tuple(pack_cfg.only_suffixes) or None
+                try:
+                    res = unpack_into(info.path, dest, only_suffixes=only)
+                except UnsafeArchiveError as exc:
+                    # 解压炸弹/危险条目：跳过并告知，继续处理别的归档
+                    notes.append(f"{info.path.name}：拒绝解包（{exc}）")
+                    self.ws.log_line("unpack", f"拒绝解包 {info.path.name}：{exc}")
+                    continue
+                except (ArchiveError, OSError) as exc:
+                    notes.append(f"{info.path.name}：解包失败（{exc}）")
+                    self.ws.log_line("unpack", f"解包失败 {info.path.name}：{exc}")
+                    continue
+
+                records.append({
+                    "source": str(info.path),
+                    "dest": str(dest),
+                    "kind": info.kind,
+                    "entries": res.entries,
+                    "written": res.written,
+                    "writable": info.writable,
+                    "skipped": res.skipped,
+                })
+                if res.skipped:
+                    notes.append(
+                        f"{info.path.name}：跳过 {len(res.skipped)} 个可疑条目"
+                        "（目录穿越等）"
+                    )
+
+            self.ws.write_json("unpacked.json", records)
+
+            total_entries = sum(r["entries"] for r in records)
+            total_written = sum(r["written"] for r in records)
+            msg = (
+                f"解包 {len(records)}/{len(infos)} 个归档，"
+                f"写出 {total_written}/{total_entries} 个文件"
+            )
+            stats = {
+                "unpacked": len(records),
+                "archives": len(infos),
+                "entries": total_entries,
+                "written": total_written,
+                "notes": notes,
+            }
+            self.ws.log_line("unpack", msg + (("；" + "；".join(notes)) if notes else ""))
+            return StageResult(stage="unpack", ok=True, message=msg, stats=stats)
+
+        return self._run("unpack", go)
+
     def stage_detect(self) -> StageResult:
         def go() -> StageResult:
             from ..engines import detect_engine
 
-            info = detect_engine(self.ws.source_dir, self.ctx)
+            info = detect_engine(self.ws.effective_source, self.ctx)
             proj = self.ws.project
             proj.engine = info.engine_id
             proj.engine_version = info.version
@@ -194,7 +302,7 @@ class Pipeline:
     def stage_extract(self) -> StageResult:
         def go() -> StageResult:
             ad = self._adapter()
-            root = self.ws.source_dir
+            root = self.ws.effective_source
             self.bus.log(f"用 {ad.display_name} 适配器抽取文本…", stage="extract")
             units, rep = ad.extract_text(root)
             self.ws.save_units(units)
@@ -235,7 +343,7 @@ class Pipeline:
         def go() -> StageResult:
             ad = self._adapter()
             self.bus.log("扫描贴图资源…", stage="images_scan")
-            assets, report = ad.extract_images(self.ws.source_dir)
+            assets, report = ad.extract_images(self.ws.effective_source)
 
             # 去重：同一个 path 只保留一条。
             # 少了这一步，同一个资产会被抽两遍，回写时译文被叠加。
@@ -269,6 +377,16 @@ class Pipeline:
                 )
 
             existing = {e.uid: e for e in self.ws.load_entries()}
+            # 刻意**不**自动并入内置游戏术语表。实测结论（数据在下面）：
+            # 内置表能修好单条缩写（`MP` → `魔法值`），但代价是整体变差 ——
+            # 同一批 27 条样本跑 3 遍：漏译从 0 升到 2.67/遍，
+            # 并出现 `Load Game` → "重新开始"（应为"读档"）这类污染，
+            # 因为提示词把 `Restart`/`Save`/`Load` 一起注入了，4B 模型会串。
+            # 而"把源词已在文本里的术语过滤掉"这条安全规则，会**正好**
+            # 滤掉 `HP`/`MP`/`Gold` —— 也就是唯一受益的那些条目，
+            # 等于自己取消自己。
+            # 所以内置表只作为**用户可查可抄的起点**（glossary.builtin_entries()），
+            # 由用户按自己游戏的情况决定是否启用，而不是默认注入。
             glossary = self.ws.load_glossary()
 
             todo: list[TextUnit] = []
@@ -447,10 +565,10 @@ class Pipeline:
             self.bus.log(f"项目字符集共 {cs.total} 个字符", stage="fonts")
 
             # 审计游戏自带字体
-            game_fonts = ad.discover_fonts(self.ws.source_dir)
+            game_fonts = ad.discover_fonts(self.ws.effective_source)
             audits: list[tuple[Any, Path, Any]] = []
             for gf in game_fonts:
-                fp = self.ws.source_dir / gf.path
+                fp = self.ws.effective_source / gf.path
                 if not fp.is_file():
                     continue
                 try:
@@ -607,7 +725,7 @@ class Pipeline:
             skipped = 0
             total_blocks = 0
             results: list[dict[str, Any]] = []
-            src_root = self.ws.source_dir
+            src_root = self.ws.effective_source
             existing = self._existing_image_translations()
             by_uid = {a.uid: a for a in assets}
 
@@ -836,7 +954,7 @@ class Pipeline:
                 stage="apply",
             )
             res: ApplyResult = ad.apply(
-                self.ws.source_dir,
+                self.ws.effective_source,
                 out_dir,
                 units,
                 translations,
@@ -852,6 +970,12 @@ class Pipeline:
                     error=res.error or "回写失败",
                     stats={"written": res.files_written, "skipped": res.files_skipped},
                 )
+            # ---- 最后一步：把改动打回归档 ----
+            # 顺序很重要：必须**在** ad.apply() 写进解包树之后再打回，
+            # 否则归档里还是旧内容。这也是为什么回写阶段要负责这件事，
+            # 而不是解包阶段。
+            repack_stats = self._repack_archives()
+
             return StageResult(
                 stage="apply",
                 ok=True,
@@ -864,10 +988,72 @@ class Pipeline:
                     "fonts": len(font_patches),
                     "refused": len(risky),
                     "out_dir": str(out_dir),
+                    **repack_stats,
                 },
             )
 
         return self._run("apply", go)
+
+    def _repack_archives(self) -> dict[str, Any]:
+        """把解包树里改过的文件打回原归档（带备份）。
+
+        没解过包就什么都不做 —— 这是多数游戏的情况。
+
+        **归档回写失败不抛异常**，只记警告：`out/` 目录里已经有一份完整
+        的产物（那是用户真正交付的东西），归档回写只是"顺手帮你装回游戏"。
+        因为一个归档写不进去就让整条流水线报失败，会让用户以为汉化没做成。
+        """
+        from ..archives import UnpackedArchive, repack
+
+        if not self.ctx.config.pack.repack:
+            return {"repacked": 0, "repack_skipped_by_config": True}
+
+        records = self.ws.load_unpacked()
+        if not records:
+            return {"repacked": 0}
+
+        done: list[str] = []
+        failed: list[str] = []
+        for rec in records:
+            if not rec.get("writable", True):
+                failed.append(f"{Path(rec['source']).name}（格式不支持回写）")
+                continue
+            unpacked = UnpackedArchive(
+                source=Path(rec["source"]),
+                dest=Path(rec["dest"]),
+                kind=str(rec.get("kind", "")),
+                entries=int(rec.get("entries", 0)),
+                written=int(rec.get("written", 0)),
+                writable=bool(rec.get("writable", True)),
+            )
+            try:
+                # 必须传 out_dir 作为改动来源，**不能**让 repack 去比对
+                # 解包树：流水线的 apply() 把产物写进 out/，
+                # 解包树里其实一个字都没改。第一版就是漏了这个参数，
+                # 于是 changed_members() 返回空 → repacked=0 →
+                # 所有阶段都 ok，归档里却还是原文。
+                changed, note = repack(unpacked, changes_from=self.ws.out_dir)
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{unpacked.source.name}（{exc}）")
+                self.ws.log_line("apply", f"归档回写失败 {unpacked.source.name}：{exc}")
+                continue
+            if changed:
+                done.append(note)
+                self.bus.log(note, stage="apply")
+            else:
+                self.ws.log_line("apply", f"{unpacked.source.name}：{note}")
+
+        for f in failed:
+            self.bus.log(
+                f"归档未能回写：{f}。out/ 目录里的产物是完整的，"
+                "可以把文件手工复制进游戏目录",
+                stage="apply", severity=Severity.WARN,
+            )
+        return {
+            "repacked": len(done),
+            "repack_notes": done,
+            "repack_failed": failed,
+        }
 
     # ==================================================================
     # 全流程
@@ -885,6 +1071,7 @@ class Pipeline:
         self.bus.log("=" * 60, stage="pipeline")
         t0 = time.time()
 
+        self.stage_unpack()
         self.stage_detect()
         self.stage_extract()
         self.stage_images_scan()
