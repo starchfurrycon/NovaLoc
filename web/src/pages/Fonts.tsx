@@ -141,6 +141,8 @@ export default function FontsPage(): ReactNode {
   const fonts = useResource<FontReport>((signal) => api.getFonts(id, signal), [id])
   const audit = useAction(api.fonts)
 
+  const projectName = project.data?.name ?? null
+
   const coverage = useMemo(() => fonts.data?.coverage ?? [], [fonts.data])
   const patches = useMemo(() => fonts.data?.patches ?? [], [fonts.data])
 
@@ -170,7 +172,7 @@ export default function FontsPage(): ReactNode {
   return (
     <div className="space-y-4">
       <PageHeader
-        eyebrow={`FONTS / ${id.slice(0, 8)}`}
+        eyebrow={`FONTS / ${projectName ?? id.slice(0, 8)}`}
         title="字体"
         description="审计目标语言字符集在游戏字体中的覆盖情况，并生成字体补丁计划。缺字会导致游戏内显示为方块或问号，请在写回资源前处理。"
         meta={

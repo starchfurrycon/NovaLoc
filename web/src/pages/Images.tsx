@@ -45,6 +45,7 @@ export default function ImagesPage(): ReactNode {
   const [showAnnotated, setShowAnnotated] = useState(true)
 
   const project = useResource<Project>((signal) => api.getProject(id, signal), [id])
+  const projectName = project.data?.name ?? null
   const images = useResource<ImagePage>(
     (signal) => api.getImages(id, { limit }, signal),
     [id, limit],
@@ -131,7 +132,7 @@ export default function ImagesPage(): ReactNode {
   return (
     <div className="space-y-4">
       <PageHeader
-        eyebrow={`IMAGES / ${id.slice(0, 8)}`}
+        eyebrow={`IMAGES / ${projectName ?? id.slice(0, 8)}`}
         title="贴图审校"
         description="逐张贴图核对 OCR 结果。标注图中的方框编号与下方图块列表一一对应；修改后可直接写回，不会覆盖原文件。"
         meta={

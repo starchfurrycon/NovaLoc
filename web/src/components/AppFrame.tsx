@@ -26,7 +26,6 @@ import {
   Gauge,
   Image as ImageIcon,
   Layers,
-  LayoutGrid,
   Menu,
   RefreshCw,
   ScanLine,

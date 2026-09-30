@@ -18,7 +18,7 @@ import {
 import { api } from '../api'
 import type { Project, TextEntry, TextPatchItem, TextPage } from '../api'
 import { errorMessage, useAction, useResource, useToasts } from '../hooks'
-import { cx, kindLabel, statusLabel, statusTone, truncate } from '../ui'
+import { cx, kindLabel, statusTone, truncate } from '../ui'
 import { PageHeader } from '../components/PageHeader'
 import { VirtualList } from '../components/VirtualList'
 import {

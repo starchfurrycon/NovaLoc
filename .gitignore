@@ -4,18 +4,24 @@ __pycache__/
 *.egg-info/
 .eggs/
 build/
-dist/
 .venv/
 venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# Python build output (the frontend's committed web/dist is excluded below)
+**/dist/
+!web/dist/
 
 # --- Node ---
 node_modules/
-web/dist/
+web/node_modules/
 web/.vite/
 *.tsbuildinfo
+
+# --- Frontend build output (intentionally committed) ---
+# web/dist ships with the repo so the tool runs without a Node toolchain.
+!web/dist/**
 
 # --- Runtime / user data (never commit) ---
 data/
@@ -42,6 +48,5 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# --- ¿ª·¢½ÅÊÖ¼Ü£¨²»Èë¿â£© ---
+# --- å¼€å‘è„šæ‰‹æ¶ï¼ˆä¸å…¥åº“ï¼‰ ---
 .scratch/
-
