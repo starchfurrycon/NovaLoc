@@ -155,6 +155,23 @@ class TranslationEntry(BaseModel):
     updated_at: float = Field(default_factory=time.time)
     meta: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def is_done(self) -> bool:
+        """是否已经有可用译文（翻译/已审校/已锁定都算）。"""
+        return self.status in (EntryStatus.TRANSLATED, EntryStatus.REVIEWED, EntryStatus.LOCKED)
+
+    @property
+    def placeholder_ok(self) -> bool:
+        """占位符校验是否通过。
+
+        回写前的最后一道闸门：占位符丢了或顺序变了，
+        回写进游戏会导致文本错乱（甚至崩溃），所以宁可拒绝回写。
+        """
+        return not any(
+            w in ("placeholder_lost", "placeholder_order_changed", "placeholder_extra")
+            for w in self.warnings
+        )
+
 
 class GlossaryEntry(BaseModel):
     source: str
@@ -331,6 +348,11 @@ class Project(BaseModel):
     updated_at: float = Field(default_factory=time.time)
     notes: str = ""
     stage: str = "created"
+    engine: str = ""
+    """识别出的引擎适配器 id（rpgmaker / renpy / unity / loose）。"""
+
+    engine_version: str = ""
+    """引擎版本或游戏版本，仅用于展示。"""
 
     def bump(self) -> None:
         self.updated_at = time.time()

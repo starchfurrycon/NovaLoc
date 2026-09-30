@@ -1,0 +1,162 @@
+@import 'tailwindcss';
+
+/* ------------------------------------------------------------------ *
+ * NovaLoc / 新译 — restrained light-sci-fi design tokens
+ * ------------------------------------------------------------------ */
+
+@theme {
+  --color-void: #03080c;
+  --color-abyss: #050d13;
+  --color-panel: #07141b;
+  --color-panel-2: #0a1c25;
+  --color-line: #10333f;
+  --color-line-soft: #0d2731;
+
+  --color-cyan: #2ee6d6;
+  --color-cyan-soft: #7ff5ea;
+  --color-cyan-dim: #1d9c93;
+  --color-teal: #12b3ad;
+
+  --color-ink: #cfe9ee;
+  --color-ink-dim: #86a8b3;
+  --color-ink-faint: #5d7d88;
+
+  --color-ok: #3ddc97;
+  --color-warn: #f0c26b;
+  --color-err: #ff6b7f;
+  --color-info: #6fb4ff;
+
+  --font-mono:
+    'JetBrains Mono', 'Sarasa Mono SC', 'Cascadia Mono', 'Consolas', 'SFMono-Regular', 'Menlo',
+    'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace;
+  --font-sans:
+    'Inter', 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei UI', 'PingFang SC', system-ui, sans-serif;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    background-color: var(--color-void);
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    color: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-cyan) 35%, transparent);
+    color: #04161a;
+  }
+
+  :focus-visible {
+    outline: 1px solid var(--color-cyan);
+    outline-offset: 1px;
+  }
+}
+
+@layer components {
+  /* Thin technical scrollbars ------------------------------------- */
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line) transparent;
+  }
+  .scroll-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+    border-radius: 0;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb:hover {
+    background: var(--color-cyan-dim);
+  }
+
+  /* Arwes text-effects manager needs a stable line-height container */
+  .nl-text {
+    display: inline-block;
+    max-width: 100%;
+    word-break: break-word;
+  }
+
+  .nl-mono-grid {
+    background-image:
+      linear-gradient(to right, color-mix(in srgb, var(--color-line) 45%, transparent) 1px, transparent 1px),
+      linear-gradient(to bottom, color-mix(in srgb, var(--color-line) 45%, transparent) 1px, transparent 1px);
+    background-size: 42px 42px;
+  }
+}
+
+@utility nl-label {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+}
+
+@utility nl-panel {
+  position: relative;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-panel-2) 70%, transparent), transparent),
+    var(--color-panel);
+  border: 1px solid var(--color-line-soft);
+}
+
+@keyframes nl-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes nl-scan {
+  0% {
+    transform: translateY(-100%);
+  }
+  100% {
+    transform: translateY(400%);
+  }
+}
+
+.nl-pulse {
+  animation: nl-pulse 1.6s ease-in-out infinite;
+}
+
+.nl-scanline {
+  animation: nl-scan 4.5s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nl-pulse,
+  .nl-scanline,
+  .ArwesAnimated,
+  canvas {
+    animation: none !important;
+  }
+}

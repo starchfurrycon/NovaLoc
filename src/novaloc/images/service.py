@@ -76,6 +76,12 @@ class BlockOutcome:
     too_small: bool = False
     warnings: list[str] = field(default_factory=list)
 
+    # --- 几何与识别信息：审校页要靠它把文字块画回原图上 ---
+    box: tuple[int, int, int, int] = (0, 0, 0, 0)
+    quad: list[tuple[float, float]] = field(default_factory=list)
+    confidence: float = 0.0
+    ocr_engine: str = ""
+
 
 @dataclass
 class TextureResult:
@@ -258,6 +264,10 @@ class TextureTranslator:
                             block_id=b.id, source=b.source, target="",
                             status=EntryStatus.SKIPPED,
                             warnings=["无译文"] if texts[gi].strip() else [],
+                            box=tuple(b.box),  # type: ignore[arg-type]
+                            quad=[(float(x), float(y)) for x, y in (b.quad or [])],
+                            confidence=float(b.confidence or 0.0),
+                            ocr_engine=b.ocr_engine or "",
                         )
                     )
                 continue
@@ -317,10 +327,28 @@ class TextureTranslator:
             )
         self.calls += 1
         results = self._translate_fn(items, target_lang)
-        for (i, _t), text in zip(pending, results):
+        # 翻译提供者返回的是 ``TranslationEntry`` 列表，而本模块内部只关心
+        # 纯文本。早先这里直接把结果当字符串用，导致 ``.strip()`` 抛
+        # AttributeError，异常又被上层吞掉，表现为"一张贴图都没汉化"，
+        # 极难排查。所以这里统一做一次归一化，两种形态都接受。
+        for (i, _t), res in zip(pending, results):
+            text = self._entry_text(res)
             if text:
                 out[i] = text
         return out
+
+    @staticmethod
+    def _entry_text(res: Any) -> str:
+        """把翻译结果归一化成纯文本（兼容 ``TranslationEntry`` 与 ``str``）。"""
+        if res is None:
+            return ""
+        if isinstance(res, str):
+            return res.strip()
+        for attr in ("target", "text", "translation"):
+            val = getattr(res, attr, None)
+            if isinstance(val, str):
+                return val.strip()
+        return str(res).strip()
 
     def _pick_font(self) -> str:
         """挑一个中文字体用于重绘。
@@ -357,7 +385,17 @@ class TextureTranslator:
         font_path: str,
     ) -> BlockOutcome:
         """画一块并贴回。任何异常都收敛成 outcome，不打断整图。"""
-        out = BlockOutcome(block_id=block.id, source=block.source, target=text)
+        out = BlockOutcome(
+            block_id=block.id,
+            source=block.source,
+            target=text,
+            # 几何信息一路带着走：审校页要靠它在原图上画框，
+            # 丢了它用户就只能看到一堆文本、不知道对应图上哪里。
+            box=tuple(block.box),  # type: ignore[arg-type]
+            quad=[(float(a), float(b)) for a, b in (block.quad or [])],
+            confidence=float(block.confidence or 0.0),
+            ocr_engine=block.ocr_engine or "",
+        )
         if not text.strip():
             out.status = EntryStatus.SKIPPED
             return out
