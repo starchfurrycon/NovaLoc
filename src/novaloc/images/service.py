@@ -42,6 +42,7 @@ from ..models import (
     TextLocation,
     TextUnit,
 )
+from ..translate.glossary import engine_label_target
 from .inpaint import InpaintResult, inpaint_boxes, load_lama
 from .io import imread_bgr, imwrite_bgr
 from .ocr_ppocrv6 import PPOcrV6Engine
@@ -184,6 +185,21 @@ def _norm(s: str) -> str:
     return unicodedata.normalize("NFKC", str(s or "")).replace(" ", "").replace("\n", "").strip()
 
 
+def _content(s: str) -> str:
+    """只留"实义字符"：丢掉标点、空白、括号、符号。
+
+    用来识别"译文只是原文加了个壳" —— 模型很爱写
+    ``'[o]中文译文'``、``'" [o] 中文译文 "'`` 这类形状，
+    它们在原文外面套了括号或引号。把这些壳全丢掉之后，
+    源文和译文的**实义内容**就暴露出来了。
+    """
+    import unicodedata
+
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKC", str(s or "")) if ch.isalnum()
+    )
+
+
 #: 单个字母/数字/符号的"文字块"一律判为噪声 —— 见 `_is_plausible_text_block`
 _SINGLE_GLYPH_RE = re.compile(r"^[\w\W]$", re.UNICODE)
 
@@ -219,6 +235,9 @@ class TextureTranslator:
         self._vlm_cache: dict[str, str] = {}
         self.calls = 0
         self.cache_hits = 0
+        #: 命中了引擎术语确定性表的块数（`ATK`→`攻击力` 这类）。
+        #: 这些块**没有**问模型，所以不该计入 `calls`。
+        self.engine_label_hits = 0
         self.vlm_reads = 0
         self.vlm_fixes = 0
         self.vlm_cache_hits = 0
@@ -972,6 +991,23 @@ class TextureTranslator:
             else:
                 pending.append((i, t))
 
+        # ---- 引擎术语：确定性译法，根本不问模型 ----
+        # 贴图上的属性缩写是**有限闭集**（`ATK`/`DEF`/`MAT`/`MDF`/`AGI`/`LUK`…），
+        # 而这些块的实测表现是：48% 原样返回英文（写着"已翻译"其实没翻），
+        # 且 `'LUK'` 被音译成 `'卢克'`（人名）。
+        # 同一个模型、同一批缩写，8 个里只有 2 个对 —— 所以这类词
+        # **不该依赖模型**，走确定性表更快也更准。
+        if pending:
+            still: list[tuple[int, str]] = []
+            for i, t in pending:
+                label = engine_label_target(t)
+                if label:
+                    out[i] = label
+                    self.engine_label_hits += 1
+                else:
+                    still.append((i, t))
+            pending = still
+
         if dry_run or not pending:
             return out
         if self._translate_fn is None:
@@ -1070,13 +1106,23 @@ class TextureTranslator:
         同样会画到图上。
 
         判据：把原文归一化后作为子串出现在译文里，**且**译文多出来的部分
-        里有**字母或数字**。这条要小心别误杀正常情况：
+        里有**字母、数字或汉字**。这条要小心别误杀正常情况：
 
         * ``'AGI'`` → ``'AGI'``（专有术语本就该保留）是**允许**的 ——
           译文没变长，不进这条判据；
         * ``'....'`` → ``'……'``（英文省略号译成中文省略号）也是**允许**的
           —— 译文正好是源文加一个全角点，多出来的是**标点**，不是冗余文字。
           第一版判据只看"变长了就拒"，把这条真译文误杀了。
+
+        ## 2b. 模型会用**加括号**绕开上面的判据
+
+        真实记录：``'[o]'`` → ``'[o]中文译文'``。多出来的 `中文译文`
+        是**汉字**，而当时的判据只查 ASCII 字母数字，所以没抓到。
+
+        正确做法是先把两侧都**剥掉成对的包裹字符**（模型给原文套一层
+        ``[ ]``/``" "`` 是典型的"我把它当词条了"痕迹），剥离后再比较。
+        剥的时候**原文和译文都要剥**，否则会把 `'[o]' → '[o]'`
+        这种正常保留误判成回声。
         """
         src = _norm(source)
         tgt = _norm(target)
@@ -1089,13 +1135,64 @@ class TextureTranslator:
                 self._note_rejection("meta_answer")
                 return False
 
-        if src and tgt.startswith(src) and len(tgt) > len(src):
-            extra = tgt[len(src):]
-            if any(ch.isalnum() for ch in extra):
-                self._note_rejection("source_echo_with_junk")
-                return False
+        if self._is_source_echo(src, tgt):
+            self._note_rejection("source_echo_with_junk")
+            return False
 
         return True
+
+    #: 会被剥掉的"包裹字符"：首尾成对出现时视为模型套的外壳，不是内容
+    _WRAPPER_PAIRS = {
+        "[": "]", "(": ")", "{": "}", "〈": "〉", "《": "》",
+        "【": "】", "「": "」", "『": "』", "“": "”", "‘": "’",
+    }
+
+    #: 引号类包裹：模型常写成 ``" [o] 中文译文 "``（引号外还有空格），
+    #: 所以这类要**允许中间夹空白**，不能像上面那样要求首尾紧邻。
+    _QUOTE_PAIRS = {'"': '"', "'": "'"}
+
+    @classmethod
+    def _strip_wrappers(cls, s: str) -> str:
+        """剥掉**成对**的外层包裹字符（可能套多层、引号内可夹空白）。"""
+        out = s.strip()
+        changed = True
+        while changed and len(out) >= 2:
+            changed = False
+            if cls._WRAPPER_PAIRS.get(out[0]) == out[-1] or out[0] in cls._QUOTE_PAIRS and out[-1] == cls._QUOTE_PAIRS[out[0]]:
+                out = out[1:-1].strip()
+                changed = True
+        return out
+
+    @classmethod
+    def _is_source_echo(cls, src: str, tgt: str) -> bool:
+        """译文是不是"原文 + 冗余正文"？
+
+        判三遍，**最后那遍才是真正管用的**：
+
+        1. 原样比较；
+        2. 各剥一次成对包裹后比较；
+        3. **只比实义字符**（`_content`：丢掉标点、空白、括号，
+           只留下字母/数字/汉字）。
+
+        第 3 条把模型各种包装花样一并解决：``'[o]'`` → ``'[o]中文译文'``、
+        ``'" [o] 中文译文 "'``、``'(o) 中文意思'`` 在"只比实义字符"之后
+        都是同一个形状 —— 源文的 `o` 后面凭空多出了 `中文译文`。
+
+        也不需要对 `'....'` → `'……'` 特判放行：那两者**实义字符都是空**，
+        第 3 条自然不会触发。
+        """
+        if not src:
+            return False
+        pairs = (
+            (src, tgt),
+            (cls._strip_wrappers(src), cls._strip_wrappers(tgt)),
+            (_content(src), _content(tgt)),
+        )
+        for a, b in pairs:
+            if a and b.startswith(a) and len(b) > len(a):
+                if any(ch.isalnum() for ch in b[len(a):]):
+                    return True
+        return False
 
     @staticmethod
     def _entry_text(res: Any) -> str:

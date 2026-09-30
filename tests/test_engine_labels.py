@@ -229,9 +229,62 @@ def test_no_two_labels_share_a_target_with_different_meaning() -> None:
         frozenset({"xp", "exp"}),        # 经验值的两种写法
         frozenset({"g", "gold"}),        # 货币单位的两种写法
         frozenset({"lv", "level"}),      # 等级的缩写与全称
+        # `MHP`/`MMP` 里的 M 是 Maximum，和 `HP`/`MP` 是**同一个资源**
+        # （当前值 vs 最大值），不是两种资源。属性栏里这两者通常紧挨着
+        # 显示，译成不同的词反而会让人以为是两套血条。
+        # 这条是**刻意**的，不是碰撞 —— 所以列进白名单而不是改译法。
+        frozenset({"hp", "mhp"}),
+        frozenset({"mp", "mmp"}),
     }
     bad = {t: s for t, s in bad.items() if frozenset(s) not in allowed}
     assert not bad, f"不同标签撞同一个译法：{bad}"
+
+
+def test_stat_abbreviations_are_covered_deterministically() -> None:
+    """属性缩写必须走**确定性查表**，不能交给模型。
+
+    真实贴图实测（173 个文字块，48% 是纯 ASCII 属性缩写）：
+    同一个模型、同一批缩写，8 个里只有 2 个对 ——
+
+    * ``'LUK'`` → ``'卢克'``（当**人名**音译了）；
+    * ``'MHP'`` → ``'生命值'``（对）、``'ATK'`` → ``'攻击力'``（对）；
+    * ``'AGI'``/``'DEF'``/``'MAT'``/``'MDF'``/``'MMP'`` **原样返回英文**，
+      却被标成"已翻译"。
+    """
+    for key in ("mhp", "mmp", "atk", "def", "mat", "mdf", "agi", "luk"):
+        t = engine_label_target(key)
+        assert t, f"属性缩写 {key!r} 没有确定性译法"
+
+
+def test_luk_is_luck_not_a_person_name() -> None:
+    """**真实误译的回归**：``'LUK'`` 被音译成 ``'卢克'``。
+
+    `LUK = Luck = 幸运`，和人名毫无关系。贴图上这个字错得很显眼
+    （属性栏里写着一个人名），而它**通过了所有自动检查** ——
+    非空、是中文、长度合理。
+    """
+    t = engine_label_target("LUK")
+    assert t == "幸运", f"`LUK` 必须译成「幸运」，实际 {t!r}"
+    assert t != "卢克"
+
+
+def test_attack_and_magic_attack_are_distinguishable() -> None:
+    """`ATK`/`MAT`、`DEF`/`MDF` 必须**成对可区分**。
+
+    译成同一个词会让属性栏出现两个相同标签（和 `HP`/`MP`/`TP`
+    全被译成"生命值"是同一类事故）。
+    """
+    atk, mat = engine_label_target("ATK"), engine_label_target("MAT")
+    deff, mdf = engine_label_target("DEF"), engine_label_target("MDF")
+    assert atk and mat and atk != mat, f"ATK={atk!r} 与 MAT={mat!r} 撞了"
+    assert deff and mdf and deff != mdf, f"DEF={deff!r} 与 MDF={mdf!r} 撞了"
+
+
+def test_stat_labels_stay_short_for_textures() -> None:
+    """贴图上空间紧张，属性缩写译法要短（≤3 个汉字）。"""
+    for key in ("atk", "def", "mat", "mdf", "agi", "luk", "mhp", "mmp"):
+        t = engine_label_target(key)
+        assert len(t) <= 3, f"{key!r} 的译法 {t!r} 太长，贴图会溢出"
 
 
 def test_engine_label_target_is_pure_lookup_not_substitution() -> None:

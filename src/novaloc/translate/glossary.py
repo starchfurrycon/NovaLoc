@@ -354,6 +354,41 @@ _ENGINE_LABELS: tuple[EngineLabel, ...] = (
     EngineLabel("exp", "经验值", "RPG Maker 标准译法"),
     EngineLabel("xp", "经验值", "EXP 的另一种写法，同一事物"),
     EngineLabel("sp", "技能值", "常见的技能点资源"),
+    # --- 属性缩写（贴图/状态栏里极常见）---
+    #
+    # ## 为什么必须放在**确定性**表里，不能交给模型
+    #
+    # 真实贴图实测（173 个文字块，48% 是纯 ASCII 属性缩写）：
+    #
+    # * `'LUK'` → `'卢克'` —— 模型把它当**人名**音译了。
+    #   这是术语误译的典型：`LUK = Luck = 幸运`，和人名毫无关系。
+    # * `'MHP'` → `'生命值'`（对了）、`'ATK'` → `'攻击力'`（对了），
+    #   但 `'AGI'`/`'DEF'`/`'MAT'`/`'MDF'`/`'MMP'` **原样返回英文**
+    #   （48% 的块 target 是纯 ASCII，写着"已翻译"其实没翻）。
+    #
+    # 同一个模型、同一批缩写，8 个里 2 个对、6 个不翻或翻错 ——
+    # 对**有限闭集**的引擎术语，确定性表永远比模型可靠。
+    #
+    # ## 译法依据
+    #
+    # 采用中文 RPG Maker 社区的习惯写法，并让**相关项成对**、彼此可区分：
+    # `ATK`/`MAT`（物理/魔法攻击）、`DEF`/`MDF`（物理/魔法防御）。
+    # 贴图上空间紧张，所以取短式（"魔攻/魔防"而不是"魔法攻击力"）。
+    #
+    # `MHP`/`MMP` 里的 M 是 Maximum（最大生命/魔法值），
+    # 但属性栏里紧挨着 HP/MP 显示，**同译**才不会让人误解为两种资源。
+    EngineLabel("mhp", "生命值", "M=Maximum 最大生命值；与 HP 同译，避免误解为两种资源"),
+    EngineLabel("mmp", "魔法值", "M=Maximum 最大魔法值；与 MP 同译"),
+    EngineLabel("atk", "攻击力", "属性栏标准译法"),
+    EngineLabel("def", "防御力", "属性栏标准译法"),
+    EngineLabel("mat", "魔攻", "Magic Attack；与 MAT 成对的是 MDF，取短式适配贴图"),
+    EngineLabel("mdf", "魔防", "Magic Defense；与 MAT 成对，取短式适配贴图"),
+    EngineLabel("agi", "敏捷", "属性栏标准译法"),
+    EngineLabel("luk", "幸运", "Luck；**不能**音译成「卢克」，那是人名"),
+    EngineLabel("spd", "速度", "属性栏常见写法"),
+    EngineLabel("hit", "命中", "属性栏常见写法"),
+    EngineLabel("eva", "闪避", "属性栏常见写法"),
+    EngineLabel("cri", "暴击", "属性栏常见写法"),
     # --- terms.basic 的其余两项（Level / Lv）---
     #
     # `Lv` 是 `Level` 的缩写写法，两者在 `terms.basic` 里各占两个位置
