@@ -39,16 +39,27 @@ _CONTROL_PATTERNS = [
 ]
 
 _PLACEHOLDER_PATTERNS: list[tuple[str, str]] = [
+    # **嵌套形式必须排在基础形式之前**：`\S[\V[101]]` 要整体算**一个**占位符。
+    # 排在后面的话，基础规则会先只匹配到里面的 `\V[101]`，
+    # 于是守卫认为"原文有 1 个占位符、译文有 1 个"——数量对得上，
+    # 但结构已经坏了（外层 `\S[` 和 `]` 被当成可翻译的明文）。
+    # 必须和 `translate/placeholders.py` 的排列顺序保持一致。
+    ("rpgmaker_escape_nested", r"\\[VvNnPpCcIiSs]\[\\[VvNnPpCcIiSs]\[\d+\]\]"),
     ("rpgmaker_escape", r"\\[VvNnPpCcIiSs]\[\d+\]"),
     ("renpy_tag", r"\{/?[a-zA-Z]+(?:=[^{}]*)?\}"),
     ("rich_text_tag", r"</?[a-zA-Z][^>]*>"),
     ("bracket_tag", r"\[/?[a-zA-Z]+(?:=[^\]]*)?\]"),
-    ("printf", r"%(?:\d+\$)?[-+ #0]*[\d*]*(?:\.\d+)?[hlL]?[diouxXeEfFgGcrs%]"),
+    ("printf", r"%(?:\d+\$)?[-+#0]*[\d*]*(?:\.\d+)?[hlL]?[diouxXeEfFgGcrs%]"),
     ("brace_index", r"\{\d+(?::[^{}]*)?\}"),
     ("template_var", r"\$\{[^}]*\}"),
     ("html_entity", r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);"),
     ("newline_escape", r"\\n"),
     ("fmt_escape", r"\\{2,}"),
+    # 插件定义的裸字母占位符：`\D`（伤害表达式）、`\R`（次数表达式）。
+    # 这两个**不是** RPG Maker 原生转义，是游戏插件自己解析的。
+    # 必须和 `translate/placeholders.py` 同步 —— 只在一侧加会重现
+    # "守卫认、屏蔽器不认"（或反之）的老问题，实测代价是 91 条静默损坏。
+    ("plugin_letter_escape", r"\\[DR]"),
 ]
 
 # 明确不该送进翻译引擎的东西
