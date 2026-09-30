@@ -217,7 +217,7 @@ WebSocket 处理器（`ws_job`）在事件循环线程里，而事件是在 work
    还容易把显存打爆。
 3. **取消语义简单。** `shutdown()` 用 `cancel_futures=True`。
 
-Frontend 侧：前端静态资源由 FastAPI 直接挂载（`_web_dist()` → `web/dist`），
+Frontend 侧：前端静态资源由 FastAPI 直接挂载（`_web_dist()` → `novaloc/web_dist`），
 非 `/api` 非 `/ws` 的路径走 SPA 回退。前端构建产物**随仓库提交**，所以运行时不需要 Node。
 
 ---

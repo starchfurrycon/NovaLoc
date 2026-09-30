@@ -1,14 +1,15 @@
 """FastAPI 应用：把流水线暴露成 HTTP + WebSocket 接口。
 
 前端契约见 ``web/src/api.ts``（由前端并行开发，两边必须一致）。
-静态文件服务 ``web/dist``，所以构建后的前端可以直接由本服务托管，
-用户不需要装 Node。
+静态文件服务 ``novaloc/web_dist``（构建产物**随包分发**），
+所以构建后的前端由本服务直接托管，用户不需要装 Node。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -28,8 +29,12 @@ from .jobs import Job, JobManager, load_config, save_config
 
 log = logging.getLogger(__name__)
 
-VERSION = "0.1.0"
-
+# **唯一版本来源**。以前这里硬写 "0.1.0"，而 pyproject.toml 与
+# ``novaloc/__init__.py`` 各自也写了一份 —— 三处手工同步必然漂移：
+# 发版时包版本升到 0.2.0，``/api/health`` 却仍然报 0.1.0，
+# 前端"关于"里显示的还是旧号。测试
+# ``test_version_is_single_source`` 锁住这一点。
+from .. import __version__ as VERSION  # noqa: E402
 
 # --------------------------------------------------------------------------
 # 请求体
@@ -694,6 +699,7 @@ def create_app() -> FastAPI:
 
     web_dist = _web_dist()
     if web_dist is not None:
+        log.debug("前端静态资源目录：%s", web_dist)
         app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="assets")
 
         @app.get("/")
@@ -710,6 +716,17 @@ def create_app() -> FastAPI:
                 return FileResponse(candidate)
             return FileResponse(web_dist / "index.html")
 
+    else:
+        # **要吵一声**。以前这里是静默跳过：接口全都正常，只有根路径 404，
+        # 用户看到"打不开页面"却没有任何线索。前端是随包分发的，
+        # 真找不到基本就是安装不完整。
+        log.warning(
+            "找不到前端静态资源，Web 界面不可用（API 仍然正常）。"
+            "已查找：包内 novaloc/web_dist、源码树 web/dist、$NOVALOC_WEB_DIST。"
+            "若你是从源码运行，请先构建前端；若刚 pip 安装完，"
+            "可能是安装包不完整，建议重装 novaloc。"
+        )
+
     @app.on_event("shutdown")
     def _shutdown() -> None:
         jobs.shutdown()
@@ -718,8 +735,36 @@ def create_app() -> FastAPI:
 
 
 def _web_dist() -> Path | None:
-    """找构建好的前端。开发时可能还没构建，返回 None 即可。"""
+    """找构建好的前端，返回 ``index.html`` 所在目录；找不到返回 ``None``。
+
+    **按这个顺序找**：
+
+    1. ``novaloc/web_dist`` —— 构建产物**随包分发**（在 ``src/novaloc/web_dist``）。
+       这是安装后的正常情况（``pip install`` / ``pip install -e .``）。
+       放在**包内**是刻意的：早先放在仓库根的 ``web/dist``，
+       hatchling 打包时只收 ``src/novaloc``，导致 wheel 里根本没有前端，
+       ``pip install nova-loc`` 装出来的 GUI 是打不开的 —— 而
+       GitHub 自动生成的 wheel 又不会报错，属于"静默残废"。
+    2. 源码树里的 ``web/dist`` —— 兼容旧布局与手工构建到那里的人。
+    3. ``NOVALOC_WEB_DIST`` 环境变量 —— 开发时指向别处。
+
+    三条都没有也不算错误：开发时可能还没构建前端。
+    此时只提供 API，``create_app`` 会打印一行提示。
+    """
     here = Path(__file__).resolve()
+
+    env = os.environ.get("NOVALOC_WEB_DIST")
+    if env:
+        d = Path(env)
+        if (d / "index.html").is_file():
+            return d
+
+    # 1) 包内（安装后的正常情况）
+    bundled = here.parents[1] / "web_dist"
+    if (bundled / "index.html").is_file():
+        return bundled
+
+    # 2) 源码树 / 手工构建
     for base in (here.parents[3], here.parents[2]):
         d = base / "web" / "dist"
         if (d / "index.html").is_file():
@@ -727,6 +772,46 @@ def _web_dist() -> Path | None:
     return None
 
 
-app = create_app()
+_app: FastAPI | None = None
 
-__all__ = ["app", "create_app"]
+
+def get_app() -> FastAPI:
+    """进程级单例，给 ``uvicorn ... novaloc.api.app:get_app`` 之类的入口用。"""
+    global _app
+    if _app is None:
+        _app = create_app()
+    return _app
+
+
+def __getattr__(name: str) -> Any:
+    """让 ``app`` 与 ``create_app`` 都能从模块上取到，**且不在模块里存同名变量**。
+
+    为什么绕这一圈：模块末尾如果直接写 ``app = create_app()``，
+    那个变量会**遮蔽同名的子模块** —— 于是
+
+        import novaloc.api.app as m
+        m._web_dist            # AttributeError: 'FastAPI' object has no attribute
+
+    拿到的是 FastAPI 实例而不是模块。``from ... import`` 不受影响
+    （import 机制会回退到 ``sys.modules``），所以这个坑只在
+    ``import ... as`` 时炸，非常难查 —— 写测试时就正好踩到了。
+
+    改用模块级 ``__getattr__``（PEP 562）后三者都正确：
+
+    * ``import novaloc.api.app as m`` → 模块；
+    * ``from novaloc.api.app import app`` → FastAPI 实例；
+    * ``from novaloc.api.app import create_app`` → 工厂函数。
+
+    顺带得到一个好处：``import novaloc.api.app`` 不再产生副作用地
+    构造一个 App。直接 ``uvicorn novaloc.api.app:app`` 仍然可用。
+    """
+    if name == "app":
+        return get_app()
+    if name == "create_app":
+        return create_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# `app` 由上面的模块级 __getattr__ 惰性提供，模块里**没有**这个全局变量。
+# ruff 的 F822 只做静态检查、不认 PEP 562，所以这条必须豁免。
+__all__ = ["app", "create_app", "get_app"]  # noqa: F822

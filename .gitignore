@@ -12,7 +12,7 @@ venv/
 # Python build output。
 # 这里刻意只写 `dist/`（只匹配仓库根目录），**不写 `**/dist/`** ——
 # 后者的语义是"忽略任意层级的 dist 目录"，而 Git 不会进入被忽略的目录，
-# 于是 `!web/dist/**` 这种"先忽略目录、再放行内部文件"的写法完全无效，
+# 于是"先忽略目录、再放行内部文件"的写法完全无效，
 # 前端产物会静默地不被提交。这个坑很难发现，因为 `git status` 不报错。
 dist/
 build/*.egg-info/
@@ -24,8 +24,15 @@ web/.vite/
 *.tsbuildinfo
 
 # --- Frontend build output (intentionally committed) ---
-# web/dist ships with the repo so the tool runs without a Node toolchain.
-!web/dist/**
+#
+# 产物在 `src/novaloc/web_dist/`，**不是** `web/dist/`。
+# 放包内是刻意的：hatchling 只打包 `src/novaloc`，产物放仓库根会让
+# wheel 里没有前端，`pip install nova-loc` 装出来的界面 404，
+# 而且构建时毫无警告（属于"静默残废"，已踩过一次）。
+#
+# 上面那条 `dist/`（只匹配根目录，不递归）**不会**命中 `web_dist/`，
+# 所以这里不需要任何 `!` 例外 —— 之前的 `!web/dist/**` 写法本身就
+# 是无效的，见前面的注释。
 
 # --- Runtime / user data (never commit) ---
 data/

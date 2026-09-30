@@ -1348,23 +1348,42 @@ novaloc text export <项目id> --format csv --out 译文.csv   # 里面含 gloss
 
 术语表在提示词里会被**强制注入**（`prompts.py::build_glossary_block`）。
 
-### 12.7 提交了 `web/dist/` 是不是错了
+### 12.7 提交了前端构建产物是不是错了
 
-**不是。** 这是有意的：前端构建产物随仓库提交，
+**不是。** 这是有意的：前端构建产物随包提交，
 这样工具**不需要 Node 就能运行**。
 
-`.gitignore` 里为此有专门的负向规则：
+产物路径是 **`src/novaloc/web_dist/`**，也就是**放在 Python 包内部**。
+这一点是踩过坑才定下来的：早先放在仓库根的 `web/dist`，而
+`pyproject.toml` 里写的是
 
-```
-**/dist/
-!web/dist/
-...
-# --- Frontend build output (intentionally committed) ---
-# web/dist ships with the repo so the tool runs without a Node toolchain.
-!web/dist/**
+```toml
+[tool.hatch.build.targets.wheel]
+packages = ["src/novaloc"]
 ```
 
-所以**不要**把 `web/dist/` 加进忽略列表。
+hatchling 只收 `src/novaloc`，于是 **wheel 里根本没有前端**。
+GitHub 自动生成的 wheel 不会因此报错，`pip install nova-loc`
+装完接口全都正常、只有根路径 404 —— 典型的"静默残废"。
+放进包内后，`pip install` 与 `pip install -e .` 用的是同一批产物。
+
+#### 关于 `.gitignore` 的一个陷阱
+
+网上常见的写法是"先忽略所有 `dist/`、再用 `!` 放行前端"，**那是无效的**：
+
+```
+**/dist/          # 忽略任意层级的 dist
+!web/dist/        # ← 完全不起作用
+!web/dist/**      # ← 也不起作用
+```
+
+**Git 不会进入被忽略的目录**，所以目录一旦被忽略，内部的 `!` 例外
+再怎么写都无效，而 `git status` 也不报错 —— 前端产物会静默地不被提交。
+
+本仓库的做法是**只忽略仓库根的 `dist/`**（模式 `dist/` 不递归），
+而前端产物在 `src/novaloc/web_dist/`，路径里根本没有 `dist` 段，
+所以既不需要任何 `!` 例外，也不会被误忽略。
+**不要把 `web_dist/` 加进忽略列表。**
 
 ### 12.8 同时跑两个项目会不会更快
 

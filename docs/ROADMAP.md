@@ -117,7 +117,7 @@
 | GET | `/api/projects/{pid}/qa` |
 | GET / DELETE | `/api/jobs`, `/api/jobs/{job_id}` |
 | WS | `/ws/jobs/{job_id}` |
-| GET | `/` 与 SPA 回退（挂载 `web/dist`） |
+| GET | `/` 与 SPA 回退（挂载 `novaloc/web_dist`） |
 
 API 文档页：`/api/docs`。
 
@@ -134,7 +134,7 @@ API 文档页：`/api/docs`。
 | `Job` | 任务进度（WebSocket 实时日志流） |
 | `Settings` | 配置编辑 |
 
-前端构建产物 `web/dist` **随仓库提交**，所以运行时不依赖 Node。
+前端构建产物 `src/novaloc/web_dist/` **随仓库提交**，所以运行时不依赖 Node。（放在包内是为了让 wheel 也带上它，见第 3 节 #13）
 
 ### 1.7 测试现状（重要）
 

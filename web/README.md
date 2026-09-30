@@ -1,7 +1,7 @@
 # NovaLoc / 新译 — 前端 (web)
 
 NovaLoc 的桌面端前端：Vite + React 19 + TypeScript(strict) + Tailwind 4 + Arwes + lucide-react。
-轻科幻技术风格（深色底 + 青绿强调色 + 等宽字体），构建产物 `web/dist/` 会被 FastAPI 后端直接静态托管。
+轻科幻技术风格（深色底 + 青绿强调色 + 等宽字体），构建产物 `src/novaloc/web_dist/` 会被 FastAPI 后端直接静态托管。
 
 ---
 
@@ -41,19 +41,25 @@ pnpm run dev
 
 ```powershell
 cd web
-pnpm run build      # tsc -b && vite build  → web/dist/
+pnpm run build      # tsc -b && vite build  → src/novaloc/web_dist/
 pnpm run typecheck  # 仅做类型检查
 pnpm run preview    # 本地预览构建产物
 ```
 
-构建产物：`web/dist/index.html`、`web/dist/assets/*.js`、`web/dist/assets/*.css`。
+构建产物：`src/novaloc/web_dist/index.html`、`src/novaloc/web_dist/assets/*.js`、`src/novaloc/web_dist/assets/*.css`。
 
-**`web/dist/` 是刻意提交进仓库的**（`.gitignore` 中通过 `!web/dist/**` 例外放行），
-这样没有 Node 工具链的机器也能直接运行工具；`web/node_modules/` 仍被忽略。
+**构建产物是刻意提交进仓库的**，这样没有 Node 工具链的机器也能直接运行工具；
+`web/node_modules/` 仍被忽略。
+
+产物的位置由 `vite.config.ts` 的 `build.outDir` 决定，指向
+**`../src/novaloc/web_dist`** —— 也就是**放进 Python 包内部**。
+这不是随意选的：`pyproject.toml` 里 hatchling 只打包 `src/novaloc`，
+产物放仓库根的话 **wheel 里会没有前端**，`pip install nova-loc`
+装出来界面 404 且构建时毫无警告。改这个路径前请先确认打包仍然生效。
 
 ## 路由
 
-使用 `HashRouter`，因此静态托管无需服务端重写规则，后端把 `web/dist` 挂到任意路径都能工作。
+使用 `HashRouter`，因此静态托管无需服务端重写规则，后端把 `novaloc/web_dist` 挂到任意路径都能工作。
 
 | 路由 | 页面 | 主要接口 |
 | --- | --- | --- |

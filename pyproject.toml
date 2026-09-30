@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nova-loc"
-version = "0.2.0"
+# 版本号的**唯一来源**是 src/novaloc/__init__.py 的 __version__，这里动态读取。
+# 曾经三处（这里、__init__.py、api/app.py）各写一份，手工同步第一次发版就漂移了：
+# 包升到 0.2.0 时 /api/health 仍报 0.1.0。动态读就不会再发生。
+dynamic = ["version"]
 description = "NovaLoc 新译 — 全离线游戏全文本汉化流水线：文本抽取、AI 翻译、字体补字、贴图文字重绘"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -90,6 +93,11 @@ Issues = "https://github.com/starchfurrycon/novaloc/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/novaloc"]
+
+# 让 hatchling 从包本身读版本号，与上面 dynamic = ["version"] 配套。
+# 这样 pyproject.toml 里再也**没有**版本字面量可以漂移。
+[tool.hatch.version]
+path = "src/novaloc/__init__.py"
 
 [tool.ruff]
 line-length = 110
