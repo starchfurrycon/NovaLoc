@@ -382,6 +382,39 @@ def mask_indices(text: str) -> list[int]:
     return [int(m.group(1)) for m in _MASK_RE.finditer(text or "")]
 
 
+def strip_unknown_masks(text: str, n_slots: int) -> str:
+    """删掉**不存在的**屏蔽记号（下标 >= ``n_slots``）。
+
+    模型偶尔会在**本条根本没有占位符**时凭空写出 ``⟦0⟧``。
+    真实记录（BeyondPortal）：
+
+    * ``'啊...乌鲁拉 别那么快，不然我就要射了！'``（无占位符）
+      → 模型回 ``'啊…乌鲁拉，别急，我还没瞄准呢！”} ⟦0⟧'``
+    * ``'啊~... 是-是...拜託 …'`` → ``'哎… 嗯… 是… 请帮帮我…”} ⟦0⟧, {'``
+
+    这些凭空记号会撞进 ``verify_restored`` 的"多出占位符"分支，
+    整条判为 fatal、译文清空 —— 玩家看到空白对话框，
+    而**真正的问题只是多了一个垃圾记号**。
+
+    凭空记号没有任何对应的原始占位符可还原，删掉它**不会**丢信息，
+    所以这是安全的修复（"多出来的"和"丢失的"性质完全不同：
+    丢失的必须拒绝，多出来的可以删）。实测 14 条这类失败全部可救。
+
+    注意只删**越界**的：``⟦0⟧``/``⟦1⟧`` 在 ``n_slots=3`` 时是合法的，
+    原样保留交给后续校验去判断顺序与重复。
+    """
+    if n_slots <= 0:
+        # 本条没有任何占位符 → 所有记号都是凭空造的
+        return _MASK_RE.sub("", text or "")
+    if not text:
+        return text or ""
+
+    def _sub(m: re.Match[str]) -> str:
+        return "" if int(m.group(1)) >= n_slots else m.group(0)
+
+    return _MASK_RE.sub(_sub, text)
+
+
 def verify_restored(
     original: str,
     translated_raw: str,

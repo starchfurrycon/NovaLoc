@@ -538,6 +538,35 @@ class OllamaTranslationProvider:
                                 restored, ph_check = restored2, check2
                                 raw_masked = repaired
                     if ph_check.fatal:
+                        # 再试一种**安全的**修复：删掉**凭空多出来的**屏蔽记号。
+                        #
+                        # 与"丢失占位符"不同 —— 丢失的是真信息，必须拒绝；
+                        # 多出来的是模型幻觉，删掉不丢任何东西。
+                        # 真实记录：源文根本没有占位符，模型却回了
+                        # `'啊…乌鲁拉，别急，我还没瞄准呢！”} ⟦0⟧'`，
+                        # 于是整条被判 fatal、译文清空，玩家看到空白对话框。
+                        # 实测 14 条这类失败全部可救。
+                        cleaned = ph.strip_unknown_masks(
+                            raw_masked, len(slots_all[local_i])
+                        )
+                        cleaned2, check3 = ph.verify_restored(
+                            item.unit.source,
+                            cleaned,
+                            slots_all[local_i],
+                            masked_source=masked_all[local_i],
+                        )
+                        if cleaned != raw_masked and not check3.fatal:
+                            self.stats["stray_mask_stripped"] = (
+                                self.stats.get("stray_mask_stripped", 0) + 1
+                            )
+                            log.debug(
+                                "删掉凭空记号：%s → %r",
+                                ph_check.describe(),
+                                cleaned,
+                            )
+                            restored, ph_check = cleaned2, check3
+                            raw_masked = cleaned
+                    if ph_check.fatal:
                         # 补不回来 —— 硬错误，绝不能写回游戏
                         self.stats["placeholder_fatal"] += 1
                         entry.status = EntryStatus.FAILED
