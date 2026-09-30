@@ -762,21 +762,142 @@ class RpgMakerAdapter(EngineAdapter):
                     )
         return out
 
-    def wire_fonts(self, out_dir: Path, installed: dict[str, str]) -> list[str]:
-        """改 ``fonts/gamefont.css`` 的 ``@font-face`` 指向补好的字体。
+    def _engine_flavour(self, out_dir: Path) -> str:
+        """判断是 MZ 还是 MV —— 两者加载字体的机制**完全不同**。
 
-        RPG Maker MV/MZ 的字体是通过 CSS 加载的，``@font-face`` 里的
-        ``fontFamily`` 必须和 ``js/rpg_core.js`` 里
-        ``Graphics._createFontLoader`` 用的名字对得上（默认 ``GameFont``）。
-        **只替换字体文件、不改 CSS 的 ``src``，游戏仍然加载旧字体**，
-        用户会看到"文件换了但游戏里还是口口口"。
+        实测（BeyondPortal，MZ）：
 
-        MZ 没有 ``fonts/`` 目录时，新建一个并写 CSS —— 引擎会自动
-        加载 ``fonts/gamefont.css``（如果存在），这是官方支持的扩展点。
+            rmmz_scenes.js
+              Scene_Boot.prototype.loadGameFonts = function() {
+                  const advanced = $dataSystem.advanced;
+                  FontManager.load("rmmz-mainfont", advanced.mainFontFilename);
+                  FontManager.load("rmmz-numberfont", advanced.numberFontFilename);
+              };
+
+        也就是说 MZ 是按 **System.json 里的文件名**去 `fonts/` 取文件的，
+        **没有任何代码引用 `fonts/gamefont.css`**
+        （`index.html` 只挂了 `css/game.css`）。
+        MV 相反：`index.html` 里 `<link>` 了 `fonts/gamefont.css`。
+
+        分不清就会做错事：给 MZ 写 gamefont.css 属于**自欺**——
+        文件生成了、日志说"已接线"，但引擎根本不会读它。
+        """
+        out_root = _content_root(out_dir) or out_dir
+        js = out_root / "js"
+        if (js / "rmmz_core.js").is_file():
+            return "mz"
+        if (js / "rpg_core.js").is_file():
+            return "mv"
+        # 退路：看 index.html 引不引 CSS
+        html = out_root / "index.html"
+        if html.is_file():
+            t = html.read_text(encoding="utf-8", errors="replace")
+            if "gamefont.css" in t:
+                return "mv"
+            if "rmmz" in t or "js/main.js" in t:
+                return "mz"
+        return "mv"
+
+    def _mz_font_filenames(self, out_dir: Path) -> list[str]:
+        """从 `System.json` 读 MZ 实际会加载的字体文件名。"""
+        out_root = _content_root(out_dir) or out_dir
+        sysj = out_root / "data" / "System.json"
+        if not sysj.is_file():
+            return []
+        try:
+            data = json.loads(sysj.read_text(encoding="utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            return []
+        adv = data.get("advanced") or {}
+        names = [adv.get("mainFontFilename"), adv.get("numberFontFilename")]
+        return [n for n in names if isinstance(n, str) and n.strip()]
+
+    def _wire_fonts_mz(
+        self,
+        out_dir: Path,
+        installed: dict[str, str],
+        *,
+        game_dir: Path | None = None,
+    ) -> list[str]:
+        """MZ 的字体接线 —— **不需要改任何配置**，但要**验证**同名覆盖真的发生了。
+
+        MZ 按 `System.json.advanced.mainFontFilename` 指定的文件名去
+        `fonts/` 取字体。我们的做法就是**用补好的字体覆盖那个同名文件**，
+        所以引擎自然就会加载到中文字形。
+
+        ## 为什么这个方法必须存在（而不是什么都不做）
+
+        这个"什么都不用改"的结论**很容易被后续重构悄悄破坏**：
+        只要有人把补丁产物改成只写 `<原名>.zh.woff`（看起来更"干净"、
+        不覆盖原文件），MZ 就会继续加载原字体 ——
+        文件都在、日志都绿、**游戏里满屏口口口**。
+
+        所以这里**验证** `System.json` 点名的每个文件确实与**源游戏**里的
+        同名文件不同 —— "不同"才是"注入成功"的证据。
+        只比文件大小是不够的（补丁失败时 `apply` 会把原字体原样拷过来，
+        大小这时**恰好相同**；但若补丁"成功"却写回了原字节，大小也可能相同，
+        而反过来大小不同也不代表对）。有 `game_dir` 时就逐字节比。
         """
         notes: list[str] = []
-        if not installed:
+        wanted = self._mz_font_filenames(out_dir)
+        if not wanted:
+            notes.append("⚠️ 读不到 System.json 的字体文件名，请手动确认 fonts/ 下的字体")
             return notes
+
+        out_root = _content_root(out_dir) or out_dir
+        src_root = None
+        if game_dir is not None:
+            src_root = _content_root(game_dir) or game_dir
+
+        for name in wanted:
+            f = out_root / "fonts" / name
+            if not f.is_file():
+                notes.append(
+                    f"⚠️ System.json 指定的字体 {name} 在 fonts/ 下不存在，"
+                    "MZ 会退回系统字体（中文可能显示为口口口）"
+                )
+                continue
+            src = (src_root / "fonts" / name) if src_root is not None else None
+            if src is not None and src.is_file():
+                if f.read_bytes() == src.read_bytes():
+                    notes.append(
+                        f"❌ {name} 与源文件**逐字节相同** —— 中文字形没有注入成功！"
+                        "游戏里会是口口口。请检查字体阶段为什么没产出（"
+                        "常见原因是字符集里有补不上的字符，或没有可用的中文字体）。"
+                    )
+                    continue
+                notes.append(
+                    f"MZ 按 System.json 加载 fonts/{name}，已用注入中文字形的版本覆盖"
+                    f"（{src.stat().st_size} → {f.stat().st_size} 字节）"
+                )
+            else:
+                notes.append(f"MZ 按 System.json 加载 fonts/{name}，文件已就位")
+        notes.append(
+            "MZ 不读 fonts/gamefont.css（那是 MV 的机制，"
+            "MZ 用 FontManager.load + System.json 里的文件名）"
+        )
+        return notes
+
+    def wire_fonts(
+        self,
+        out_dir: Path,
+        installed: dict[str, str],
+        *,
+        game_dir: Path | None = None,
+    ) -> list[str]:
+        """让引擎真正去加载补好的字体。MV 与 MZ 的机制不同，必须分开处理。
+
+        ``game_dir`` 是**源游戏**目录，只用于"产物是否真的变了"的对照校验
+        （MZ 那条路需要它来发现"原样拷贝"这种静默失败）。
+        返回人类可读的说明（进日志与报告）。
+        """
+        if not installed:
+            return []
+
+        if self._engine_flavour(out_dir) == "mz":
+            return self._wire_fonts_mz(out_dir, installed, game_dir=game_dir)
+
+        notes: list[str] = []
 
         # fonts 目录必须落在**资源根**下（MV 的 NW.js 布局是 out/www/fonts，
         # MZ 是 out/fonts）。判定顺序与 `discover_fonts` 一致。
@@ -986,7 +1107,7 @@ class RpgMakerAdapter(EngineAdapter):
                 res.files_written += n
                 # 光放文件不够，还得让引擎去用它
                 try:
-                    for note in self.wire_fonts(out_dir, installed):
+                    for note in self.wire_fonts(out_dir, installed, game_dir=game_dir):
                         res.warnings.append(f"[字体接线] {note}")
                 except Exception as exc:  # noqa: BLE001
                     res.warnings.append(f"字体接线失败（字体文件已就位，可能需手动指向）：{exc}")

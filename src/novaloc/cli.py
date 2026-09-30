@@ -41,7 +41,7 @@ from .core import paths
 from .core.config import Config
 from .core.events import Event, EventBus
 from .core.registry import Context, Providers
-from .core.workspace import Workspace
+from .core.workspace import Workspace, WorkspaceBusyError
 from .models import EntryStatus
 from .pipeline import STAGE_LABELS, STAGES, Pipeline, PipelineError, StageResult, run_qa
 
@@ -1196,7 +1196,11 @@ def run(
     unsub = bus.subscribe(on_event)
     failed: PipelineError | None = None
     try:
-        with progress:
+        # 独占工作区：两个 `novaloc run` 同时跑会各自读到旧的 entries.jsonl、
+        # 各自写回自己的版本，**后写的把先写的成果全抹掉且不报错**。
+        # 真实事故：翻译跑 50 分钟时并发跑 apply，两边抢同一个
+        # `entries.jsonl.tmp` → WinError 32，翻译在最后一步保存时崩掉。
+        with ws.lock(what=f"run {'/'.join(s for s, _ in todo)}"), progress:
             for sid, label in todo:
                 progress.update(task_id, description=f"{label}（{sid}）")
                 if sid == "detect":
@@ -1216,6 +1220,9 @@ def run(
                 elif sid == "apply":
                     pipe.stage_apply()
                 progress.advance(task_id)
+    except WorkspaceBusyError as exc:
+        console.print(f"[red]✗ {exc}[/red]")
+        raise typer.Exit(code=2) from None
     except PipelineError as exc:
         failed = exc
     except KeyboardInterrupt:

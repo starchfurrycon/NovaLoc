@@ -30,7 +30,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import shutil
 import threading
 import time
@@ -58,9 +60,117 @@ from .sanitize import sanitize_tree
 T = TypeVar("T", bound=BaseModel)
 
 
+class WorkspaceBusyError(RuntimeError):
+    """工作区被另一个进程占用。
+
+    单独定义成异常类型（而不是返回布尔/打日志）是为了让调用方**必须**处理：
+    并发写会静默抹掉对方成果，绝不能"警告一下继续跑"。
+    """
+
+
+def _pid_alive(pid: int) -> bool:
+    """判断某个 pid 是否还活着（用于识别**陈旧锁**）。
+
+    ## Windows 上不能用 `os.kill(pid, 0)`
+
+    POSIX 里 `os.kill(pid, 0)` 是标准做法（`ESRCH` = 不存在）。
+    但**实测 Windows 上它对已退出的进程不抛任何异常**
+    （CPython 的实现是调 `OpenProcess` + `TerminateProcess`，
+    对死 pid 直接静默返回）：
+
+        已退出进程 pid=37100
+        os.kill(37100, 0) → 没有抛异常
+
+    用它判活会**永远返回 True** —— 于是陈旧锁永远解不开，
+    用户被一个早已不存在的进程永久挡住，和"锁不释放"是同一个病。
+
+    所以 Windows 走 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
+    + `GetExitCodeProcess`：打不开句柄 = 进程不存在；
+    打得开但退出码不是 `STILL_ACTIVE` = 已退出。
+    实测三种情况都对（已退出 False / 自己 True / 不存在的 pid False）。
+
+    判错的方向必须是"保守"：**宁可认为它还活着**（于是报错让用户确认），
+    也不要把一个真在跑的进程误判成死的、然后两个进程一起写。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 存在但没权限动它 → 活着
+    except OSError:
+        return True
+    return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """Windows：`OpenProcess` + `GetExitCodeProcess`。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        # 只要"能不能查到"，不要别的权限 —— 权限越小越不容易被拒。
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False  # 打不开 = 不存在（或已退出）
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == 259  # STILL_ACTIVE
+            return True  # 查不到 → 保守判活
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - 任何异常都保守判活
+        return True
+
+
+def _tmp_sibling(path: Path) -> Path:
+    """给 ``path`` 生成一个**本进程独有**的临时文件名（同目录）。
+
+    ## 为什么不能固定叫 ``<name>.tmp``
+
+    原子写是"先写 tmp、再 rename 覆盖正式文件"。两个进程同时写同一个
+    ``.tmp`` 时，Windows 上第二个 rename 会
+
+        [WinError 32] 另一个程序正在使用此文件，进程无法访问
+
+    **真实事故**：翻译阶段跑了 **50 分钟**（21655 条），
+    我在另一个终端并发跑 `apply`（它也要写 `entries.jsonl`），
+    两边争同一个 `entries.jsonl.tmp` —— 翻译在**最后一步保存时崩掉**，
+    而且 `entries.jsonl` 中间还出现了 1 行截断（读到一半被替换）。
+
+    ## 为什么不是加锁就够了
+
+    加锁（见 `Workspace.lock()`）能挡住"同时跑两个阶段"，
+    但挡不住"同一个进程里两个线程"，也挡不住用户手工编辑文件。
+    **独有 tmp 名**是更底层的一道保险：最坏情况也只是"最后一次写入赢"，
+    绝不会出现半个文件。
+
+    用 `os.getpid()` + 线程 id：同进程不同线程也不会撞。
+    """
+    import os
+    import threading
+
+    tag = f"{os.getpid()}-{threading.get_ident()}"
+    return path.with_name(f"{path.name}.{tag}.tmp")
+
+
 def _atomic_write(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = _tmp_sibling(path)
     tmp.write_text(data, encoding="utf-8")
     tmp.replace(path)
 
@@ -105,7 +215,8 @@ def _json_safe(model: BaseModel) -> str:
 def _write_jsonl(path: Path, items: Iterable[BaseModel]) -> int:
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # 独有 tmp 名，避免并发写入撞在同一个 `.tmp` 上（见 `_tmp_sibling`）。
+    tmp = _tmp_sibling(path)
     n = 0
     with tmp.open("w", encoding="utf-8", newline="\n") as fh:
         for it in items:
@@ -134,6 +245,87 @@ class Workspace:
         self.project = project
         self.root = root
         self._lock = threading.RLock()
+
+    # ------------------------------------------------------------------
+    # 跨进程互斥
+    # ------------------------------------------------------------------
+
+    @property
+    def lock_path(self) -> Path:
+        return self.root / ".novaloc.lock"
+
+    @contextlib.contextmanager
+    def lock(self, *, what: str = "流水线") -> Iterator[None]:
+        """独占这个工作区，防止两个 `novaloc run` 同时写同一批文件。
+
+        ## 真实事故（这次是我自己踩的）
+
+        翻译阶段跑到第 50 分钟（21655 条）时，我在另一个终端并发跑了
+        `apply`。两边都要写 `translations/entries.jsonl`：
+
+        * 两边抢同一个 `entries.jsonl.tmp`，Windows 上是
+          `[WinError 32] 另一个程序正在使用此文件，进程无法访问`，
+          翻译在**最后一步保存时崩掉**；
+        * 更糟的是 `entries.jsonl` **中间**出现了 1 行截断
+          （读到一半被替换），说明"原子改名"并不是在所有时序下都安全。
+
+        已经用"独有 tmp 名"（`_tmp_sibling`）修掉了截断，
+        但"同时跑两个阶段"本身仍然是**逻辑错误**：两个进程各自读到
+        旧的 `entries.jsonl`，各自写回自己的版本，**后写的把先写的成果全抹掉**。
+        这种情况没有任何报错，用户只会发现"莫名其妙少了一批译文"。
+
+        ## 为什么用"锁文件 + 进程存活检测"而不是 `msvcrt.locking`
+
+        文件锁在进程被强杀（Ctrl+C、关机、`taskkill`）时**不会释放**，
+        用户下次运行会永远被挡住，而且查不出原因。
+        这里记 PID：锁文件里写着持有者的 pid，
+        新进程发现那个 pid **已经不存在**就认为锁是陈旧的、直接接管。
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        lp = self.lock_path
+        for attempt in range(2):
+            try:
+                fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                holder = ""
+                try:
+                    holder = lp.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    holder = ""
+                pid_txt = holder.split()[0] if holder.split() else ""
+                alive = False
+                if pid_txt.isdigit():
+                    alive = _pid_alive(int(pid_txt))
+                if alive and attempt == 0:
+                    raise WorkspaceBusyError(
+                        f"这个工作区正被另一个进程使用（pid {pid_txt}）。\n"
+                        f"锁文件：{lp}\n"
+                        "同时跑两个阶段会互相覆盖成果，所以这里直接停下。\n"
+                        "若确认那个进程已经不在了，删掉锁文件再试。"
+                    ) from None
+                # 陈旧锁：持有者已死 → 接管。
+                try:
+                    lp.unlink()
+                except OSError:
+                    pass
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(f"{os.getpid()} {what}\n")
+            break
+        else:  # pragma: no cover - 两次都撞上，属于异常情况
+            raise WorkspaceBusyError(f"无法取得工作区锁：{lp}")
+
+        try:
+            yield
+        finally:
+            # 只删自己写的锁，避免误删别人的（接管竞态）
+            try:
+                if lp.is_file() and lp.read_text(encoding="utf-8").strip().startswith(
+                    str(os.getpid())
+                ):
+                    lp.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # 创建 / 打开
