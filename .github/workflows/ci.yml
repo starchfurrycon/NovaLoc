@@ -1,0 +1,72 @@
+name: CI
+
+# push / PR 上跑静态检查与导入冒烟测试。
+#
+# ⚠️ 这里**故意不跑完整测试套件**。
+#
+# 原因：真实测试需要 PP-OCRv6 的 ONNX 模型（约 140 MB 下载）和可用的
+# DirectML/CUDA 推理后端。CI runner 既没有 GPU、也不该为每次 push 去
+# 下载模型，所以 `pytest` 在这个环境里跑不全，跑了也只会给出误导性的绿。
+#
+# 当前能做的两件事：
+#   1. `ruff check src` —— 静态检查，不需要任何运行时依赖；
+#   2. 导入冒烟测试 —— 确认包能被导入、没有语法/循环导入/缺失模块的问题。
+#
+# 完整测试请在本地跑（需要模型与 GPU），见 README 的「开发」一节。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint-and-smoke:
+    name: ruff + import smoke
+    runs-on: ubuntu-latest
+
+    env:
+      # 让导入直接从源码树解析，避免 CI 依赖本地 editable 安装的副作用。
+      # 注意：src/novaloc/translate/ 没有 __init__.py（命名空间包），
+      # 所以这里用 PYTHONPATH 指向 src 而不是依赖已安装的包。
+      PYTHONPATH: src
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dev extras (no inference backend)
+        # 不装 dml / gpu / cpu / ocr / vision / inpaint：
+        # 冒烟测试只需要基础依赖，而 onnxruntime 的三个变体互相冲突，
+        # CI 里装任何一个都没有意义。
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check src
+
+      - name: Import smoke test
+        # 覆盖四个用户提到的顶层入口加上各子包与可选深层模块。
+        # 这一条能抓到：语法错误、循环导入、__init__ 里引用了不存在的名字、
+        # 以及打包时漏掉模块（例如 translate 命名空间包的 __init__ 缺失）。
+        run: |
+          python -c "import novaloc, novaloc.api.app, novaloc.pipeline, novaloc.engines"
+          python -c "import novaloc.cli, novaloc.models, novaloc.lang"
+          python -c "import novaloc.core.config, novaloc.core.workspace, novaloc.core.registry"
+          python -c "import novaloc.fonts.catalog, novaloc.fonts.charset, novaloc.fonts.merge, novaloc.fonts.qa"
+          python -c "import novaloc.images.io, novaloc.images.render, novaloc.images.inpaint, novaloc.images.textgroup"
+          python -c "import novaloc.translate.placeholders, novaloc.translate.guards, novaloc.translate.json_parse"
+          python -c "from novaloc.pipeline.stages import STAGES; assert len(STAGES) == 8, STAGES"
+
+      - name: CLI smoke test
+        # --help 不需要配置、不需要网络、不需要模型。
+        run: |
+          novaloc --version
+          novaloc --help

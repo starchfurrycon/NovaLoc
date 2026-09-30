@@ -1043,7 +1043,10 @@ def _validate_stage(stage: str) -> str:
     valid = [s for s, _ in STAGES]
     key = stage.strip().lower()
     if key not in valid:
-        _fail(f"未知阶段 {stage!r}。可用阶段：" + "、".join(f"{s}（{lb}）" for s, lb in STAGES))
+        # 用 ASCII 逗号+空格而不是中文顿号：rich 会把全角标点当成换行机会，
+        # 长句会在奇怪的地方断行。
+        avail = ", ".join(f"{s} ({lb})" for s, lb in STAGES)
+        _fail(f"未知阶段 {stage!r}。可用阶段: {avail}")
     return key
 
 
@@ -1137,7 +1140,6 @@ def run(
         transient=False,
     )
     task_id = progress.add_task("准备中…", total=max(1, len(todo)))
-    log_lines: list[str] = []
 
     # 质检阶段会为每一条没有译文的串各发一条 warn 日志（几十上百条），
     # 直接把终端刷爆。同类消息只打前几条，其余汇总。
@@ -1162,23 +1164,18 @@ def run(
             if n >= MAX_SAME_LOG:
                 suppressed[ev.message] = suppressed.get(ev.message, 0) + 1
                 return
-            log_lines.append(f"{prefix}{ev.message}")
             console.print(f"[{style}]{prefix}{ev.message}[/{style}]" if style else f"{prefix}{ev.message}")
         elif ev.kind == "stage_error":
-            log_lines.append(f"✗ [{STAGE_LABELS.get(ev.stage, ev.stage)}] {ev.message}")
             console.print(f"[red]✗ [{STAGE_LABELS.get(ev.stage, ev.stage)}] {ev.message}[/red]")
         elif ev.kind == "stage_end":
             skipped = sum(suppressed.values())
             if skipped:
                 console.print(f"[dim]…另有 {skipped} 条重复提示已折叠。[/dim]")
                 suppressed.clear()
-            log_lines.append(f"✅ {STAGE_LABELS.get(ev.stage, ev.stage)} 完成：{ev.message}")
             console.print(
                 f"[green]✅ {STAGE_LABELS.get(ev.stage, ev.stage)} 完成[/green]"
                 + (f"：{ev.message}" if ev.message else "")
             )
-        elif ev.kind == "done":
-            log_lines.append(f"完成：{ev.message}")
 
     unsub = bus.subscribe(on_event)
     failed: PipelineError | None = None
@@ -1917,6 +1914,7 @@ def serve(
 
 @ollama_app.command("status")
 def ollama_status(
+    base_url: str = typer.Option("", "--base-url", help="Ollama 地址；留空用配置里的值。"),
     json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
 ) -> None:
     """检查 Ollama 是否安装/运行，以及推荐模型是否就位。"""
@@ -1926,8 +1924,8 @@ def ollama_status(
     from .translate import ollama_setup  # noqa: PLC0415
 
     cfg = load_config()
-    base_url = cfg.resolved_ollama_host()
-    snap = ollama_setup.status_snapshot(base_url)
+    url = base_url or cfg.resolved_ollama_host()
+    snap = ollama_setup.status_snapshot(url)
 
     if json_output:
         _echo_json(snap)

@@ -1,0 +1,48 @@
+name: Release
+
+# 打一个 v* tag 就构建发行包并发布 Release。
+#
+# 为什么用 ubuntu-latest：构建 wheel/sdist 是**纯 Python 打包**，
+# 不需要 OCR 模型、不需要 onnxruntime、更不需要 GPU。
+# 在 Linux 上构建比在 Windows runner 上快得多，也更便宜。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: build + publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build backend
+        run: python -m pip install --upgrade pip build
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Show artifacts
+        run: ls -lh dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # tag 名即版本名（v0.1.0 之类）
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

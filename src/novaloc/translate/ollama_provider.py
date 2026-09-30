@@ -347,6 +347,30 @@ class OllamaTranslationProvider:
                 else:
                     candidate = raw_masked
 
+                # 抄记号检测：mask_batch 是**逐条局部编号**，所以"把上一条的
+                # ⟦1⟧ 抄进这一条"用越界检查抓不到（这一条自己也有 ⟦0⟧）。
+                # 某条译文里出现超出自身槽位数的记号下标，就是抄错了。
+                # 这类错误很危险：还原后占位符多重集仍然"正确"，
+                # 但游戏里读到的变量是错的（比如把名字显示成了金钱）。
+                if use_mask:
+                    leaked = [
+                        idx for idx in ph.mask_indices(raw_masked)
+                        if idx >= len(slots_all[local_i])
+                    ]
+                    if leaked:
+                        self.stats["cross_item_leak"] = (
+                            self.stats.get("cross_item_leak", 0) + 1
+                        )
+                        entry.status = EntryStatus.FAILED
+                        entry.target = ""
+                        entry.warnings = [
+                            f"cross_item_leak: 译文里出现了本条目不存在的占位符编号 "
+                            f"{sorted(set(leaked))}（本条只有 {len(slots_all[local_i])} 个占位符），"
+                            "疑似把相邻条目的占位符抄了过来"
+                        ]
+                        entry.meta["raw_model_output"] = raw_masked
+                        continue
+
                 res = guard(
                     item.unit.source,
                     candidate,

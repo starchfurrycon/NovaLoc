@@ -114,6 +114,68 @@ class TextureResult:
         return self.translated > 0
 
 
+def _crop_quad(image: Any, quad: list[tuple[float, float]], *, pad: int = 3) -> Any:
+    """按四边形裁剪出一个**正立的**文字区域。
+
+    直接把外接矩形裁给 VLM 是不行的：斜排文字在外接矩形里仍然
+    是斜的，模型读起来更吃力。这里做一次透视校正，把四边形
+    拉成水平矩形 —— 相当于"把这块文字摆正了再给模型看"。
+    """
+    import cv2
+
+    if not quad or len(quad) != 4:
+        return None
+
+    h, w = image.shape[:2]
+    pts = np.asarray(quad, dtype="float32")
+
+    # 目标宽高取四边形的边长，尽量不缩放（缩放会损失小字信息）
+    top = float(np.linalg.norm(pts[1] - pts[0]))
+    bottom = float(np.linalg.norm(pts[2] - pts[3]))
+    left = float(np.linalg.norm(pts[3] - pts[0]))
+    right = float(np.linalg.norm(pts[2] - pts[1]))
+    tw = int(round(max(top, bottom)))
+    th = int(round(max(left, right)))
+    if tw < 2 or th < 2:
+        return None
+
+    # 要正立，四边形的顶点顺序必须是"顺时针、左上打头"。
+    # RapidOCR 不保证顺序，先按角度排序再旋转到左上打头。
+    ordered = _order_quad(pts)
+    dst = np.array([[0, 0], [tw - 1, 0], [tw - 1, th - 1], [0, th - 1]], dtype="float32")
+    m = cv2.getPerspectiveTransform(ordered, dst)
+    warped = cv2.warpPerspective(image, m, (tw, th), flags=cv2.INTER_CUBIC)
+
+    # 补一圈边：模型对贴着边缘的字容易漏读
+    if pad > 0:
+        warped = cv2.copyMakeBorder(
+            warped, pad, pad, pad, pad, cv2.BORDER_REPLICATE
+        )
+    del h, w
+    return warped
+
+
+def _order_quad(pts: Any) -> Any:
+    """把四个点排成"顺时针、左上打头"。
+
+    与 ``textgroup.quad_geometry`` 同一套约定：图像坐标 y 向下，
+    所以按极角升序排列得到的就是顺时针。
+    """
+    c = pts.mean(axis=0)
+    ang = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+    ordered = pts[np.argsort(ang)]
+    # 旋转到 x+y 最小的点（左上角）打头
+    start = int(np.argmin(ordered.sum(axis=1)))
+    return np.roll(ordered, -start, axis=0)
+
+
+def _norm(s: str) -> str:
+    """比较用归一化：忽略空白与全半角差异。"""
+    import unicodedata
+
+    return unicodedata.normalize("NFKC", str(s or "")).replace(" ", "").replace("\n", "").strip()
+
+
 class TextureTranslator:
     """贴图汉化执行器。
 
@@ -129,8 +191,12 @@ class TextureTranslator:
         self._ocr: PPOcrV6Engine | None = None
         self._lama: Any = None
         self._lama_tried = False
+        self._vlm: Any = None
+        self._vlm_tried = False
         self.calls = 0
         self.cache_hits = 0
+        self.vlm_reads = 0
+        self.vlm_fixes = 0
 
     # ------------------------------------------------------------------
     # 依赖惰性加载
@@ -141,6 +207,68 @@ class TextureTranslator:
         if self._ocr is None:
             self._ocr = self.ctx.cache_get("ocr", lambda: PPOcrV6Engine(self.ctx))
         return self._ocr
+
+    @property
+    def vlm(self) -> Any:
+        """视觉大模型兜底；不可用返回 ``None``（自动跳过兜底）。"""
+        if not self._vlm_tried:
+            self._vlm_tried = True
+            ocr_cfg = getattr(self.cfg, "ocr", None)
+            enabled = getattr(ocr_cfg, "vlm_fallback", True) if ocr_cfg else True
+            if not enabled:
+                self._vlm = None
+                return None
+            try:
+                from ..translate.vision_ollama import OllamaVisionEngine
+
+                eng = OllamaVisionEngine(self.ctx)
+                ok, why = eng.available()
+                if ok:
+                    self._vlm = eng
+                else:
+                    log.info("视觉兜底不可用，跳过：%s", why)
+                    self._vlm = None
+            except Exception as exc:  # noqa: BLE001
+                log.info("视觉兜底初始化失败，跳过：%s", exc)
+                self._vlm = None
+        return self._vlm
+
+    @property
+    def vlm_threshold(self) -> float:
+        ocr_cfg = getattr(self.cfg, "ocr", None)
+        if ocr_cfg is not None:
+            return float(getattr(ocr_cfg, "vlm_threshold", 0.6))
+        img_cfg = getattr(self.cfg, "image", None)
+        if img_cfg is not None:
+            return float(getattr(img_cfg, "vlm_threshold", 0.6))
+        return 0.6
+
+    def _vlm_reconsider(self, image: Any, block: Any) -> str:
+        """对低置信度的块，让 VLM 重读一遍文字内容。
+
+        **只用来纠正文字，绝不用来改框**：VLM 的定位精度比专用 OCR
+        差两个数量级（实测旋转文本 Hmean 2.1 vs 93.8），
+        一旦让它决定位置，排版就毁了。所以这里只取文本，
+        四边形坐标原样保留。
+        """
+        vlm = self.vlm
+        if vlm is None:
+            return ""
+        quad = getattr(block, "quad", None) or []
+        if not quad:
+            return ""
+
+        try:
+            crop = _crop_quad(image, quad)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("裁剪待重读区域失败：%s", exc)
+            return ""
+        if crop is None or getattr(crop, "size", 0) == 0:
+            return ""
+
+        self.vlm_reads += 1
+        text = vlm.read_text(crop, hint="这是游戏贴图里的文字，请只输出文字本身")
+        return (text or "").strip()
 
     @property
     def lama(self) -> Any:
@@ -204,6 +332,13 @@ class TextureTranslator:
             b for b in blocks
             if (b.box[2] - b.box[0]) >= min_box and (b.box[3] - b.box[1]) >= min_box
         ]
+
+        # ---- 1b. 视觉兜底：只对低置信度的块重读文字，不改框 ----
+        # 专用 OCR 在定位上碾压 VLM（旋转文本 Hmean 93.8 vs 2.1），
+        # 所以框一律用 OCR 的；但美术字/描边字 OCR 会给低置信度结果，
+        # 这时让 VLM 重读一遍**内容**，能救回不少贴图。
+        blocks = self._vlm_rescue(raw, blocks)
+
         asset.blocks = blocks
         asset.analyzed = True
         if not blocks:
@@ -281,6 +416,46 @@ class TextureTranslator:
         return result
 
     # ------------------------------------------------------------------
+
+    def _vlm_rescue(self, image: Any, blocks: list[Any]) -> list[Any]:
+        """对低置信度的块用 VLM 重读。返回（可能被修正过的）块列表。
+
+        设计要点：
+
+        * **阈值来自配置**（``ocr.vlm_threshold``，默认 0.6），不是拍脑袋；
+        * **只改文字，不改框** —— 四边形原样保留；
+        * **只在 VLM 给出非空结果时替换**，读不出来就保留 OCR 原结果，
+          避免"兜底把好结果搞坏"；
+        * 单块失败不影响整张图。
+        """
+        if not blocks or self.vlm is None:
+            return blocks
+        thr = self.vlm_threshold
+        low = [b for b in blocks if float(getattr(b, "confidence", 0.0) or 0.0) < thr]
+        if not low:
+            return blocks
+
+        log.debug("有 %d/%d 块置信度低于 %.2f，尝试视觉兜底", len(low), len(blocks), thr)
+        for b in low:
+            try:
+                better = self._vlm_reconsider(image, b)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("视觉兜底失败（保留 OCR 结果）：%s", exc)
+                continue
+            if not better:
+                continue
+            # 归一化后再比较：VLM 常把空格/换行处理得不一样，
+            # 但内容相同的话没必要替换（也不会改善）
+            if _norm(better) == _norm(b.source):
+                continue
+            b.source = better
+            b.confidence = max(float(getattr(b, "confidence", 0.0) or 0.0), thr)
+            warnings = list(getattr(b, "warnings", []) or [])
+            if "vlm_reread" not in warnings:
+                warnings.append("vlm_reread")
+            b.warnings = warnings
+            self.vlm_fixes += 1
+        return blocks
 
     def _translate_texts(
         self,

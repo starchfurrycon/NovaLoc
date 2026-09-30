@@ -230,7 +230,7 @@ Frontend 侧：前端静态资源由 FastAPI 直接挂载（`_web_dist()` → `w
 | `translate` | `TranslationProvider` | `available()` / `translate_batch(items, target_lang)` | `ollama` |
 | `ocr` | `OcrEngine` | `available()` / `detect_and_recognize(image, lang_hint)` | `ppocrv6` |
 | `inpaint` | `InpaintEngine` | `available()` / `inpaint(image, mask)` | 目录为空；实际走 `images/inpaint.py` 的三档降级 |
-| `vision` | `VisionEngine` | `available()` / `read_text()` / `describe_style()` | 目录为空（规划中） |
+| `vision` | `VisionEngine` | `available()` / `read_text()` / `describe_style()` | `ollama`（`translate/vision_ollama.py`），只做低置信度的兜底重读 |
 | `engine` | —（不用 Protocol） | 见第 7 节 `EngineAdapter` | `rpgmaker` / `renpy` / `unity` / `loose` |
 
 注册方式是装饰器 `@register(kind, name)`，它把 `name` 挂到 `cls.provider_name` 上并写进
@@ -645,6 +645,5 @@ class MyProvider:
 | `engines/base.py::wire_fonts` 默认实现 | 返回空列表（不改任何东西） | **只有 `rpgmaker` 与 `renpy` 覆写了它**；`unity` 与 `loose` 没有。Unity 的字体指向需要处理 TMP，见 `docs/FONTS.md` |
 | `api/jobs.py` 与 `core/config.py` | 配置实际是 `<data_root>/config.json`，而 `core/config.py` 的读写走 `<config_dir>/config.toml` | 两套格式并存；`cli.load_config()` 做了 JSON → TOML 的回退，但 `core.get_config()` 只读 TOML |
 | `pipeline/stage_images_localize` | 逐图串行处理 | 大项目贴图多时耗时长；并发会争抢 GPU，所以是有意保守 |
-| `translate` 包 | **没有 `__init__.py`**（作为命名空间包存在） | 开发态 import 正常；打包为 wheel 时能否被 hatchling 收录需要额外验证 |
-
-最后一条不是设计选择，更像是遗漏，写在这里以便优先修掉。
+| `images/service.py::_vlm_rescue` | 逐块串行调用视觉模型，且**没有缓存** | 一张图里低置信度的块多时会连续发多次 `/api/chat`；同一文字块在别的图上重复出现也要重问。`vlm_reads` / `vlm_fixes` 两个计数器可用于观察命中率 |
+| `tests/` 目录 | 不存在，而 `pyproject.toml` 的 `testpaths = ["tests"]` | `pytest` 收集不到测试；真实测试在 `.scratch/` 下（见 `docs/ROADMAP.md` 第 1.7 节） |
