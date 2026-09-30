@@ -419,13 +419,39 @@ class RpgMakerAdapter(EngineAdapter):
     def _commands_text(self, holder: Any, fname: str, base: str) -> list[TextUnit]:
         """解析事件指令列表里的文本。
 
-        RPG Maker 的指令是一个二维数组：``[[code, indent, [params...]], ...]``。
+        RPG Maker 的指令列表有**两种**序列化形式，必须都认：
+
+        .. code-block:: javascript
+
+            // 数组形式（RPG Maker MV/MZ 官方编辑器保存的样子）
+            [401, 0, ["一句台词"]]
+            // 字典形式（部分插件/导出工具写出来的样子）
+            {"code": 401, "indent": 0, "parameters": ["一句台词"]}
+
         ``code 401``（显示文字）的 ``params[0]`` 就是一句台词。
         ``code 102``（显示选项）的 params 整体是候选列表。
         ``code 101`` 的 params[4] 是说话人名字。
 
         **``code 355``/``655``（脚本）绝不翻译** —— 那是插件参数和 JS 代码，
         翻了必然破坏游戏逻辑。
+
+        ## 为什么必须两种都认（真实游戏事故）
+
+        一台真实 MZ 游戏的 `data/` 里有 **175,062** 条指令，**全是字典形式**。
+        而这里原先只判断 ``isinstance(cmd, list)``，于是**每一条都被跳过**：
+
+        * **20,065 句台词**、**16,599 个说话人名**、427 组选项，
+          **一个字都没翻译**；
+        * 更坏的是流水线会报"翻译完成 3163/3299 条"、质检通过、
+          回写成功 —— 因为被翻译的只有事件名（``'EV002'``）和数据库词条，
+          **看起来一切正常**。
+
+        玩家打开游戏会看到：菜单是中文，剧情全是原文。
+        这是"静默失效"最严重的形态 —— 报告全绿，核心功能等于没做。
+
+        字典形式下 ``parameters`` 是**具名键**，所以指针写成
+        ``.../list/{ci}/parameters/0``；:meth:`_set_pointer` 本来就支持
+        数字段当数组下标、非数字段当字典键，所以回写不需要改。
         """
         out: list[TextUnit] = []
         lst = holder.get("list") if isinstance(holder, dict) else None
@@ -433,16 +459,14 @@ class RpgMakerAdapter(EngineAdapter):
             return out
 
         for ci, cmd in enumerate(lst):
-            if not isinstance(cmd, list) or len(cmd) < 3:
+            code, params, pkey = self._norm_command(cmd)
+            if code is None:
                 continue
-            try:
-                code = int(cmd[0])
-            except (TypeError, ValueError):
-                continue
-            params = cmd[2]
             if code in (401, 405):
                 if isinstance(params, list) and params:
-                    u = self._mk(str(params[0]), fname, f"{base}/{ci}/2/0", TextKind.DIALOGUE)
+                    u = self._mk(
+                        str(params[0]), fname, f"{base}/{ci}/{pkey}/0", TextKind.DIALOGUE
+                    )
                     if u:
                         out.append(u)
             elif code == 102 and isinstance(params, list):
@@ -453,18 +477,49 @@ class RpgMakerAdapter(EngineAdapter):
                     # 最后一项是"取消时返回的索引"，是数字串
                     if oi == len(params) - 1 and choice.isdigit():
                         continue
-                    u = self._mk(choice, fname, f"{base}/{ci}/2/{oi}", TextKind.MENU)
+                    u = self._mk(choice, fname, f"{base}/{ci}/{pkey}/{oi}", TextKind.MENU)
                     if u:
                         out.append(u)
             elif code == 101 and isinstance(params, list) and len(params) >= 5:
                 # 脸图设置：[faceName, faceIndex, _, _, speakerName]
                 speaker = params[4]
                 if isinstance(speaker, str):
-                    u = self._mk(speaker, fname, f"{base}/{ci}/2/4", TextKind.CHARACTER_NAME)
+                    u = self._mk(
+                        speaker, fname, f"{base}/{ci}/{pkey}/4", TextKind.CHARACTER_NAME
+                    )
                     if u:
                         out.append(u)
             # 108/408 注释、355/655 脚本：有意跳过
         return out
+
+    @staticmethod
+    def _norm_command(cmd: Any) -> tuple[int | None, Any, str]:
+        """把两种形式的指令归一化成 ``(code, parameters, 指针里的参数字段名)``。
+
+        认不出来返回 ``(None, None, "")``。
+
+        第三项是**指针里该用的那一段**：数组形式是下标 ``"2"``，
+        字典形式是键名 ``"parameters"``。回写时靠它定位，
+        所以两种形式的指针不能混用。
+
+        注意别用 ``len(cmd) >= 3`` 来判断数组形式：字典形式的
+        ``len()`` 是**键的个数**，``{"code":401,"indent":1,"parameters":[...]}``
+        恰好是 3，会误判成合法数组，然后 ``cmd[0]`` 抛
+        ``KeyError``（或者更糟：静默取到别的键）。
+        """
+        if isinstance(cmd, dict):
+            code = cmd.get("code")
+            params = cmd.get("parameters")
+            try:
+                return int(code), params, "parameters"
+            except (TypeError, ValueError):
+                return None, None, ""
+        if isinstance(cmd, list) and len(cmd) >= 3:
+            try:
+                return int(cmd[0]), cmd[2], "2"
+            except (TypeError, ValueError):
+                return None, None, ""
+        return None, None, ""
 
     @staticmethod
     def _kind_for_field(field: str) -> TextKind:
