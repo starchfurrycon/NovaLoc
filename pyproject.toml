@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nova-loc"
-version = "0.1.0"
+version = "0.2.0"
 description = "NovaLoc 新译 — 全离线游戏全文本汉化流水线：文本抽取、AI 翻译、字体补字、贴图文字重绘"
 readme = "README.md"
 requires-python = ">=3.11"
