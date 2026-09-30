@@ -27,6 +27,7 @@ import numpy as np
 from ..core.registry import Context, register
 from ..models import ImageTextBlock, TextBlockStyle
 from .io import imread_bgr
+from .ocr_cache import cache_key
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +114,10 @@ class PPOcrV6Engine:
         self._tier: str = ""
         self._ready: tuple[bool, str] | None = None
         self._load_error: str = ""
+        self._ocr_cache: Any = None
+        # 用 None 而不是 "" 表示"还没算过" —— 空串是**合法的已算过结果**，
+        # 拿它当初值会让 `is not None` 判断永远短路，直接返回空标识。
+        self._engine_tag_cache: str | None = None
 
     # ------------------------------------------------------------------
     # 基本信息
@@ -325,7 +330,14 @@ class PPOcrV6Engine:
         max_side: int | None = None,
         asset_uid: str = "",
     ) -> OcrPage:
-        """识别一张图。``image`` 可为路径 / ndarray / PIL Image。"""
+        """识别一张图。``image`` 可为路径 / ndarray / PIL Image。
+
+        结果会进**磁盘缓存**（见 :mod:`novaloc.images.ocr_cache`）。
+        理由：真实游戏上贴图动辄上千张，OCR 是最慢的一步，
+        而且在真实资产上**结果不确定** —— 崩一次重跑，
+        识别出的框和文字就变了，产物无法复现。
+        缓存让这一步"只做一次、每次都一样"。
+        """
         ok, why = self.available()
         if not ok:
             return OcrPage(error=why)
@@ -336,6 +348,25 @@ class PPOcrV6Engine:
 
         score = float(min_score if min_score is not None else self._opt("min_score", 0.5))
         limit = int(max_side or self._opt("max_side", 4096) or 4096)
+
+        cache = self._cache()
+        key: str | None = None
+        if cache is not None and cache.enabled:
+            key = cache_key(
+                np.ascontiguousarray(arr).tobytes(),
+                tier=self.tier,
+                min_score=score,
+                max_side=limit,
+                lang=self._source_lang() or "",
+                engine_tag=self._engine_tag(),
+            )
+            hit = cache.get(key)
+            if hit is not None:
+                page = self._page_from_cache(hit, asset_uid)
+                if page is not None:
+                    log.debug("OCR 命中缓存（%s）", asset_uid or "无 uid")
+                    return page
+
         scale = 1.0
         if max(w, h) > limit:
             scale = limit / max(w, h)
@@ -352,12 +383,111 @@ class PPOcrV6Engine:
             return OcrPage(error=f"OCR 推理失败：{exc}", width=w, height=h)
 
         elapsed = (time.time() - t0) * 1000
-        return OcrPage(
+        page = OcrPage(
             blocks=self._to_blocks(result, score, scale, asset_uid),
             width=w,
             height=h,
             elapsed_ms=elapsed,
             tier=self._tier,
+        )
+        if cache is not None and key is not None and not page.error:
+            cache.put(key, self._page_to_cache(page))
+        return page
+
+    # ------------------------------------------------------------------
+    # 缓存
+    # ------------------------------------------------------------------
+
+    def _cache(self) -> Any:
+        """本实例的 OCR 缓存（可用 `ocr.cache=False` 关掉）。"""
+        cached = getattr(self, "_ocr_cache", None)
+        if cached is not None:
+            return cached
+        from .ocr_cache import OcrCache, default_cache_root
+
+        if not bool(self._opt("cache", True)):
+            self._ocr_cache = OcrCache(None)
+            return self._ocr_cache
+        explicit = self._opt("cache_dir", "")
+        root = Path(str(explicit)) if explicit else default_cache_root()
+        self._ocr_cache = OcrCache(root)
+        return self._ocr_cache
+
+    def _engine_tag(self) -> str:
+        """引擎版本标识，进缓存键。
+
+        目的是防止"模型换了却命中旧缓存"：产物看着正常，
+        用的却是上一个模型的识别结果，这种问题极难查。
+        所以标识里既要有**包版本**，也要有**模型文件指纹** ——
+        只写包版本挡不住"同一个包、换了模型权重"。
+
+        （踩过：早先读 ``rapidocr.__version__``，这个属性不存在，
+        结果标识永远是 ``rapidocr|?`` —— 缓存键里等于没有版本信息。）
+        """
+        cached = getattr(self, "_engine_tag_cache", None)
+        if cached is not None:
+            return cached
+        bits = ["rapidocr"]
+        try:
+            import importlib.metadata as md
+
+            bits.append(md.version("rapidocr"))
+        except Exception:  # noqa: BLE001
+            bits.append("?")
+        bits.append(str(self._opt("use_directml", True)))
+        bits.append(self.tier)
+
+        # 模型文件指纹：名字 + 大小。不用哈希内容 —— 这几个 onnx
+        # 加起来 150 MB，每次算哈希太浪费；大小变化足以发现换模型。
+        try:
+            md_dir = self.model_dir()
+            fps = sorted(
+                f"{p.name}:{p.stat().st_size}"
+                for p in md_dir.rglob("*.onnx")
+                if p.is_file()
+            )
+            bits.append(",".join(fps))
+        except Exception:  # noqa: BLE001
+            bits.append("nomodels")
+
+        self._engine_tag_cache = "|".join(bits)
+        return self._engine_tag_cache
+
+    @staticmethod
+    def _page_to_cache(page: OcrPage) -> dict[str, Any]:
+        return {
+            "width": page.width,
+            "height": page.height,
+            "elapsed_ms": page.elapsed_ms,
+            "tier": page.tier,
+            "blocks": [b.model_dump(mode="json") for b in page.blocks],
+        }
+
+    def _page_from_cache(self, doc: dict[str, Any], asset_uid: str) -> OcrPage | None:
+        """从缓存文档还原 OcrPage；格式不对就返回 ``None``（按未命中处理）。
+
+        ⚠️ **块的 ``id`` 要按当前 ``asset_uid`` 重写**：``asset_uid`` 不参与
+        缓存键（同一张图可能以不同 uid 出现），但 ``id`` 的构造是
+        ``f"{asset_uid or 'img'}#{序号}"``。直接把缓存里的 id 拿来用，
+        会出现"框来自这张图、id 却属于那次调用的 uid"的错配 ——
+        下游按 id 索要样式/结果时就会对不上。
+        """
+        try:
+            blocks = [
+                ImageTextBlock.model_validate(b) for b in (doc.get("blocks") or [])
+            ]
+        except Exception as exc:  # noqa: BLE001
+            log.debug("OCR 缓存内容无法还原（按未命中处理）：%s", exc)
+            return None
+        prefix = asset_uid or "img"
+        for i, b in enumerate(blocks):
+            b.id = f"{prefix}#{i}"
+        return OcrPage(
+            blocks=blocks,
+            width=int(doc.get("width") or 0),
+            height=int(doc.get("height") or 0),
+            elapsed_ms=0.0,  # 命中缓存不是真实耗时，别算进性能统计
+            tier=str(doc.get("tier") or self._tier),
         )
 
     def _source_lang(self) -> str | None:
