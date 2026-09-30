@@ -122,3 +122,97 @@ def test_can_extract_uncovorable_chars_from_the_error() -> None:
     assert tail, "冒号后应当有字符"
     dropped = set(tail) - set(" 。，、")
     assert set(INCIDENT_CHARS) <= dropped, f"没解析出全部字符：{sorted(dropped)}"
+
+
+def test_error_parser_takes_the_tail_not_the_prefix() -> None:
+    """**从右端切**，不要按"是不是字母"筛。
+
+    第一版写成"冒号后、去掉空白和 ASCII"，结果把前缀里的
+    `font`/`is` 之类字母也当成"字符"留下了。
+    更糟的是外来文字（阿拉伯、天城）**也是 `isalpha()` 为真**，
+    按"是不是字母"根本分不出来。
+    """
+    from novaloc.pipeline.stages import Pipeline
+
+    got = Pipeline._chars_from_patch_error(INCIDENT_ERROR)
+    assert got == set(INCIDENT_CHARS), f"多出 {sorted(got - set(INCIDENT_CHARS))}"
+
+    # 没有冒号 → 空集（调用方据此不做重试，宁可硬失败也不瞎剔）
+    assert Pipeline._chars_from_patch_error("没有冒号的报错") == set()
+    assert Pipeline._chars_from_patch_error(None) == set()
+    assert Pipeline._chars_from_patch_error("") == set()
+
+
+# ----------------------------------------------------------------------
+# 三、「影响多少条文本」——剔除判据
+# ----------------------------------------------------------------------
+
+def _pipeline():
+    from novaloc.core.config import Config
+    from novaloc.core.events import EventBus
+    from novaloc.core.registry import Context
+    from novaloc.core.workspace import Workspace
+    from novaloc.models import Project
+    from novaloc.pipeline.stages import Pipeline
+
+    ws = Workspace(Project(name="t", game_dir="."), Path("."))
+    return Pipeline(ws, Context(config=Config(), events=EventBus()))
+
+
+def test_char_entry_counts_counts_texts_not_occurrences() -> None:
+    """**核心口径**：数"出现在多少条里"，不是"出现多少次"。
+
+    用"次数"会被长句里的重复字符骗过：
+    `'的的的的的'` 是 1 条、5 次。而判据要的是"影响多少条文本"。
+    """
+    from novaloc.pipeline.stages import Pipeline
+
+    c = Pipeline._char_entry_counts(["的的的的的", "你好"])
+    assert c["的"] == 1, "同一条里出现 5 次，也只算 1 条"
+    assert c["你"] == 1
+    # 跨组累加
+    c2 = Pipeline._char_entry_counts(["的"], ["的"])
+    assert c2["的"] == 2, "两条各出现一次 → 2 条"
+
+
+def test_common_chars_look_frequent_and_drift_chars_look_rare() -> None:
+    """真实数据的形状：正常字符几千条，跑偏字符几条。"""
+    from novaloc.pipeline.stages import Pipeline
+
+    translated = ["穿过传送门"] * 500 + ["我们ค่อยๆ ก็ได้"]
+    counts = Pipeline._char_entry_counts(translated)
+    assert counts["传"] == 500, "正常字符应当高频"
+    assert counts["ค"] == 1, "跑偏字符应当罕见"
+    pl = _pipeline()
+    limit = pl._droppable_char_limit(len(translated))
+    assert counts["ค"] <= limit, "罕见字符应当允许剔除"
+    assert counts["传"] > limit, "高频字符绝不能剔除"
+
+
+def test_droppable_limit_scales_with_project_size() -> None:
+    """绝对阈值不够用，必须带比例项。
+
+    实测：`'กี้'`（泰文）出现在 **7 条**里 —— 绝对阈值 3 挡不住，
+    于是"剔了 18 个还剩 3 个"、字体合并**还是失败**。
+    而 7 条相对于 2 万条只占 0.03%。
+    """
+    pl = _pipeline()
+    assert pl._droppable_char_limit(10) == 3, "小项目用绝对下限"
+    assert pl._droppable_char_limit(1000) >= 3
+    assert pl._droppable_char_limit(30000) > 7, (
+        "2 万条规模下，影响 7 条的字符必须允许剔除（真实事故就是这样）"
+    )
+    # 但也不能大到把真需求剔掉：0.5% 是保守上限
+    assert pl._droppable_char_limit(30000) < 30000 * 0.01
+
+
+def test_limit_never_reaches_real_content() -> None:
+    """真正需要的字符（出现在 90%+ 条里）永远碰不到剔除线。"""
+    from novaloc.pipeline.stages import Pipeline
+
+    n = 30000
+    translated = ["的生命值"] * n
+    counts = Pipeline._char_entry_counts(translated)
+    limit = _pipeline()._droppable_char_limit(n)
+    for ch in "的生命值":
+        assert counts[ch] > limit, f"{ch!r} 竟然落在可剔范围里"

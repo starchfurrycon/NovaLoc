@@ -132,6 +132,32 @@ class PipelineError(RuntimeError):
 
 
 class Pipeline:
+    #: 补不上的字符"影响多少条文本"以内，才允许从字符集里剔掉（**绝对下限**）。
+    #:
+    #: 真实数据校准：BeyondPortal 的跑偏字符只影响 1～7 条，
+    #: 而正常汉字（`的`/`，`/`你`）动辄出现在几千条里。
+    _MIN_ENTRIES_FOR_DROPPABLE_CHAR = 3
+
+    #: 允许剔除的"影响条数"上限，按文本总量取**比例**。
+    #:
+    #: ## 为什么必须有比例项（绝对阈值不够用）
+    #:
+    #: 实测：`'กี้'`（泰文）出现在 **7 条**里 ——
+    #: 绝对阈值 3 挡不住它，于是"剔了 18 个还剩 3 个"、字体合并**还是失败**。
+    #: 而这 7 条相对于 2 万条待译文本只占 **0.03%**：
+    #: 为了这 7 条让**整个游戏的中文全部变口口口**，显然荒唐。
+    #:
+    #: 取 0.5% 是很保守的：它意味着"最多允许为了 0.5% 的文本牺牲全量"。
+    #: 真正需要的字符（`的`/`你`）占 90%+，永远碰不到这条线。
+    _DROPPABLE_CHAR_RATIO = 0.005
+
+    def _droppable_char_limit(self, n_texts: int) -> int:
+        """允许剔除的字符最多能影响多少条文本。"""
+        return max(
+            self._MIN_ENTRIES_FOR_DROPPABLE_CHAR,
+            int(n_texts * self._DROPPABLE_CHAR_RATIO),
+        )
+
     """一个项目的汉化流水线。"""
 
     # 见文件末尾的 font_patch_records() —— 提成模块级函数是为了能单独测。
@@ -727,6 +753,29 @@ class Pipeline:
         tail = text[idx + 1 :].strip()
         return {c for c in tail if not c.isspace()}
 
+    @staticmethod
+    def _char_entry_counts(*groups: list[str]) -> dict[str, int]:
+        """统计每个字符出现在**多少条**文本里（不是出现多少次）。
+
+        ## 为什么要数"条数"而不是"次数"
+
+        字体规划失败时我们不能一律剔字符（那等于把需求删掉当修好）。
+        但**只在极少数条目里出现**的字符，几乎一定是坏数据：
+        某几句译文里混进了泰文/阿拉伯文，或者某条没翻译的原文里有怪符号。
+        为了这几条让**整个游戏的中文全部变口口口**，显然不划算。
+
+        「条数」这个口径很关键：一个正常字符（比如 `的`）
+        会出现几千次、几千条；而跑偏字符通常只出现在 1～2 条里。
+        用"出现次数"会被长句里的重复字符骗过，
+        用"条数"才反映"它到底影响多少条文本"。
+        """
+        counts: dict[str, int] = {}
+        for group in groups:
+            for text in group:
+                for ch in set(text or ""):
+                    counts[ch] = counts.get(ch, 0) + 1
+        return counts
+
     def stage_fonts(self, *, force: bool = False) -> StageResult:
         def go() -> StageResult:
             ad = self._adapter()
@@ -740,11 +789,6 @@ class Pipeline:
                 )
 
             charset = fs.build_charset(translated, source)
-            # 「必需字符」= 译文 + UI 安全字符。这些**一定**会被写回游戏，
-            # 缺一个就是口口口，所以要求 100% 覆盖。
-            # 源文侧（含 OCR 噪声、别的文字系统的残渣）是「顺带覆盖」：
-            # 补不上只警告。详见 `stage_fonts` 里重试那一段的说明。
-            critical_charset = fs.build_charset(translated)
             cs = ProjectCharset(
                 text_chars=sorted(set("".join(translated))),
                 ui_chars=sorted(set("".join(source)) - set("".join(translated))),
@@ -839,27 +883,60 @@ class Pipeline:
                 # 都变成口口口。
                 dropped_for_retry: list[str] = []
                 if not pr.ok:
-                    uncovorable = self._chars_from_patch_error(pr.error)
-                    # 只剔"只在源文侧"的字符；译文侧**不许剔** ——
-                    # 剔译文里的字符等于自己骗自己，缺了就是口口口。
-                    removable = uncovorable & (set(charset) - set(critical_charset))
-                    if removable:
-                        dropped_for_retry = sorted(removable)
+                    # ---- 迭代剔除「只影响极少数条目」的补不上的字符 ----
+                    #
+                    # 判据见 `_char_entry_counts`：正常字符（`的`/`，`）
+                    # 出现在几千条里；跑偏字符（泰文/阿拉伯文）
+                    # 通常只在几条里。
+                    #
+                    # 早先版本只剔"**只在源文侧**"的字符。那个判据**不够**：
+                    # 实测有 11 条**译文本身**混进了外来文字，
+                    # 于是它们进了「必需字符」，一个都剔不掉，
+                    # 整个字体合并失败 → `apply` 把原字体原样拷过去 →
+                    # **游戏里满屏口口口**。
+                    #
+                    # 为了几句坏译文让整个游戏的**全部中文**变口口口，
+                    # 显然不划算。所以放宽成"影响条目数 ≤ 3 的字符可以剔"，
+                    # 并且**永远不动**出现得多的字符（那才是真需求）。
+                    #
+                    # ## 为什么要**循环**而不是剔一次
+                    #
+                    # 实测：剔掉 18 个之后报错变成"还缺 3 个"——
+                    # 因为规划器是**贪心集合覆盖**，候选字体的选择变了，
+                    # 原本被别的字体顺带覆盖的字符就会跟着缺。
+                    # 一次剔不干净，必须迭代到成功或用光次数。
+                    counts = self._char_entry_counts(translated, source)
+                    limit = self._droppable_char_limit(len(translated))
+                    reduced = charset
+                    for _attempt in range(3):
+                        uncovorable = self._chars_from_patch_error(pr.error)
+                        removable = {
+                            ch
+                            for ch in uncovorable
+                            if counts.get(ch, 0) <= limit
+                        }
+                        removable -= set(dropped_for_retry)  # 已经剔过的不重复算
+                        if not removable:
+                            break
+                        dropped_for_retry.extend(sorted(removable))
                         # 注意**不改 `charset` 本身**：它是每轮 audit 的基准，
-                        # 改了会让后面字体的 `audit.ok` 判断与产物不一致
-                        # （早先版本在这里写回 `charset = reduced`，
-                        # 于是下游"已全覆盖、跳过"的判断用的是**缩小后**的
-                        # 字符集，和实际写进字体的字符集对不上）。
-                        reduced = "".join(c for c in charset if c not in removable)
+                        # 改了会让后面字体的 `audit.ok` 判断与产物不一致。
+                        reduced = "".join(c for c in reduced if c not in removable)
+                        pr = fs.patch_font(fp, reduced, out_path=out_path)
+                        if pr.ok:
+                            break
+                    if dropped_for_retry:
+                        worst = max(counts.get(c, 0) for c in dropped_for_retry)
                         self.bus.log(
-                            f"{len(removable)} 个字符只出现在**未翻译的原文**里"
-                            f"（{''.join(dropped_for_retry[:24])}），"
-                            "没有任何字体能提供。已从「顺带覆盖」里剔除后重试 —— "
-                            "它们不属于中文译文，不影响汉化完整性。",
+                            f"{len(dropped_for_retry)} 个字符补不上，但它们"
+                            f"**最多只影响 {worst} 条**文本（共 {len(translated)} 条，"
+                            f"{worst / max(1, len(translated)):.3%}）"
+                            f"（{''.join(dropped_for_retry[:24])}）。"
+                            "不值得为了它们让全部中文字形都注入失败，"
+                            "已从字符集里剔除。",
                             stage="fonts",
                             severity=Severity.WARN,
                         )
-                        pr = fs.patch_font(fp, reduced, out_path=out_path)
                 # 记录**实际用的策略**，不要把 action 写死成 "merge"。
                 # 早先这里硬编码 "merge"，于是 replace / fallback_only
                 # 策略产出的字体虽然 ok=True、out_path 也有值，却因为
