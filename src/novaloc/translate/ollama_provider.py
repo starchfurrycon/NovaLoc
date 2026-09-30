@@ -379,14 +379,30 @@ class OllamaTranslationProvider:
             raise ProviderError(why)
 
         self.stats["items"] += len(items)
+
+        # ---- 0. 同批内去重 ----
+        # 真实数据里冗余极高：某个角色的**说话人名**有 4334 条待翻，
+        # 而不同原文只有 **33** 种（99.2% 是重复的 `'<right>  Ulula  </right>'`
+        # 这类）；整体待办里 26.3% 是重复原文。
+        # 不去重就是"同一句话问模型几千次"，纯浪费。
+        # 去重后只在 `unique` 上跑模型，再把结果按原文映射回去。
+        #
+        # 只在**同一批**内去重（不是全局缓存）：批内重复已经覆盖了
+        # 这类高度重复的场景，而且不需要维护跨批状态与失效逻辑。
+        uniq_items, first_of, owners = self._dedupe(items)
+        if len(uniq_items) < len(items):
+            self.stats["deduped"] = self.stats.get("deduped", 0) + (
+                len(items) - len(uniq_items)
+            )
+
         out: list[TranslationEntry] = [self._blank(it) for it in items]
-        batches = self._make_batches(items)
+        batches = self._make_batches(uniq_items)
         ratio = self.cfg.translate.max_chars_ratio
         use_mask = self.cfg.translate.mask_placeholders
 
         for bi, batch in enumerate(batches):
             self.stats["batches"] += 1
-            batch_items = [items[i] for i in batch]
+            batch_items = [uniq_items[i] for i in batch]
             sources = [it.unit.source for it in batch_items]
 
             # ---- 1. 屏蔽占位符 ----
@@ -467,8 +483,8 @@ class OllamaTranslationProvider:
 
             # ---- 3. 还原 + 校验 + 守卫 ----
             for local_i, global_i in enumerate(batch):
-                item = items[global_i]
-                entry = out[global_i]
+                item = uniq_items[global_i]
+                entry = out[first_of[global_i]]
                 raw_masked = raw_by_index.get(local_i, "")
                 # 出站净化：模型偶尔把 `\uddd1` 这类**孤立代理项**当字面量
                 # 吐出来，`json.loads` 会忠实还原成一个非法字符。留着它
@@ -572,7 +588,63 @@ class OllamaTranslationProvider:
                 entry.retries = 0
                 entry.status = EntryStatus.FAILED if res.fatal else EntryStatus.TRANSLATED
 
+        # ---- 4. 把去重后的结果摊回重复项 ----
+        # 重复项的 `uid` 各不相同（同一句台词出现在多个事件里，
+        # 引擎用 `location.pointer` 区分），所以每个 uid 都要有自己的条目 ——
+        # 否则回写时只会改到一处，游戏里其它地方还是原文。
+        # 译文/状态照抄，但 `uid`/`source`/`kind` 必须是这一条自己的。
+        first_positions = set(first_of.values())
+        for pos, entry in enumerate(out):
+            if pos in first_positions:
+                continue  # 首次出现，本身就是被翻译的那条
+            canonical = out[first_of[owners[pos]]]
+            entry.target = canonical.target
+            entry.status = canonical.status
+            entry.warnings = list(canonical.warnings)
+            entry.provider = canonical.provider
+            entry.model = canonical.model
+            entry.glossary_hits = list(canonical.glossary_hits)
+            entry.meta = {**canonical.meta, "deduped_from_uid": canonical.uid}
+
         return out
+
+    @staticmethod
+    def _dedupe(
+        items: list[TranslateItem],
+    ) -> tuple[list[TranslateItem], dict[int, int], list[int]]:
+        """按 `source` 去重，返回 ``(唯一条目, 唯一序号→首次出现序号, 每条对应的唯一序号)``。
+
+        ## 为什么值得做
+
+        真实游戏待办 22087 条里，**26.3% 是重复原文**。极端例子是说话人名：
+        4334 条待翻、不同原文只有 **33** 种（99.2% 重复）——
+        就是 `'<right>  Ulula  </right>'` 这种被复制到几百个事件里的名字。
+        不去重等于同一句话问模型几千次。
+
+        ## 去重的键为什么只用 `source`
+
+        加上 `kind` 会更"安全"，但实测同一文本在不同 `kind` 下（比如
+        某个词既是道具名又是说话人）译文应该一致；用 `source` 能多省一些。
+        `max_chars` 这类每条的约束由后续的守卫单独检查，
+        不会因为共用一条译文而漏检。
+
+        注意**不能**按 `uid` 去重 —— 引擎给每处出现都分配了不同的
+        `uid`（`location.pointer` 不同），它们是不同的回写目标。
+        """
+        first_of: dict[int, int] = {}
+        owners: list[int] = []
+        uniq_items: list[TranslateItem] = []
+        seen: dict[str, int] = {}
+        for i, it in enumerate(items):
+            key = it.unit.source
+            if key in seen:
+                owners.append(seen[key])
+                continue
+            seen[key] = len(uniq_items)
+            owners.append(len(uniq_items))
+            first_of[len(uniq_items)] = i
+            uniq_items.append(it)
+        return uniq_items, first_of, owners
 
     def _blank(self, item: TranslateItem) -> TranslationEntry:
         return TranslationEntry(
