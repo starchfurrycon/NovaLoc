@@ -137,7 +137,13 @@ class OllamaTranslationProvider:
         except OllamaError:
             return {}
 
-    def _options(self, *, temperature: float | None = None) -> dict:
+    def _options(
+        self,
+        *,
+        temperature: float | None = None,
+        n_items: int = 1,
+        src_chars: int = 0,
+    ) -> dict:
         o = self.cfg.ollama
         opts: dict[str, object] = {
             "temperature": o.temperature if temperature is None else temperature,
@@ -146,9 +152,50 @@ class OllamaTranslationProvider:
             # 关键：不设这个，Ollama 用 1.0（等于关闭），批量翻译必然复读
             "repeat_penalty": o.repeat_penalty,
             "repeat_last_n": o.repeat_last_n,
+            "num_predict": self._num_predict(n_items, src_chars),
         }
         return opts
         # num_gpu 交给 Ollama 自己决定；硬设容易撞显存上限
+
+    def _num_predict(self, n_items: int, src_chars: int) -> int:
+        """给这一批算一个**输出 token 上限**。这是防"跑飞"的硬闸门。
+
+        ## 为什么必须设
+
+        原先**没设** `num_predict`，Ollama 就不限制输出。真实游戏
+        （19048 句台词）实测：正常批次 6～10 秒，个别批次 **384 秒**、
+        有的 **1500 秒以上**（模型停在 `done_reason='length'`，
+        撞的是 `num_ctx` 上限反复生成）。整轮翻译看起来像卡死，
+        实际在一条条慢慢烧。
+
+        ## 上限怎么算
+
+        上限必须**贴着这批内容的实际需要**，太松挡不住跑飞、
+        太紧会把正常 JSON 截断 —— 截断的后果更慢：解析失败 → 重试
+        → 再逐条降级（12 条 = 12 次调用）。
+
+        实测两次校准：
+
+        * `per_item=48`（一刀切）：跑飞的那批从 384 秒降到 17.6 秒，
+          但另一些批次涨到 **153～183 秒**，正是因为被截断后触发了重试与逐条降级；
+        * 改成按内容算之后，正常批次回到 6～17 秒。
+
+        算式：``(原文总字符数 × 系数 + 每条 JSON 开销)``，
+        再用 ``num_ctx/3`` 兜底。
+
+        系数取 2.2：中文译文一般**比原文短**，但这批原文里混着西语、
+        表情符号和 RPG Maker 转义序列，实测译文/原文的 token 比接近 1.0～1.5，
+        2.2 留了安全余量。每条再加 12 token 覆盖
+        ``{"i": 0, "t": ""},`` 这类 JSON 结构开销。
+        """
+        o = self.cfg.ollama
+        per_item = max(1, int(getattr(o, "max_output_tokens_per_item", 48)))
+        factor = float(getattr(o, "max_output_char_factor", 2.2))
+        # 内容需要多少
+        need = int(src_chars * factor) + 12 * max(1, n_items) + 32
+        # 上限：绝不超过"每条 per_item"这条保险丝（防止内容超长导致无上限）
+        ceiling = per_item * max(1, n_items) + 64
+        return max(64, min(need, ceiling, o.num_ctx // 3))
 
     # ------------------------------------------------------------------
     # 批量切分
@@ -204,14 +251,24 @@ class OllamaTranslationProvider:
     # 模型调用
     # ------------------------------------------------------------------
 
-    def _chat(self, user: str, *, system: str, temperature: float | None = None) -> str:
+    def _chat(
+        self,
+        user: str,
+        *,
+        system: str,
+        temperature: float | None = None,
+        n_items: int = 1,
+        src_chars: int = 0,
+    ) -> str:
         result = self.client.chat(
             self._model,
             [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            options=self._options(temperature=temperature),
+            options=self._options(
+                temperature=temperature, n_items=n_items, src_chars=src_chars
+            ),
             fmt="json",
             keep_alive=self.cfg.ollama.keep_alive,
         )
@@ -236,7 +293,14 @@ class OllamaTranslationProvider:
             glossary_block=self._collect_glossary(batch_items),
             extra_context=self._context_hint(batch_items),
         )
-        raw = self._chat(user, system=prompts.SYSTEM_PROMPT)
+                # n_items 与 src_chars 共同决定输出上限（截断会让 JSON 解析失败，
+        # 反而更慢），所以这里必须把这一批的真实长度告诉它
+        raw = self._chat(
+            user,
+            system=prompts.SYSTEM_PROMPT,
+            n_items=len(batch_items),
+            src_chars=sum(len(s or "") for s in masked),
+        )
         expect = list(range(len(batch_items)))
         # 传 masked 作为 sources：模型有时不按"对象数组"回，而是回
         # "原文作键的对象"（实测 translategemma:4b 就是这样），
@@ -276,7 +340,9 @@ class OllamaTranslationProvider:
             glossary_block=self._collect_glossary([item]),
             extra_context=self._context_hint([item]),
         )
-        raw = self._chat(user, system=prompts.SYSTEM_PROMPT)
+        raw = self._chat(
+            user, system=prompts.SYSTEM_PROMPT, n_items=1, src_chars=len(masked or "")
+        )
         mapping, res = parse_translations(raw, expect_indices=[0])
         if 0 in mapping:
             return mapping[0]
@@ -543,7 +609,11 @@ class OllamaTranslationProvider:
         user = prompts.build_review_user_prompt(pairs)
         try:
             raw = self._chat(
-                user, system=prompts.REVIEW_SYSTEM_PROMPT, temperature=0.0
+                user,
+                system=prompts.REVIEW_SYSTEM_PROMPT,
+                temperature=0.0,
+                n_items=len(sources),
+                src_chars=sum(len(s or "") for s in sources),
             )
             mapping, res = parse_translations(raw, expect_indices=list(range(len(sources))))
             if not mapping:

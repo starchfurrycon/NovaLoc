@@ -50,6 +50,32 @@ class OllamaConfig(BaseModel):
     max_batch_strings: int = 40
     """一次请求塞多少条短字符串。"""
 
+    max_output_tokens_per_item: int = 48
+    """每条原文允许模型生成多少 token 的**保险丝上限**。
+
+    原先**没有设** `num_predict`，于是 Ollama 用默认值 —— 等于不限制。
+    真实游戏实测（19048 句台词）里有若干批次会跑飞：正常批次 6～10 秒，
+    个别批次 **384 秒**，有的甚至到 **1500 秒以上**（模型停在
+    `done_reason='length'`，撞的是 `num_ctx` 上限）。
+    结果是整轮翻译看着像卡死，而它其实在一条条慢慢烧。
+
+    这只是**上限**；实际值由 `max_output_char_factor` 按这批内容的
+    字符数算出来（见 `ollama_provider._num_predict`），所以短句不会被
+    这个数字拖慢。设成 48 是给"内容异常长"的情况兜底。
+    """
+
+    max_output_char_factor: float = 2.2
+    """输出 token 上限按"原文总字符数 × 这个系数"计算。
+
+    中文译文一般比原文短，但这批真实数据里混着西语、表情符号和
+    RPG Maker 转义序列，实测译文/原文的 token 比接近 1.0～1.5，
+    取 2.2 留安全余量。
+
+    ⚠️ 这个值**不能太小**：上限截断会让 JSON 解析失败，然后走
+    重试 + 逐条降级（12 条 = 12 次模型调用），比不管还慢。
+    实测一刀切 `per_item=48` 时，有的批次反而涨到 153～183 秒。
+    """
+
     max_batch_chars: int = 3000
     concurrency: int = 1
     """并发请求数。8 GB 显存建议 1，跑大模型时别并发。"""
