@@ -162,14 +162,22 @@ export function truncate(value: string, max = 120): string {
 
 /** Human chapter/stage names for the pipeline. */
 const STAGE_LABELS: Record<string, string> = {
+  // 键必须与后端 `novaloc.pipeline.stages.STAGES` 的阶段 id **逐字一致**。
+  // 以前这里写的是 `images`，而后端发的是 `images_scan` / `images_localize`，
+  // 于是任务页和质检页会直接显示英文 id；新增的 `unpack` 同理。
+  // 对不上的时候 `stageLabel()` 会退回显示原始 id —— 不难看，但很露怯。
+  unpack: '解包资源',
   detect: '引擎识别',
   extract: '文本提取',
+  images_scan: '扫描贴图',
   translate: '机器翻译',
-  images: '贴图识别',
   fonts: '字体审计',
+  images_localize: '贴图汉化',
   qa: '质检',
   apply: '写回资源',
   job: '任务',
+  // 旧键保留：历史工作区的日志里可能还是这两个写法
+  images: '贴图识别',
 }
 
 export function stageLabel(stage: string | null | undefined): string {

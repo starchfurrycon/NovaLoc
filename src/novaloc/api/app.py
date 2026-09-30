@@ -120,6 +120,7 @@ def create_app() -> FastAPI:
                 results = pipe.run_all(only_pending=kw.get("only_pending", True))
             else:
                 fn_map = {
+                    "unpack": lambda: pipe.stage_unpack(),
                     "detect": lambda: pipe.stage_detect(),
                     "extract": lambda: pipe.stage_extract(),
                     "images_scan": lambda: pipe.stage_images_scan(),
@@ -135,6 +136,16 @@ def create_app() -> FastAPI:
                 }
                 if stage not in fn_map:
                     raise ValueError(f"未知阶段：{stage}")
+                # 防漂移：`/api/health` 是从 STAGES 动态列阶段的（9 个），
+                # 而这里是手写的映射表。新增阶段时只改一处，
+                # 就会变成"接口说支持、实际调用报未知阶段" ——
+                # 加阶段那次就是这么漏掉 `unpack` 的。
+                missing = [s for s, _ in STAGES if s not in fn_map]
+                if missing:
+                    raise ValueError(
+                        f"{', '.join(missing)} 在 STAGES 里但没有对应的执行分支"
+                        "（api/app.py 的 fn_map 需要同步）"
+                    )
                 results = [fn_map[stage]()]
             return {"stages": [r.to_dict() for r in results]}
 
