@@ -70,6 +70,35 @@ STAGE_LABELS = dict(STAGES)
 _CHECKPOINT_INTERVAL_S = 15.0
 
 
+def _clear_dir(path: Path) -> int:
+    """删掉目录里的**全部内容**（保留目录本身），返回删掉的文件数。
+
+    只用于**产出目录**（工作区内部的中间产物），绝不用于源游戏目录。
+
+    为什么要这么写：产出目录是"这一轮的结果"，不是"累积的结果"。
+    重跑时如果只覆盖写出成功的文件，上一轮产出、这一轮被规则跳过的文件
+    会**留在原地**，而下游 `apply` 是按目录内容回写的 ——
+    于是报告说"69 张已汉化"、实际往游戏里写 87 个。
+    这是最坏的一类 bug：报告数字看着合理，游戏里却多了没申报的改动。
+
+    单个文件删不掉（被占用等）只记日志，不中断整轮 ——
+    清理失败最多让产物陈旧，不该让阶段失败。
+    """
+    if not path.is_dir():
+        return 0
+    n = 0
+    for p in sorted(path.rglob("*"), reverse=True):
+        try:
+            if p.is_file() or p.is_symlink():
+                p.unlink()
+                n += 1
+            elif p.is_dir():
+                p.rmdir()
+        except OSError as exc:  # noqa: PERF203
+            log.debug("清理产出目录失败（忽略）%s：%s", p, exc)
+    return n
+
+
 @dataclass
 class StageResult:
     stage: str
@@ -821,6 +850,18 @@ class Pipeline:
 
             tt = TextureTranslator(self.ctx, translate_fn=self._make_texture_translate())
             out_dir = self.ws.p("images", "rebuilt")
+            # **每次跑之前先清空**：贴图重跑时"这次没产出"的旧文件会留在
+            # 目录里，而 `apply` 是按目录内容回写的 —— 于是报告说
+            # "69/750 已汉化"，实际往游戏里写了 87 个（多出的 18 个是
+            # 上一轮的旧结果，其中包括按新规则本该跳过的噪声图）。
+            # 这是"报告与实际不一致"的静默失效：数字看着对，游戏里多了东西。
+            stale = _clear_dir(out_dir)
+            if stale:
+                self.bus.log(
+                    f"清理了 {stale} 个上一轮遗留的贴图产物",
+                    stage="images_localize",
+                    severity=Severity.INFO,
+                )
             out_dir.mkdir(parents=True, exist_ok=True)
 
             throttle = ProgressThrottle(self.bus, "images_localize", min_interval_s=0.4)

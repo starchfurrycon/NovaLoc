@@ -190,6 +190,11 @@ _SINGLE_GLYPH_RE = re.compile(r"^[\w\W]$", re.UNICODE)
 #: 多字符块但占画面比例超过这个值 → 判为幻觉
 _MAX_BLOCK_AREA_FRAC = 0.85
 
+#: 数字占"字母数字"的比例超过这个值 → 判为噪声而非文字。
+#: 校准见 `TextureTranslator._looks_like_text`：纯数字噪声是 1.0，
+#: `'22zzzz²'` 是 0.5，而正例（`'GAME OVER'`/`'ATK'`/`'on'`）全是 0。
+_MAX_DIGIT_RATIO_OF_ALNUM = 0.5
+
 
 class TextureTranslator:
     """贴图汉化执行器。
@@ -505,6 +510,10 @@ class TextureTranslator:
         if len(text.strip()) < 2:
             return False
 
+        # 判据 3/4：像不像"一段要翻译的文字"（见 `_looks_like_text`）
+        if not self._looks_like_text(text):
+            return False
+
         # 判据 2：区域占比（很宽的阈值，只挡"整张图当成一块字"）
         box = getattr(block, "box", None)
         if box and len(box) == 4 and img_w > 0 and img_h > 0:
@@ -515,6 +524,65 @@ class TextureTranslator:
             if (bw * bh) / float(img_w * img_h) > _MAX_BLOCK_AREA_FRAC:
                 return False
         return True
+
+    def _looks_like_text(self, text: str) -> bool:
+        """这段 OCR 结果像不像"要翻译的文字"（还是噪声）？
+
+        ## 为什么要加这一条（真实游戏实测）
+
+        旧的两条判据（单字符、超大占比）挡不住**图标表/行走图/状态图**
+        上的噪声块。在一台真实 MZ 游戏上跑完 `images_localize`，
+        238 个进入翻译的块里有这些：
+
+        ==================== ==================== ========
+        类别                 样本                 占比
+        ==================== ==================== ========
+        纯数字噪声            ``'4994994'`` ``'444444'`` ``'16999699'``  24.8%
+        符号噪声              ``'●+++++++'`` ``'....'`` ``'")'``        3.8%
+        重复噪声              ``'COOOOOOO'`` ``'OOOOOOOO'`` ``'Cooo'``   2.5%
+        ==================== ==================== ========
+
+        它们不仅白烧翻译时间，还会被**当真画回贴图**：
+        `Balloon.png`（一张行走图/动画表）有 **47.4%** 的像素被改动 ——
+        等于把原画涂花了。而 ``'+222?22?'`` 这类块送去翻译后，
+        模型回的是 ``'已识别文字，无法确定具体含义'``（一句"我读不出来"），
+        这句**抱怨**照样被画到了图上。
+
+        ## 判据怎么定的（拿真实数据校准，不是拍脑袋）
+
+        两条，都从上面那张表的反例里反推、并用正例验过：
+
+        1. **至少要有一个字母（含 CJK）**。纯数字块没有翻译价值 ——
+           数字在贴图里通常是伤害数值/图标编号/数量。实测反例
+           ``'4994994'`` ``'444444'`` ``'000'`` ``'00'`` 全被挡掉。
+        2. **数字占字母数字的比例 < 0.5**。这条挡 ``'22zzzz²'``
+           （数字 3/6）、``'4'``（1/1）、``'0'``（1/1）。
+
+        正例（必须留下）：
+        ``'ABSoRB'``（吸收）、``'GAME OVER'``、``'CRITICAL'``、
+        ``'on'``、``'Zz'``、``'ATK'``、``'MHP'`` —— 全是纯字母。
+        **注意阈值和判据 1 重复**：0.5 已经覆盖了判据 1 的大部分情况
+        （纯数字是 1.0），但它能额外挡掉混合块，所以两条都留着。
+
+        ## 已知遗留
+
+        ``'Zz'`` ``'zzz'`` ``'COOOOOOO'`` 这类**短纯字母噪声**仍会通过，
+        以及 ``'LUK'`` 被译成 ``'卢克'``（人名）这种**术语误译**。
+        前者需要"同图内该文本是否只出现在图案区域"之类的上下文判据，
+        后者要接术语表（引擎 UI 短标签已有确定性覆盖，见
+        `translate/glossary.py`）；两者都需要先拿更多真实数据校准，
+        不适合在这一提交里凭感觉定阈值。
+        """
+        dense = "".join(ch for ch in text if not ch.isspace())
+        if not dense:
+            return False
+        if not any(ch.isalpha() for ch in dense):
+            return False
+        alnum = [ch for ch in dense if ch.isalnum()]
+        if not alnum:
+            return False
+        digits = sum(ch.isdigit() for ch in alnum)
+        return digits / len(alnum) < _MAX_DIGIT_RATIO_OF_ALNUM
 
     @staticmethod
     def _text_area_ratio(blocks: list[Any], img_w: int, img_h: int) -> float:
@@ -944,9 +1012,90 @@ class TextureTranslator:
             )
         for (i, _t), res in zip(pending, results, strict=False):
             text = self._entry_text(res)
-            if text:
-                out[i] = text
+            if not text:
+                continue
+            if not self._translation_is_usable(_t, text):
+                # 丢弃：宁可不翻译（保留原样），也不要把一句"我读不出来"
+                # 或者占位符垃圾画到游戏画面上。
+                log.debug("丢弃不可用的贴图译文：%r → %r", _t, text)
+                continue
+            out[i] = text
         return out
+
+    def _rejections(self) -> dict[str, int]:
+        """翻译输出被丢弃的计数（按原因）。供报告与测试查看。"""
+        if not hasattr(self, "_reject_counts"):
+            self._reject_counts: dict[str, int] = {}
+        return self._reject_counts
+
+    def _note_rejection(self, why: str) -> None:
+        counts = self._rejections()
+        counts[why] = counts.get(why, 0) + 1
+
+    #: 模型"读不出来"时会说的元话（而不是给译文）。
+    #: 真实游戏实测：`'+222?22?'` 的译文是
+    #: `'已识别文字，无法确定具体含义'` —— 一句**抱怨**，
+    #: 而它会被原样画到贴图上。
+    _META_ANSWER_MARKERS = (
+        "无法确定",
+        "无法识别",
+        "无法辨认",
+        "不能确定",
+        "识别文字",
+        "未识别到",
+        "没有文字",
+        "无文字",
+        "抱歉",
+        "作为AI",
+        "作为 AI",
+        "语言模型",
+        "i cannot",
+        "can't determine",
+        "unable to",
+        "no text",
+    )
+
+    def _translation_is_usable(self, source: str, target: str) -> bool:
+        """这条译文能不能画上去？挡两类**真实发生过**的坏输出。
+
+        ## 1. 模型回的是"我读不出来"（元话），不是译文
+
+        实测 ``'+222?22?'`` → ``'已识别文字，无法确定具体含义'``。
+        这句话被原样重绘进了贴图 —— 玩家会在游戏里看到一句
+        "已识别文字，无法确定具体含义"。这比不翻译坏得多。
+
+        ## 2. 译文只是把原文又抄了一遍（外加一点噪声）
+
+        实测 ``'[o]'`` → ``'[o]中文译文'`` —— 占位符式的垃圾被当成译文，
+        同样会画到图上。
+
+        判据：把原文归一化后作为子串出现在译文里，**且**译文多出来的部分
+        里有**字母或数字**。这条要小心别误杀正常情况：
+
+        * ``'AGI'`` → ``'AGI'``（专有术语本就该保留）是**允许**的 ——
+          译文没变长，不进这条判据；
+        * ``'....'`` → ``'……'``（英文省略号译成中文省略号）也是**允许**的
+          —— 译文正好是源文加一个全角点，多出来的是**标点**，不是冗余文字。
+          第一版判据只看"变长了就拒"，把这条真译文误杀了。
+        """
+        src = _norm(source)
+        tgt = _norm(target)
+        if not tgt:
+            return False
+
+        low = target.lower()
+        for marker in self._META_ANSWER_MARKERS:
+            if marker.lower() in low:
+                self._note_rejection("meta_answer")
+                return False
+
+        if src and tgt.startswith(src) and len(tgt) > len(src):
+            extra = tgt[len(src):]
+            if any(ch.isalnum() for ch in extra):
+                self._note_rejection("source_echo_with_junk")
+                return False
+
+        return True
 
     @staticmethod
     def _entry_text(res: Any) -> str:
