@@ -92,7 +92,30 @@ RM_ESCAPE_RE = re.compile(r"\\(?:V|N|C|I|P|PX|PY|FS|AF|AC|SP|AP|A|B|G|M|R|T|X|Y|
 
 #: 插件元数据标签：``<CustomEffect:heal:500>`` ``<PassiveSkill:5>``
 #: 这些标签是插件读取的参数，必须原样保留，也不该单独作为翻译单元。
-PLUGIN_TAG_RE = re.compile(r"<[A-Za-z_][A-Za-z0-9_]*(?::[^<>\n]*)?>")
+#:
+#: ⚠️ **标签名里可以带空格**：``<Crafting Ingredients>``、
+#: ``<JS Crafting Effect>``、``<Crafting Show All Switches: 127,152>``
+#: 都是真实存在的写法（BeyondPortal 用了 Crafting 系列插件）。
+#: 原先的正则 ``<[A-Za-z_]…>`` 不允许空格，于是这些标签
+#: **一个都没匹配上**，整个标签连同里面的配置都被当成正文送进翻译 ——
+#: 这正是插件配置被翻坏、模型吐出 ``⟦0⟧`` 的直接原因。
+PLUGIN_TAG_RE = re.compile(r"<[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z0-9_]+)*(?::[^<>\n]*)?>")
+
+#: `note` 字段里的 **JavaScript 代码**特征。
+#: RPG Maker 的 `note` 是插件的配置区，插件文档里明确要求把脚本写进去：
+#: ``<JS Crafting Effect>`` 之类标签之间的内容是**会被 eval 的代码**。
+NOTE_JS_RE = re.compile(
+    r"\$game[A-Za-z]+|\barguments\s*\[|\bfunction\b|=>|\bvar\s+\w|\blet\s+\w"
+    r"|\bnew\s+[A-Z]|\.setValue\s*\(|\.value\s*\("
+)
+
+#: `note` 字段里的**换行/缩进式插件配置**特征。
+#: 例如 ``<Crafting Ingredients>\n Item 60: 3\n Item 52: 2``。
+NOTE_CONFIG_LINE_RE = re.compile(r"^\s*(?:[A-Za-z][\w ]*)?\s*[:=]\s*[\w\s,.\-]*$")
+
+#: 句子标点（含中英日全角）。用来区分"人话"和"插件标签名"：
+#: ``'Crafting Ingredients'`` 没有标点，``'Recupera salud.'`` 有句号。
+_SENTENCE_PUNCT_RE = re.compile(r"[.!?。！？；;…]")
 
 
 def _content_root(game_dir: Path) -> Path | None:
@@ -272,8 +295,14 @@ class RpgMakerAdapter(EngineAdapter):
     def _mk(
         self, text: str, file: str, pointer: str, kind: TextKind, **kw: Any
     ) -> TextUnit | None:
-        """构造一个 TextUnit；不该翻的直接返回 None。"""
-        if not self._is_translatable(text):
+        """构造一个 TextUnit；不该翻的直接返回 None。
+
+        `field` 从 `kw` 里取（`_extract_database` 会传 `field=k`），
+        因为判断"要不要翻"需要知道字段语义 —— ``<right>`` 在
+        ``name`` 里是排版指令、在 ``note`` 里是插件参数。
+        """
+        field = kw.pop("field", "")
+        if not self._is_translatable(text, field):
             return None
         uid = f"{file}:{pointer}"
         return TextUnit(
@@ -285,7 +314,95 @@ class RpgMakerAdapter(EngineAdapter):
         )
 
     @staticmethod
-    def _is_translatable(text: Any) -> bool:
+    def _is_plugin_config_note(text: str) -> bool:
+        """这个 `note` 字段是**插件配置**吗（而不是给人看的注释）？
+
+        ## 为什么必须判断
+
+        RPG Maker 的 `note` 字段是**插件的配置区**。插件作者把参数写成
+        ``<Tag: value>``，把脚本写成 ``<JS XXX> ... </JS XXX>``，
+        而这些内容**会被插件读取、甚至 eval 执行**。
+
+        真实游戏实测（BeyondPortal 的 265 条 note）：
+
+        ==================== ======
+        含 JS 代码            27
+        含 ``<插件标签>``      263
+        两者都有              27
+        **纯散文（该翻译）**   **2**
+        ==================== ======
+
+        也就是说 **263/265 根本不该翻**。不判断的后果实测有三层：
+
+        1. **会把插件改坏**：`<Crafting Ingredients>` 被翻成
+           `<制作材料>`，插件就再也匹配不到这个标签，制作系统直接失效；
+        2. **翻译必然失败**：一条 note 里塞着
+           ``$gameVariables.setValue(77, ...)`` 和十几个标签，
+           占位符掩码后模型完全读不懂，实测报
+           ``placeholder_broken: 丢失占位符：['$gameVariables', ...]``；
+        3. **模型会泄漏掩码标记**：真实记录里模型吐出
+           ``'啊…乌鲁拉，别急，我还没瞄准呢！”} ⟦0⟧'`` ——
+           连正常对话都被这种批次带坏了。
+
+        ## 判定规则（任一命中即视为配置）
+
+        * 含 JavaScript 特征（``$gameXxx``、``arguments[``、``=>`` …）；
+        * 去掉标签后，剩下的内容**每一行**都像 ``键: 值`` 配置行
+          （`` Item 60: 3``），没有句子结构；
+        * 除标签外没有任何自然语言（已有逻辑会挡，这里再挡一次更省事）。
+        * **整条 note 的正文全在插件标签里**（去掉标签后只剩配置行）——
+          说明那些"看起来像英语"的内容其实是**标签名本身**
+          （``<Crafting Ingredients>`` 里的 `Crafting Ingredients`），
+          翻了就是把插件标签改坏。
+
+        ## "什么算人话"用句子结构判断，**不用词数**
+
+        这里踩过一次坑：一开始用"≥4 个词就算句子"。结果
+        ``'\\C[29]Recupera salud.\\C[0] <Max: 1>'`` 被误判成配置 ——
+        去掉标签只剩 `'Recupera salud.'`，**2 个词**，
+        可它明明是一句正常的西语说明（译成"恢复生命值。"）。
+        而 ``'Crafting Ingredients'`` 也是 2 个词，却真的只是标签名。
+
+        词数分不开这两者，**标点可以**：句子有句号/问号/感叹号
+        （含中文的 。！？），标签名没有。改用这个判据后 14 个用例全部正确。
+
+        宁可漏翻 2 条开发者注释，也不能把插件配置翻坏。
+        """
+        s = text.strip()
+        if not s:
+            return False
+        if NOTE_JS_RE.search(s):
+            return True
+
+        # 去掉标签后剩下的内容，全是配置行 / 数字符号 → 是配置区
+        outside = PLUGIN_TAG_RE.sub("\n", s)
+        lines = [ln.strip() for ln in outside.splitlines() if ln.strip()]
+
+        def _is_sentence(ln: str) -> bool:
+            """有句子标点才算人话（标签名不会有句号）。"""
+            return bool(_SENTENCE_PUNCT_RE.search(ln))
+
+        config_rows = [
+            ln for ln in lines if NOTE_CONFIG_LINE_RE.match(ln) or _NOT_TEXT_RE.match(ln)
+        ]
+        sentences = [ln for ln in lines if ln not in config_rows and _is_sentence(ln)]
+
+        # 情况一：正文全是配置行，没有一句人话
+        if lines and len(config_rows) == len(lines) and not sentences:
+            return True
+        # 情况二：去掉标签后**完全没有正文** —— 那些"像英语"的东西
+        # 就是标签名本身，属于插件参数
+        return bool(not sentences and PLUGIN_TAG_RE.search(s))
+
+    @staticmethod
+    def _is_translatable(text: Any, field: str = "") -> bool:
+        """这个字符串要不要建成翻译单元。
+
+        `field` 用来区分**字段语义**，这一点很关键：`<right>` 这类
+        RichText 标签在 ``name`` 字段里是**排版指令**（名字要靠右显示，
+        正文得翻），在 ``note`` 字段里却是**插件参数**（翻了插件就废了）。
+        同一个标签，两种含义，所以不能只看文本内容。
+        """
         if not isinstance(text, str):
             return False
         s = text.strip()
@@ -294,6 +411,17 @@ class RpgMakerAdapter(EngineAdapter):
         # 去掉转义码之后还剩不剩字母/汉字
         stripped = RM_ESCAPE_RE.sub("", s)
         if not stripped.strip():
+            return False
+        # 插件配置区不翻。**只对 note 生效**：
+        # `note` 是 RPG Maker 给插件的配置区，绝大部分内容是插件参数；
+        # 而 `name` 里的 `<right>` 是排版指令，正文必须翻。
+        #
+        # 踩过的坑：这条规则原本对所有字段生效，结果说话人名从
+        # 7694 条掉到 660 条 —— 因为 RichText 标签 `<right>  Ulula  </right>`
+        # 被当成"插件标签"，去掉标签后只剩 `Ulula`（没有句号），
+        # 就被判成"标签名本身就是内容"。真实游戏里 7034 个说话人
+        # **一句话都翻不了**，而且不报错。
+        if field == "note" and RpgMakerAdapter._is_plugin_config_note(stripped):
             return False
         # 去掉插件标签之后还有自然语言吗？
         # `<PassiveSkill:5>` 这种纯标签条目没有任何可翻的内容，
@@ -318,7 +446,9 @@ class RpgMakerAdapter(EngineAdapter):
             for k, v in entry.items():
                 if k not in fields or not isinstance(v, str):
                     continue
-                u = self._mk(v, fname, f"/{i}/{k}", self._kind_for_field(k))
+                u = self._mk(
+                    v, fname, f"/{i}/{k}", self._kind_for_field(k), field=k
+                )
                 if u:
                     out.append(u)
         return out
