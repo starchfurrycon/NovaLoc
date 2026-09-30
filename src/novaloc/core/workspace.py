@@ -1,0 +1,315 @@
+"""工作区：一个汉化项目的全部中间产物与状态。
+
+目录布局::
+
+    <data_root>/workspaces/<project_id>/
+      project.json          项目元信息
+      project.src           原始游戏目录路径
+      extracted/
+        units.jsonl         抽取出的文本单元
+        images.jsonl        发现的贴图资产
+        report.json         抽取报告
+      translations/
+        entries.jsonl       译文（流水线可反复覆盖，用户编辑也写这里）
+        glossary.json       术语表
+        memory.jsonl        翻译记忆库
+      fonts/
+        analysis.json       字体覆盖审计
+        patches.json        字体补丁结果
+        fallback/           注入用的中文字体
+      images/
+        analyzed/           带文字框标注的可视化图（人工复核用）
+        rebuilt/            重绘后的贴图
+      out/                  最终回写出的可玩游戏目录
+      qa/
+        report.json         质检报告
+      logs/
+
+**原始游戏目录永远只读**，所有写操作都在此处副本上进行。
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import threading
+import time
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+from typing import Any, TypeVar
+
+from pydantic import BaseModel
+
+from ..models import (
+    ExtractReport,
+    FontCoverage,
+    FontPatchResult,
+    GlossaryEntry,
+    ImageAsset,
+    Project,
+    ProjectCharset,
+    TextUnit,
+    TranslationEntry,
+    json_dumps,
+)
+from . import paths
+
+T = TypeVar("T", bound=BaseModel)
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_jsonl(path: Path, model: type[T]) -> list[T]:
+    if not path.exists():
+        return []
+    out: list[T] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(model.model_validate_json(line))
+            except Exception:  # noqa: BLE001 - 单行坏了不该毁掉整个列表
+                continue
+    return out
+
+
+def _write_jsonl(path: Path, items: Iterable[BaseModel]) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    n = 0
+    with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+        for it in items:
+            fh.write(it.model_dump_json())
+            fh.write("\n")
+            n += 1
+    tmp.replace(path)
+    return n
+
+
+class Workspace:
+    def __init__(self, project: Project, root: Path) -> None:
+        self.project = project
+        self.root = root
+        self._lock = threading.RLock()
+
+    # ------------------------------------------------------------------
+    # 创建 / 打开
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def create(
+        cls,
+        name: str,
+        game_dir: str | Path,
+        *,
+        project_id: str | None = None,
+        target_lang: str = "zh-Hans",
+        source_langs: list[str] | None = None,
+    ) -> Workspace:
+        src = Path(game_dir).expanduser()
+        if not src.exists():
+            raise FileNotFoundError(f"游戏目录不存在：{src}")
+        if not src.is_dir():
+            raise NotADirectoryError(f"不是目录：{src}")
+        # 防止把工作区建到游戏目录里（会造成递归扫描）
+        src_res = src.resolve()
+
+        proj = Project(
+            name=name,
+            game_dir=str(src_res),
+            target_lang=target_lang,
+            source_langs=source_langs or ["auto"],
+        )
+        if project_id:
+            proj.id = project_id
+
+        root = paths.workspaces_dir() / proj.id
+        if root.exists():
+            shutil.rmtree(root)
+        for sub in (
+            "extracted", "translations", "fonts", "fonts/fallback",
+            "images", "images/analyzed", "images/rebuilt", "out", "qa", "logs",
+        ):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+
+        ws = cls(proj, root)
+        ws.save()
+        (root / "project.src").write_text(str(src_res), encoding="utf-8")
+        return ws
+
+    @classmethod
+    def open(cls, project_id: str) -> Workspace:
+        root = paths.workspaces_dir() / project_id
+        pf = root / "project.json"
+        if not pf.exists():
+            raise FileNotFoundError(f"项目不存在：{project_id}")
+        proj = Project.model_validate_json(pf.read_text(encoding="utf-8"))
+        return cls(proj, root)
+
+    @classmethod
+    def list(cls) -> list[Project]:
+        out: list[Project] = []
+        base = paths.workspaces_dir()
+        if not base.exists():
+            return out
+        for d in sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            pf = d / "project.json"
+            if not pf.is_file():
+                continue
+            try:
+                out.append(Project.model_validate_json(pf.read_text(encoding="utf-8")))
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def delete(self) -> None:
+        if self.root.exists() and self.root.is_dir() and self.root.parent == paths.workspaces_dir():
+            shutil.rmtree(self.root)
+
+    def save(self) -> None:
+        with self._lock:
+            self.project.bump()
+            _atomic_write(self.root / "project.json", self.project.model_dump_json(indent=2))
+
+    # ------------------------------------------------------------------
+    # 路径
+    # ------------------------------------------------------------------
+
+    def p(self, *parts: str) -> Path:
+        return self.root.joinpath(*parts)
+
+    @property
+    def source_dir(self) -> Path:
+        return Path(self.project.game_dir)
+
+    @property
+    def out_dir(self) -> Path:
+        return self.p("out")
+
+    # ------------------------------------------------------------------
+    # 文本单元
+    # ------------------------------------------------------------------
+
+    def save_units(self, units: list[TextUnit]) -> None:
+        _write_jsonl(self.p("extracted", "units.jsonl"), units)
+
+    def load_units(self) -> list[TextUnit]:
+        return _read_jsonl(self.p("extracted", "units.jsonl"), TextUnit)
+
+    def save_extract_report(self, report: ExtractReport) -> None:
+        _atomic_write(self.p("extracted", "report.json"), report.model_dump_json(indent=2))
+
+    def load_extract_reports(self) -> list[ExtractReport]:
+        f = self.p("extracted", "report.json")
+        if not f.exists():
+            return []
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return []
+        if isinstance(data, list):
+            return [ExtractReport.model_validate(d) for d in data]
+        return [ExtractReport.model_validate(data)]
+
+    # ------------------------------------------------------------------
+    # 译文
+    # ------------------------------------------------------------------
+
+    def save_entries(self, entries: list[TranslationEntry]) -> None:
+        _write_jsonl(self.p("translations", "entries.jsonl"), entries)
+
+    def load_entries(self) -> list[TranslationEntry]:
+        return _read_jsonl(self.p("translations", "entries.jsonl"), TranslationEntry)
+
+    def save_glossary(self, entries: list[GlossaryEntry]) -> None:
+        _write_jsonl(self.p("translations", "glossary.jsonl"), entries)
+
+    def load_glossary(self) -> list[GlossaryEntry]:
+        return _read_jsonl(self.p("translations", "glossary.jsonl"), GlossaryEntry)
+
+    def save_memory(self, entries: list[TranslationEntry]) -> None:
+        _write_jsonl(self.p("translations", "memory.jsonl"), entries)
+
+    def load_memory(self) -> list[TranslationEntry]:
+        return _read_jsonl(self.p("translations", "memory.jsonl"), TranslationEntry)
+
+    # ------------------------------------------------------------------
+    # 贴图
+    # ------------------------------------------------------------------
+
+    def save_images(self, images: list[ImageAsset]) -> None:
+        _write_jsonl(self.p("extracted", "images.jsonl"), images)
+
+    def load_images(self) -> list[ImageAsset]:
+        return _read_jsonl(self.p("extracted", "images.jsonl"), ImageAsset)
+
+    # ------------------------------------------------------------------
+    # 字体
+    # ------------------------------------------------------------------
+
+    def save_font_coverage(self, items: list[FontCoverage]) -> None:
+        _write_jsonl(self.p("fonts", "analysis.jsonl"), items)
+
+    def load_font_coverage(self) -> list[FontCoverage]:
+        return _read_jsonl(self.p("fonts", "analysis.jsonl"), FontCoverage)
+
+    def save_font_patches(self, items: list[FontPatchResult]) -> None:
+        _write_jsonl(self.p("fonts", "patches.jsonl"), items)
+
+    def load_font_patches(self) -> list[FontPatchResult]:
+        return _read_jsonl(self.p("fonts", "patches.jsonl"), FontPatchResult)
+
+    def save_charset(self, cs: ProjectCharset) -> None:
+        _atomic_write(self.p("fonts", "charset.json"), cs.model_dump_json(indent=2))
+
+    def load_charset(self) -> ProjectCharset | None:
+        f = self.p("fonts", "charset.json")
+        if not f.exists():
+            return None
+        try:
+            return ProjectCharset.model_validate_json(f.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    # ------------------------------------------------------------------
+    # 通用 JSON
+    # ------------------------------------------------------------------
+
+    def write_json(self, rel: str, obj: Any) -> Path:
+        p = self.p(*rel.split("/"))
+        _atomic_write(p, json_dumps(obj))
+        return p
+
+    def read_json(self, rel: str, default: Any = None) -> Any:
+        p = self.p(*rel.split("/"))
+        if not p.exists():
+            return default
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return default
+
+    def log_line(self, name: str, text: str) -> None:
+        p = self.p("logs", name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+
+    def iter_source_files(self, *, follow_symlinks: bool = False) -> Iterator[Path]:
+        """遍历原始游戏目录里的文件（只读）。"""
+        root = self.source_dir
+        for p in root.rglob("*"):
+            try:
+                if p.is_symlink() and not follow_symlinks:
+                    continue
+                if p.is_file():
+                    yield p
+            except OSError:
+                continue

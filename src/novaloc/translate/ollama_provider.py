@@ -1,0 +1,433 @@
+﻿"""基于 Ollama 的本地翻译适配器（默认后端，全程离线）。
+
+核心流程（每一步都是被实战教训逼出来的）：
+
+1. **先屏蔽占位符**：把 ``{0}`` ``%s`` ``\\V[1]`` ``<color=#fff>`` 换成 ``⟦i⟧``。
+   模型看不到原始语法就无从破坏，攻击面归零。
+2. **批量发送，要求带显式索引的对象数组** ``[{"i":0,"t":"..."}]``。
+   裸数组一旦漏一条就会整体错位，而且译文通顺、错得极隐蔽。
+3. **``repeat_penalty`` 必须显式设置**（Ollama 默认 1.0 = 关闭），
+   否则本地小模型在批量任务里会复读到停不下来。
+4. **多级恢复**：JSON 解析失败时逐级降级（见 :mod:`.json_parse`），
+   最后退化为逐条翻译。宁可慢，也不丢条目。
+5. **还原 + 校验占位符**：多重集不一致就判致命，标记 FAILED 并保留原文，
+   **绝不把破坏过的文本写回游戏**。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+from ..core.registry import Context, ProviderError, TranslateItem, register
+from ..lang import guess_language
+from ..models import EntryStatus, TextKind, TranslationEntry
+from . import placeholders as ph
+from . import prompts
+from .guards import guard
+from .json_parse import parse_translations
+from .ollama_client import ModelMissing, OllamaClient, OllamaError, OllamaNotRunning
+
+log = logging.getLogger(__name__)
+
+#: 需要"更聪明"的文本类型：独占一批，避免被 UI 短标签的风格带偏
+_CAREFUL_KINDS = {TextKind.ITEM_DESC, TextKind.NARRATION, TextKind.CREDIT}
+
+#: 这些类型天然很短，可以多塞一些（省请求次数）
+_SHORT_KINDS = {
+    TextKind.UI_LABEL,
+    TextKind.MENU,
+    TextKind.ITEM_NAME,
+    TextKind.SKILL,
+    TextKind.MAP_NAME,
+    TextKind.CHARACTER_NAME,
+}
+
+
+@register("translate", "ollama")
+class OllamaTranslationProvider:
+    name = "ollama"
+
+    def __init__(self, ctx: Context) -> None:
+        self.ctx = ctx
+        cfg = ctx.config
+        self.cfg = cfg
+        self.client = ctx.cache_get(
+            "ollama_client",
+            lambda: OllamaClient(cfg.resolved_ollama_host(), timeout=cfg.ollama.request_timeout_s),
+        )
+        self._model = cfg.ollama.text_model
+        self._ready: tuple[bool, str] | None = None
+        #: 统计信息，交给 UI 显示
+        self.stats: dict[str, int] = {
+            "batches": 0,
+            "retries": 0,
+            "single_fallbacks": 0,
+            "recovered_json": 0,
+            "placeholder_fatal": 0,
+            "items": 0,
+        }
+
+    # ------------------------------------------------------------------
+
+    def available(self) -> tuple[bool, str]:
+        if self._ready is not None:
+            return self._ready
+        if not self.cfg.ollama.enabled:
+            self._ready = (False, "配置里已禁用 Ollama")
+            return self._ready
+        if not self.client.is_running():
+            self._ready = (False, f"Ollama 服务未运行（{self.client.host}）")
+            return self._ready
+        names = self.client.list_models()
+        if not self._has_model(names, self._model):
+            self._ready = (
+                False,
+                f"缺少翻译模型 '{self._model}'。已安装：{', '.join(names) or '无'}；"
+                f"请执行 `ollama pull {self._model}`",
+            )
+            return self._ready
+        ver = self.client.version()
+        self._ready = (True, f"Ollama {ver} · 模型 {self._model}")
+        return self._ready
+
+    @staticmethod
+    def _has_model(names: list[str], model: str) -> bool:
+        if model in names:
+            return True
+        base = model.split(":")[0]
+        return any(n.split(":")[0] == base for n in names)
+
+    def model_info(self) -> dict:
+        try:
+            return self.client.show(self._model)
+        except OllamaError:
+            return {}
+
+    def _options(self, *, temperature: float | None = None) -> dict:
+        o = self.cfg.ollama
+        opts: dict[str, object] = {
+            "temperature": o.temperature if temperature is None else temperature,
+            "top_p": o.top_p,
+            "num_ctx": o.num_ctx,
+            # 关键：不设这个，Ollama 用 1.0（等于关闭），批量翻译必然复读
+            "repeat_penalty": o.repeat_penalty,
+            "repeat_last_n": o.repeat_last_n,
+        }
+        return opts
+        # num_gpu 交给 Ollama 自己决定；硬设容易撞显存上限
+
+    # ------------------------------------------------------------------
+    # 批量切分
+    # ------------------------------------------------------------------
+
+    def _make_batches(self, items: list[TranslateItem]) -> list[list[int]]:
+        """把条目切成批次。
+
+        经验值：UI 短标签可以 30~50 条一批，长对话 8~12 条，
+        而且**长短句不要混批** —— 长句的语言风格会传染给短标签，
+        导致按钮文字变长、溢出。
+        """
+        o = self.cfg.ollama
+        batches: list[list[int]] = []
+        cur: list[int] = []
+        cur_chars = 0
+
+        def flush() -> None:
+            nonlocal cur, cur_chars
+            if cur:
+                batches.append(cur)
+                cur, cur_chars = [], 0
+
+        for i, item in enumerate(items):
+            text = item.unit.source
+            kind = item.unit.kind
+            long_text = len(text) > 60
+            hard = len(text) > o.max_batch_chars or kind in _CAREFUL_KINDS or long_text
+            short = kind in _SHORT_KINDS and len(text) <= 20
+
+            if hard:
+                flush()
+                batches.append([i])
+                continue
+
+            # 短标签和普通文本不混在一批
+            if cur:
+                prev_short = items[cur[0]].unit.kind in _SHORT_KINDS and len(
+                    items[cur[0]].unit.source
+                ) <= 20
+                if prev_short != short:
+                    flush()
+
+            limit = min(o.max_batch_strings, 50 if short else 25)
+            if cur and (len(cur) >= limit or cur_chars + len(text) > o.max_batch_chars):
+                flush()
+            cur.append(i)
+            cur_chars += len(text)
+        flush()
+        return batches
+
+    # ------------------------------------------------------------------
+    # 模型调用
+    # ------------------------------------------------------------------
+
+    def _chat(self, user: str, *, system: str, temperature: float | None = None) -> str:
+        result = self.client.chat(
+            self._model,
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            options=self._options(temperature=temperature),
+            fmt="json",
+            keep_alive=self.cfg.ollama.keep_alive,
+        )
+        return result.text
+
+    def _collect_glossary(self, items: list[TranslateItem]) -> str:
+        seen: dict[str, str] = {}
+        for it in items:
+            for g in it.glossary:
+                seen.setdefault(g.source, g.target)
+        if not seen:
+            return ""
+        return prompts.build_glossary_block(list(seen.items()))
+
+    def _call_batch(self, batch_items: list[TranslateItem], masked: list[str]) -> dict[int, str]:
+        """一次批量调用。返回 ``{批次内下标: 译文}``。"""
+        user = prompts.build_batch_user_prompt(
+            masked,
+            kinds=[it.unit.kind for it in batch_items],
+            target_lang=self.cfg.translate.target_lang,
+            source_lang=self.cfg.translate.source_lang,
+            glossary_block=self._collect_glossary(batch_items),
+            extra_context=self._context_hint(batch_items),
+        )
+        raw = self._chat(user, system=prompts.SYSTEM_PROMPT)
+        expect = list(range(len(batch_items)))
+        mapping, res = parse_translations(raw, expect_indices=expect)
+        if not res.ok:
+            raise ProviderError(
+                f"JSON 解析失败（{'; '.join(res.notes)[:160]}）：{raw[:180]!r}"
+            )
+        if res.method not in ("raw", "fence"):
+            self.stats["recovered_json"] += 1
+            log.debug("批 %d 通过 %s 级恢复解析", len(batch_items), res.method)
+
+        missing = [i for i in expect if i not in mapping]
+        if missing:
+            log.debug("批次漏了 %d 条：%s", len(missing), missing[:10])
+        return mapping
+
+    def _call_single(self, item: TranslateItem, masked: str) -> str:
+        user = prompts.build_single_user_prompt(
+            masked,
+            kind=item.unit.kind,
+            source_lang=self.cfg.translate.source_lang,
+            target_lang=self.cfg.translate.target_lang,
+            glossary_block=self._collect_glossary([item]),
+            extra_context=self._context_hint([item]),
+        )
+        raw = self._chat(user, system=prompts.SYSTEM_PROMPT)
+        mapping, res = parse_translations(raw, expect_indices=[0])
+        if 0 in mapping:
+            return mapping[0]
+        if res.ok and isinstance(res.value, str):
+            return res.value
+        # 有些模型即使要求 JSON 也只给纯文本，当译文用
+        stripped = raw.strip()
+        if stripped and not stripped.startswith(("[", "{")):
+            return stripped
+        raise ProviderError(f"单条翻译失败：{raw[:200]!r}")
+
+    @staticmethod
+    def _context_hint(items: list[TranslateItem]) -> str:
+        lines: list[str] = []
+        for it in items[:6]:
+            if it.context_lines:
+                lines.extend(it.context_lines[:3])
+        if not lines:
+            return ""
+        return " / ".join(dict.fromkeys(lines))[:400]
+
+    # ------------------------------------------------------------------
+    # 主入口
+    # ------------------------------------------------------------------
+
+    def translate_batch(
+        self, items: list[TranslateItem], target_lang: str
+    ) -> list[TranslationEntry]:
+        if not items:
+            return []
+
+        ok, why = self.available()
+        if not ok:
+            raise ProviderError(why)
+
+        self.stats["items"] += len(items)
+        out: list[TranslationEntry] = [self._blank(it) for it in items]
+        batches = self._make_batches(items)
+        ratio = self.cfg.translate.max_chars_ratio
+        use_mask = self.cfg.translate.mask_placeholders
+
+        for bi, batch in enumerate(batches):
+            self.stats["batches"] += 1
+            batch_items = [items[i] for i in batch]
+            sources = [it.unit.source for it in batch_items]
+
+            # ---- 1. 屏蔽占位符 ----
+            if use_mask:
+                masked_all, slots_all = ph.mask_batch(sources)
+            else:
+                masked_all = list(sources)
+                slots_all = [[] for _ in sources]
+
+            # ---- 2. 调用（带重试与逐条降级） ----
+            raw_by_index: dict[int, str] = {}
+            err: str | None = None
+            for attempt in range(3):
+                try:
+                    if len(batch_items) == 1:
+                        got = self._call_single(batch_items[0], masked_all[0])
+                        raw_by_index = {0: got} if got else {}
+                    else:
+                        raw_by_index = self._call_batch(batch_items, masked_all)
+                    err = None
+                    break
+                except (ProviderError, OllamaError, ModelMissing, OllamaNotRunning) as exc:
+                    err = str(exc)
+                    self.stats["retries"] += 1
+                    log.warning("批 %d（%d 条）第 %d 次失败：%s", bi, len(batch_items), attempt + 1, err)
+                    time.sleep(0.4 * (attempt + 1))
+
+                    # 批量反复失败 → 退化为逐条，用可靠性换速度
+                    if attempt >= 1 and len(batch_items) > 1:
+                        self.stats["single_fallbacks"] += 1
+                        singles: dict[int, str] = {}
+                        single_err: str | None = None
+                        for li, it in enumerate(batch_items):
+                            try:
+                                got = self._call_single(it, masked_all[li])
+                                if got:
+                                    singles[li] = got
+                            except (ProviderError, OllamaError) as exc2:
+                                single_err = str(exc2)
+                        if singles:
+                            raw_by_index, err = singles, single_err
+                            break
+
+            # ---- 3. 还原 + 校验 + 守卫 ----
+            for local_i, global_i in enumerate(batch):
+                item = items[global_i]
+                entry = out[global_i]
+                raw_masked = raw_by_index.get(local_i, "")
+
+                if not raw_masked:
+                    entry.status = EntryStatus.FAILED
+                    entry.target = ""
+                    entry.warnings = [f"provider_error: {err or '空响应'}"]
+                    continue
+
+                if use_mask:
+                    restored, ph_check = ph.verify_restored(
+                        item.unit.source,
+                        raw_masked,
+                        slots_all[local_i],
+                        masked_source=masked_all[local_i],
+                    )
+                    if ph_check.fatal:
+                        # 占位符被破坏 —— 这是硬错误，绝不能写回游戏
+                        self.stats["placeholder_fatal"] += 1
+                        entry.status = EntryStatus.FAILED
+                        entry.target = ""
+                        entry.warnings = [f"placeholder_broken: {ph_check.describe()}"]
+                        entry.meta["raw_model_output"] = raw_masked
+                        continue
+                    candidate = restored
+                else:
+                    candidate = raw_masked
+
+                res = guard(
+                    item.unit.source,
+                    candidate,
+                    max_chars=item.unit.max_chars,
+                    length_ratio=ratio,
+                    target_lang=target_lang,
+                )
+                entry.target = res.text
+                entry.warnings = list(res.warnings)
+                entry.provider = self.name
+                entry.model = self._model
+                entry.glossary_hits = [g.source for g in item.glossary]
+                entry.retries = 0
+                entry.status = EntryStatus.FAILED if res.fatal else EntryStatus.TRANSLATED
+
+        return out
+
+    def _blank(self, item: TranslateItem) -> TranslationEntry:
+        return TranslationEntry(
+            uid=item.unit.uid,
+            source=item.unit.source,
+            target="",
+            status=EntryStatus.PENDING,
+            kind=item.unit.kind,
+            provider=self.name,
+            model=self._model,
+            meta={"detected_lang": guess_language(item.unit.source)},
+        )
+
+    # ------------------------------------------------------------------
+    # 自检轮
+    # ------------------------------------------------------------------
+
+    def review_batch(self, sources: list[str], targets: list[str], target_lang: str) -> list[str]:
+        """对一批译文做审校，返回修正后的译文。失败时原样返回。
+
+        原则：**只允许"修"，不允许把好译文改坏**。若新译文引入了致命问题
+        （占位符丢失）或警告变多，就保留原译文。
+        """
+        if not sources:
+            return []
+        use_mask = self.cfg.translate.mask_placeholders
+        if use_mask:
+            masked_all, slots_all = ph.mask_batch(sources)
+            pairs = [(i, masked_all[i], targets[i]) for i in range(len(sources))]
+        else:
+            slots_all = [[] for _ in sources]
+            pairs = [(i, sources[i], targets[i]) for i in range(len(sources))]
+
+        user = prompts.build_review_user_prompt(pairs)
+        try:
+            raw = self._chat(
+                user, system=prompts.REVIEW_SYSTEM_PROMPT, temperature=0.0
+            )
+            mapping, res = parse_translations(raw, expect_indices=list(range(len(sources))))
+            if not mapping:
+                return targets
+
+            out: list[str] = []
+            for i, cur in enumerate(targets):
+                cand = mapping.get(i, "")
+                if not cand.strip():
+                    out.append(cur)
+                    continue
+                if use_mask:
+                    restored, check = ph.verify_restored(
+                        sources[i], cand, slots_all[i], masked_source=masked_all[i]
+                    )
+                    if check.fatal:
+                        out.append(cur)
+                        continue
+                    cand = restored
+                g_old = guard(sources[i], cur, length_ratio=self.cfg.translate.max_chars_ratio, target_lang=target_lang)
+                g_new = guard(sources[i], cand, length_ratio=self.cfg.translate.max_chars_ratio, target_lang=target_lang)
+                if g_new.fatal and not g_old.fatal:
+                    out.append(cur)
+                elif len(g_new.warnings) > len(g_old.warnings):
+                    out.append(cur)
+                else:
+                    out.append(g_new.text)
+            return out
+        except (ProviderError, OllamaError) as exc:
+            log.warning("审校轮失败，保留原译文：%s", exc)
+            return targets

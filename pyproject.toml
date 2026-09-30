@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nova-loc"
+version = "0.1.0"
+description = "NovaLoc 新译 — 全离线游戏全文本汉化流水线：文本抽取、AI 翻译、字体补字、贴图文字重绘"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "starchfurrycon" }]
+keywords = ["game", "translation", "localization", "chinese", "ocr", "inpainting", "unity", "renpy", "rpgmaker"]
+classifiers = [
+  "Environment :: Console",
+  "Environment :: Web Environment",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Games/Entertainment",
+]
+
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "python-multipart>=0.0.9",
+  "httpx>=0.27",
+  "fonttools[woff]>=4.53",
+  "pillow>=10.3",
+  "numpy>=1.26",
+  "opencv-python-headless>=4.10",
+  "onnxruntime>=1.18",
+  "typer>=0.12",
+  "rich>=13.7",
+  "sqlmodel>=0.0.22",
+  "platformdirs>=4.2",
+  "psutil>=5.9",
+  "PyYAML>=6.0",
+  "tomli-w>=1.0",
+  "scipy>=1.11",
+  "pyclipper>=1.3",
+  "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+# 本地 GPU 推理（onnxruntime-gpu 会自动替换 onnxruntime）
+gpu = ["onnxruntime-gpu>=1.18"]
+# OCR 引擎
+ocr = ["rapidocr-onnxruntime>=1.2.3"]
+# 视觉大模型（贴图文字识别兜底）——体积大，按需安装
+vision = ["transformers>=4.45", "accelerate>=0.34", "qwen-vl-utils>=0.0.8"]
+# 本地图像修复（LaMa 等）
+inpaint = ["scikit-image>=0.24"]
+# 开发
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+novaloc = "novaloc.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/starchfurrycon/novaloc"
+Repository = "https://github.com/starchfurrycon/novaloc"
+Issues = "https://github.com/starchfurrycon/novaloc/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/novaloc"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
