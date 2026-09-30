@@ -32,7 +32,10 @@ dependencies = [
   "pillow>=10.3",
   "numpy>=1.26",
   "opencv-python-headless>=4.10",
-  "onnxruntime>=1.18",
+  # 注意：onnxruntime **不在这里**。基础依赖里放 onnxruntime 会和
+  # onnxruntime-directml 冲突（两者提供同一个 `onnxruntime` 包名），
+  # 用户装完会发现 DirectML provider 消失、退回 CPU 慢 84 倍。
+  # 所以推理后端必须由用户通过 extra 显式选择：dml / gpu / cpu 三选一。
   "typer>=0.12",
   "rich>=13.7",
   "sqlmodel>=0.0.22",
@@ -46,14 +49,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 本地 GPU 推理（onnxruntime-gpu 会自动替换 onnxruntime）
+# DirectML：Windows 上的 GPU 加速。**实测比 CPU 快 84 倍**，强烈建议装。
+# 注意：onnxruntime-directml 与 onnxruntime / onnxruntime-gpu **互斥**，
+# 装了这个就要卸掉另外两个，否则 DirectML provider 不会出现。
+dml = ["onnxruntime-directml>=1.18"]
+# 纯 CPU 推理（没有独显时用这个，但会慢很多）
+cpu = ["onnxruntime>=1.18"]
+# 前端构建产物随包分发，所以 web 这个 extra 只用于开发时重建前端
+web = []
+# 本地 GPU 推理（CUDA；DirectML 不可用时才需要）
 gpu = ["onnxruntime-gpu>=1.18"]
-# OCR 引擎
-ocr = ["rapidocr-onnxruntime>=1.2.3"]
+# OCR 引擎。rapidocr 会自带 PP-OCRv6 的模型下载逻辑
+ocr = ["rapidocr>=3.0"]
 # 视觉大模型（贴图文字识别兜底）——体积大，按需安装
 vision = ["transformers>=4.45", "accelerate>=0.34", "qwen-vl-utils>=0.0.8"]
-# 本地图像修复（LaMa 等）
-inpaint = ["scikit-image>=0.24"]
+# 本地图像修复（LaMa 等）。没有 torch 时去字会退化为纯色/Telea 修补
+inpaint = ["torch>=2.4", "scikit-image>=0.24"]
 # 开发
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.11"]
 

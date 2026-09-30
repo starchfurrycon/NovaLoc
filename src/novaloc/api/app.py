@@ -291,11 +291,34 @@ def create_app() -> FastAPI:
     def get_project(pid: str) -> dict[str, Any]:
         ws = get_ws(pid)
         p = ws.project
+        # 前端头部要显示"当前跑到哪一步"。取最近一个该项目的任务，
+        # 没有就跑过就返回 None，前端会显示"暂无流水线记录"。
+        recent = jobs.list(project_id=pid, limit=1)
+        progress = None
+        if recent:
+            j = recent[0]
+            total = len(STAGES)
+            done = 0
+            if j.status == "done":
+                done = total
+            elif j.stage in STAGE_LABELS:
+                done = [s for s, _ in STAGES].index(j.stage)
+            progress = {
+                "stage": j.stage,
+                "stage_label": STAGE_LABELS.get(j.stage, j.stage),
+                "status": j.status,
+                "progress": j.progress,
+                "done_stages": done,
+                "total_stages": total,
+                "message": j.message or j.error,
+                "job_id": j.id,
+            }
         return {
             "id": p.id, "name": p.name, "game_dir": p.game_dir,
             "engine": p.engine, "engine_version": p.engine_version,
             "target_lang": p.target_lang, "created_at": p.created_at,
             "updated_at": p.updated_at, "stage": p.stage,
+            "progress": progress,
             "paths": {
                 "out_dir": str(ws.out_dir),
                 "workspace": str(ws.root),

@@ -326,6 +326,77 @@ class RenPyAdapter(EngineAdapter):
                 out.append(FontCoverage(font_id=rel, path=rel, family=f.stem, is_game_font=True))
         return out
 
+    def wire_fonts(self, out_dir: Path, installed: dict[str, str]) -> list[str]:
+        """生成 ``game/novaloc_fonts.rpy``，把 Ren'Py 的字体指向补好的字体。
+
+        Ren'Py 的字体由 ``gui.text_font`` / ``gui.name_text_font`` /
+        ``gui.interface_text_font`` 等变量控制，定义在 ``game/gui.rpy``
+        里。**光把 ttf 放进 game/ 不会生效**。
+
+        这里不改用户的 ``gui.rpy``（那是人写的、还带主题注释，改了以后
+        升级 Ren'Py 或用户手改会冲突），而是**新增一个 ``init 1`` 的
+        覆盖文件**。Ren'Py 按 ``init`` 优先级执行，``init 1`` 晚于
+        gui.rpy 的默认 ``init`` 但早于游戏启动，所以这是官方推荐的
+        覆盖方式，也最容易卸载（删掉一个文件即可）。
+        """
+        notes: list[str] = []
+        if not installed:
+            return notes
+
+        game = out_dir / "game" if (out_dir / "game").is_dir() else out_dir
+        if not game.is_dir():
+            return notes
+
+        # 优先用已经存在的字体名（Ren'Py 里字体就是相对 game/ 的路径）
+        target = ""
+        for _orig, new in installed.items():
+            target = new
+            break
+        if not target:
+            return notes
+
+        # installed 的 key 是相对 game_dir 的路径，Ren'Py 需要相对 game/ 的
+        font_rel = target
+        if font_rel.startswith("game/"):
+            font_rel = font_rel[len("game/") :]
+
+        out_file = game / "novaloc_fonts.rpy"
+        body = "\n".join([
+            "# 由 NovaLoc 新译自动生成 —— 让游戏使用补齐中文字形的字体。",
+            "# 想还原原始字体：删掉本文件即可。",
+            "init 1 python:",
+            f"    _novaloc_font = {font_rel!r}",
+            "    # 只覆盖由 gui 变量控制的字体。用户自定义的样式不动，",
+            "    # 避免把主题改花。",
+            "    for _v in (",
+            '        "text_font", "name_text_font", "interface_text_font",',
+            '        "button_text_font", "choice_button_text_font",',
+            '        "label_text_font", "main_menu_text_font",',
+            '        "game_menu_text_font", "history_text_font",',
+            "    ):",
+            '        _n = "gui." + _v',
+            "        try:",
+            "            if hasattr(store.gui, _v):",
+            "                setattr(store.gui, _v, _novaloc_font)",
+            "        except Exception:",
+            "            pass",
+            "",
+        ])
+        out_file.write_text(body, encoding="utf-8", newline="\n")
+        notes.append(f"已生成 {self._rel(out_dir, out_file)}（指向 {font_rel}）")
+
+        # 提示用户：如果 gui.rpy 里把字体写死在 style 里，覆盖不会生效
+        gui_rpy = game / "gui.rpy"
+        if gui_rpy.is_file():
+            txt = gui_rpy.read_text(encoding="utf-8", errors="replace")
+            hard = re.findall(r"style\s+\w+[^\n]*\n(?:[^\n]*\n){0,6}?[^\n]*font\s+", txt)
+            if hard:
+                notes.append(
+                    f"⚠️ {gui_rpy.name} 里有直接写死的 font（{len(hard)} 处），"
+                    "这些样式不会被 gui 变量覆盖，如仍有口口口请手动处理"
+                )
+        return notes
+
     # ------------------------------------------------------------------
     # 回写
     # ------------------------------------------------------------------
@@ -389,6 +460,7 @@ class RenPyAdapter(EngineAdapter):
         # 贴图与字体
         import shutil as _sh
 
+        installed: dict[str, str] = {}
         for mapping, label in ((rebuilt_images or {}, "贴图"), (font_patches or {}, "字体")):
             for rel, src in mapping.items():
                 dest = out_dir / rel
@@ -396,8 +468,18 @@ class RenPyAdapter(EngineAdapter):
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     _sh.copy2(src, dest)
                     res.files_written += 1
+                    if label == "字体":
+                        installed[rel] = rel
                 except Exception as exc:  # noqa: BLE001
                     res.warnings.append(f"{label}回写失败 {rel}：{exc}")
+
+        # 字体文件到位还不够，必须让 Ren'Py 真的去加载它
+        if installed:
+            try:
+                for note in self.wire_fonts(out_dir, installed):
+                    res.warnings.append(f"[字体接线] {note}")
+            except Exception as exc:  # noqa: BLE001
+                res.warnings.append(f"字体接线失败（字体文件已就位，可能需手动指向）：{exc}")
 
         res.ok = res.files_written > 0 or not by_file
         if not res.ok and not res.error:

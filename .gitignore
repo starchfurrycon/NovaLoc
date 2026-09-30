@@ -9,9 +9,13 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-# Python build output (the frontend's committed web/dist is excluded below)
-**/dist/
-!web/dist/
+# Python build output。
+# 这里刻意只写 `dist/`（只匹配仓库根目录），**不写 `**/dist/`** ——
+# 后者的语义是"忽略任意层级的 dist 目录"，而 Git 不会进入被忽略的目录，
+# 于是 `!web/dist/**` 这种"先忽略目录、再放行内部文件"的写法完全无效，
+# 前端产物会静默地不被提交。这个坑很难发现，因为 `git status` 不报错。
+dist/
+build/*.egg-info/
 
 # --- Node ---
 node_modules/

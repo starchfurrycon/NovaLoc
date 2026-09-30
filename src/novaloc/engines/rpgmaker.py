@@ -467,6 +467,90 @@ class RpgMakerAdapter(EngineAdapter):
                     )
         return out
 
+    def wire_fonts(self, out_dir: Path, installed: dict[str, str]) -> list[str]:
+        """改 ``fonts/gamefont.css`` 的 ``@font-face`` 指向补好的字体。
+
+        RPG Maker MV/MZ 的字体是通过 CSS 加载的，``@font-face`` 里的
+        ``fontFamily`` 必须和 ``js/rpg_core.js`` 里
+        ``Graphics._createFontLoader`` 用的名字对得上（默认 ``GameFont``）。
+        **只替换字体文件、不改 CSS 的 ``src``，游戏仍然加载旧字体**，
+        用户会看到"文件换了但游戏里还是口口口"。
+
+        MZ 没有 ``fonts/`` 目录时，新建一个并写 CSS —— 引擎会自动
+        加载 ``fonts/gamefont.css``（如果存在），这是官方支持的扩展点。
+        """
+        notes: list[str] = []
+        if not installed:
+            return notes
+
+        # 找到 fonts 目录（MV 在 www/fonts，MZ 在 fonts）
+        font_dir: Path | None = None
+        for cand in (out_dir / "fonts", out_dir / "www" / "fonts"):
+            if cand.is_dir():
+                font_dir = cand
+                break
+        if font_dir is None:
+            font_dir = out_dir / "fonts"
+            font_dir.mkdir(parents=True, exist_ok=True)
+            notes.append(f"新建字体目录：{self._rel(out_dir, font_dir)}")
+
+        css = font_dir / "gamefont.css"
+        old_css = css.read_text(encoding="utf-8", errors="replace") if css.is_file() else ""
+
+        # 认定要用的字体：取第一个成功注入的
+        target_new: str | None = None
+        for _orig, new in installed.items():
+            target_new = new
+            break
+        if target_new is None:
+            return notes
+
+        new_name = Path(target_new).name
+
+        if "@font-face" in old_css:
+            # 改写已有 @font-face 的 src，保留 fontFamily 名字不变 ——
+            # 改名字的话 rpg_core.js 里引用的 "GameFont" 就找不到了
+            def _fix(m: re.Match[str]) -> str:
+                return f'{m.group(1)}url("{new_name}"){m.group(3)}'
+
+            fixed = re.sub(
+                r"(src\s*:\s*)url\([^)]*\)([^;]*)(;?)",
+                _fix,
+                old_css,
+                count=1,
+            )
+            if fixed != old_css:
+                css.write_text(fixed, encoding="utf-8", newline="\n")
+                notes.append(f"已改写 {self._rel(out_dir, css)} 的 @font-face 指向 {new_name}")
+            else:
+                css.write_text(old_css, encoding="utf-8", newline="\n")
+                notes.append(f"⚠️ {css.name} 里没找到可改写的 src，请手动确认字体指向")
+            return notes
+
+        # 没有 CSS（或没有 @font-face）：写一份完整的
+        family = "GameFont"
+        core_js = out_dir / "js" / "rpg_core.js"
+        core_text = (
+            core_js.read_text(encoding="utf-8", errors="replace") if core_js.is_file() else ""
+        )
+        m = re.search(r"fontFamily\s*:\s*['\"]([^'\"]+)['\"]", core_text)
+        if m:
+            family = m.group(1)
+            notes.append(f"从 rpg_core.js 读到字体族名：{family}")
+        else:
+            notes.append(f"未能读取字体族名，按默认值 {family} 写入")
+
+        css.write_text(
+            "@font-face {\n"
+            f'  font-family: "{family}";\n'
+            f'  src: url("{new_name}");\n'
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        notes.append(f"已生成 {self._rel(out_dir, css)}（font-family: {family}）")
+        return notes
+
     # ------------------------------------------------------------------
     # 回写
     # ------------------------------------------------------------------
@@ -548,6 +632,7 @@ class RpgMakerAdapter(EngineAdapter):
         # 字体：替换 fonts/ 下的文件
         if font_patches:
             n = 0
+            installed: dict[str, str] = {}
             for rel, src in font_patches.items():
                 dest = out_dir / rel
                 try:
@@ -555,11 +640,18 @@ class RpgMakerAdapter(EngineAdapter):
                     import shutil as _sh
 
                     _sh.copy2(src, dest)
+                    installed[rel] = rel
                     n += 1
                 except Exception as exc:  # noqa: BLE001
                     res.warnings.append(f"字体回写失败 {rel}：{exc}")
             if n:
                 res.files_written += n
+                # 光放文件不够，还得让引擎去用它
+                try:
+                    for note in self.wire_fonts(out_dir, installed):
+                        res.warnings.append(f"[字体接线] {note}")
+                except Exception as exc:  # noqa: BLE001
+                    res.warnings.append(f"字体接线失败（字体文件已就位，可能需手动指向）：{exc}")
 
         res.ok = res.files_written > 0 or not by_file
         if not res.ok and not res.error:

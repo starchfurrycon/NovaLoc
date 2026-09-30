@@ -22,6 +22,10 @@ function toError(cause: unknown): Error {
 /**
  * Poll a resource. `deps` controls when the request is re-issued; `reload()`
  * forces one on demand. Aborts in-flight requests on unmount / dep change.
+ *
+ * `deps` is spread into the effect's dependency list intentionally: the array
+ * length is stable per call site (all call sites pass a fixed-length array), so
+ * the hook order never changes.
  */
 export function useResource<T>(
   loader: (signal: AbortSignal) => Promise<T>,
