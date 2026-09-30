@@ -188,7 +188,7 @@ def run_qa(ws: Workspace, ctx: Context) -> dict[str, Any]:
                 issues.append(_issue(
                     Severity.ERROR, "fonts",
                     f"字体 {fc.family or fc.path} 缺少 {len(fc.missing)} 个字符，"
-                    f"游戏内会显示为口口口：{''.join(fc.missing[:40])}",
+                    f"游戏内会显示为口口口：{fc.missing[:40]}",
                     font_id=fc.font_id,
                 ))
         # 补丁结果

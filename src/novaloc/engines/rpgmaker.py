@@ -89,21 +89,77 @@ RM_ESCAPE_RE = re.compile(r"\\(?:V|N|C|I|P|PX|PY|FS|AF|AC|SP|AP|A|B|G|M|R|T|X|Y|
 PLUGIN_TAG_RE = re.compile(r"<[A-Za-z_][A-Za-z0-9_]*(?::[^<>\n]*)?>")
 
 
+def _content_root(game_dir: Path) -> Path | None:
+    """返回**放资源的那一层**（`data/`、`img/`、`fonts/` 的父目录）。
+
+    RPG Maker 的桌面版有两种摆放方式，两种都很常见：
+
+    * **MZ / 新版 MV**：资源在游戏根目录 —— ``<游戏>/data``、``<游戏>/img``；
+    * **NW.js 打包的 MV**：资源在 ``www/`` 里 —— ``<游戏>/www/data``、
+      ``<游戏>/www/img``，而 Exe 与 nw.dll 在根目录。
+
+    以前这里到处写死 ``game_dir / "data"``，于是**第二种布局完全用不了**：
+    探测阶段找不到 ``data/`` 直接返回 0 置信度，被 `loose` 兜底抢占
+    （实测一个 558 MB 的 MV 游戏被判成"散装文件，置信度 25%"），
+    抽取阶段则直接报"找不到数据目录"。
+
+    只在 `fonts` 那一处做了 `www/` 兼容 —— 所以"字体能改、文本抽不出来"
+    这种更让人困惑的表现也是可能的。
+
+    判定顺序是先看 `data/` 再看 `www/data`（而不是反过来）：同时存在时
+    以游戏根目录的为准，因为那才是引擎实际加载的位置。
+    两边都没有就返回 ``None``，由调用方给出各自的错误信息。
+    """
+    for cand in (game_dir, game_dir / "www"):
+        if (cand / "data").is_dir():
+            return cand
+    return None
+
+
 @register("engine", "rpgmaker")
 class RpgMakerAdapter(EngineAdapter):
     """RPG Maker MV / MZ 适配器。"""
 
     id = "rpgmaker"
     display_name = "RPG Maker MV/MZ"
+
     priority = 10
+
+    def _rel(self, base: Path, path: Path) -> str:
+        """相对路径一律相对**游戏根**（`base`，也就是 `effective_source`）。
+
+        ## 为什么必须相对游戏根
+
+        适配器算出的路径会被各阶段这样用::
+
+            src = self.ws.effective_source / asset.path
+
+        而 `effective_source` 是**游戏根**（NW.js 布局下 `www/` 的父目录）。
+        如果这里相对资源根返回 `img/system/Loading.png`，阶段就会去
+        ``<游戏根>/img/system/Loading.png`` 找 —— 找不到，于是所有贴图
+        报"源文件不存在"、`analyzed` 永远是 false，而**阶段本身报 ok**。
+
+        实测：一个 558 MB 的真实 MV 游戏，11 张候选贴图全部这样被静默跳过，
+        阶段输出是"0/11 张贴图已汉化"，看起来像"这些图本来没字"。
+
+        所以内容在 `www/` 里就把 `www/` 前缀补回去。对外只认游戏根一套坐标。
+        """
+        root = _content_root(base)
+        try:
+            if root is not None and root != base:
+                return (root.relative_to(base) / path.relative_to(root)).as_posix()
+            return path.relative_to(base).as_posix()
+        except ValueError:
+            return path.name
 
     # ------------------------------------------------------------------
 
     def detect(self, game_dir: Path) -> EngineInfo:
         info = EngineInfo(engine_id=self.id, display_name=self.display_name, root=game_dir)
-        data = game_dir / "data"
-        if not data.is_dir():
+        root = _content_root(game_dir)
+        if root is None:
             return info
+        data = root / "data"
 
         # MZ 的特征文件
         mz_markers = ["System.json", "MapInfos.json", "CommonEvents.json", "Tilesets.json"]
@@ -113,6 +169,9 @@ class RpgMakerAdapter(EngineAdapter):
 
         info.confidence = min(1.0, 0.4 + 0.15 * len(present))
         info.evidence.append(f"data/ 下存在 {len(present)}/{len(mz_markers)} 个 RPG Maker 数据文件")
+        # 说清楚是哪一层，否则"明明有 data/ 却说找不到"会让人怀疑自己看错了
+        if root != game_dir:
+            info.evidence.append(f"资源在子目录 {root.name}/ 下（NW.js 打包布局）")
 
         # 看 System.json 里的结构判断大版本
         sysf = data / "System.json"
@@ -133,8 +192,8 @@ class RpgMakerAdapter(EngineAdapter):
                 info.evidence.append(f"System.json 解析失败：{exc}")
                 info.confidence *= 0.6
 
-        # 有 JS 目录是 MV/MZ 的强信号
-        if (game_dir / "js").is_dir():
+        # 有 JS 目录是 MV/MZ 的强信号（NW.js 布局下在同一层 www/ 里）
+        if (root / "js").is_dir():
             info.confidence = min(1.0, info.confidence + 0.15)
             info.evidence.append("存在 js/ 目录（MV/MZ 的脚本与插件）")
 
@@ -147,12 +206,15 @@ class RpgMakerAdapter(EngineAdapter):
     # ------------------------------------------------------------------
 
     def extract_text(self, game_dir: Path) -> tuple[list[TextUnit], ExtractReport]:
-        data = game_dir / "data"
         report = ExtractReport(adapter=self.id)
         units: list[TextUnit] = []
-        if not data.is_dir():
-            report.errors.append(f"找不到数据目录：{data}")
+        root = _content_root(game_dir)
+        if root is None:
+            report.errors.append(
+                f"找不到数据目录：{game_dir / 'data'} 或 {game_dir / 'www' / 'data'}"
+            )
             return units, report
+        data = root / "data"
 
         files = sorted(p for p in data.glob("*.json") if p.is_file())
         report.files_scanned = len(files)
@@ -415,7 +477,13 @@ class RpgMakerAdapter(EngineAdapter):
         """
         report = ExtractReport(adapter=self.id)
         out: list[ImageAsset] = []
-        img = game_dir / "img"
+        root = _content_root(game_dir)
+        if root is None:
+            report.errors.append(f"找不到资源目录（data/ 不存在）：{game_dir}")
+            return out, report
+        # 相对路径必须相对**资源根**取，回写时才能拼回同一个位置
+        # （以前相对 game_dir 取，NW.js 布局下回写会找不到目标）
+        img = root / "img"
         if not img.is_dir():
             report.errors.append(f"找不到图片目录：{img}")
             return out, report
@@ -449,9 +517,16 @@ class RpgMakerAdapter(EngineAdapter):
     # ------------------------------------------------------------------
 
     def discover_fonts(self, game_dir: Path) -> list[FontCoverage]:
-        """RPG Maker 自带 ``fonts/`` 目录（MV 只有 gamefont.css + 一个字体）。"""
+        """RPG Maker 自带 ``fonts/`` 目录（MV 只有 gamefont.css + 一个字体）。
+
+        路径相对**资源根**取，与 `wire_fonts` 保持一致 ——
+        以前这里相对 `game_dir`、`wire_fonts` 却按 `out/fonts` 优先去找，
+        NW.js 布局下会出现"字体发现路径是 www/fonts/…，安装却落到 out/fonts"，
+        两边对不上。
+        """
         out: list[FontCoverage] = []
-        for d in (game_dir / "fonts", game_dir / "www" / "fonts"):
+        root = _content_root(game_dir) or game_dir
+        for d in (root / "fonts",):
             if not d.is_dir():
                 continue
             for f in sorted(d.rglob("*")):
@@ -483,14 +558,11 @@ class RpgMakerAdapter(EngineAdapter):
         if not installed:
             return notes
 
-        # 找到 fonts 目录（MV 在 www/fonts，MZ 在 fonts）
-        font_dir: Path | None = None
-        for cand in (out_dir / "fonts", out_dir / "www" / "fonts"):
-            if cand.is_dir():
-                font_dir = cand
-                break
-        if font_dir is None:
-            font_dir = out_dir / "fonts"
+        # fonts 目录必须落在**资源根**下（MV 的 NW.js 布局是 out/www/fonts，
+        # MZ 是 out/fonts）。判定顺序与 `discover_fonts` 一致。
+        out_root = _content_root(out_dir) or out_dir
+        font_dir = out_root / "fonts"
+        if not font_dir.is_dir():
             font_dir.mkdir(parents=True, exist_ok=True)
             notes.append(f"新建字体目录：{self._rel(out_dir, font_dir)}")
 
@@ -511,10 +583,12 @@ class RpgMakerAdapter(EngineAdapter):
             # 改写已有 @font-face 的 src，保留 fontFamily 名字不变 ——
             # 改名字的话 rpg_core.js 里引用的 "GameFont" 就找不到了
             def _fix(m: re.Match[str]) -> str:
+                # 后缀（format(...)、local(...) 之类）原样保留，
+                # 只换 url(...) 里的文件名。
                 return f'{m.group(1)}url("{new_name}"){m.group(3)}'
 
             fixed = re.sub(
-                r"(src\s*:\s*)url\([^)]*\)([^;]*)(;?)",
+                r"(src\s*:\s*)(?:local\([^)]*\)\s*,\s*)?url\([^)]*\)([^;]*)(;?)",
                 _fix,
                 old_css,
                 count=1,
@@ -522,14 +596,24 @@ class RpgMakerAdapter(EngineAdapter):
             if fixed != old_css:
                 css.write_text(fixed, encoding="utf-8", newline="\n")
                 notes.append(f"已改写 {self._rel(out_dir, css)} 的 @font-face 指向 {new_name}")
+            elif new_name and new_name in old_css:
+                # 目标字体正好和 CSS 里已写的是同一个文件名 ——
+                # 那是**覆盖同名文件**的正常情况（`font_id` 与目标同名），
+                # CSS 无需改动，也不需要警告。
+                css.write_text(old_css, encoding="utf-8", newline="\n")
+                notes.append(f"{css.name} 已指向 {new_name}（同名覆盖，无需改写）")
             else:
                 css.write_text(old_css, encoding="utf-8", newline="\n")
-                notes.append(f"⚠️ {css.name} 里没找到可改写的 src，请手动确认字体指向")
+                notes.append(
+                    f"⚠️ {css.name} 里没找到可改写的 src，请手动确认字体指向"
+                    f"（期望指向 {new_name}）"
+                )
             return notes
 
         # 没有 CSS（或没有 @font-face）：写一份完整的
         family = "GameFont"
-        core_js = out_dir / "js" / "rpg_core.js"
+        # rpg_core.js 同样在资源根下（NW.js 布局是 out/www/js/）
+        core_js = out_root / "js" / "rpg_core.js"
         core_text = (
             core_js.read_text(encoding="utf-8", errors="replace") if core_js.is_file() else ""
         )
@@ -578,8 +662,13 @@ class RpgMakerAdapter(EngineAdapter):
             if u.uid in translations:
                 by_file.setdefault(u.location.file, []).append(u)
 
+        # 写入目标必须落在**资源根**下（NW.js 布局是 out/www/data）。
+        # `units` 是上一步从同一个根抽出来的，这里必须用同一套判定，
+        # 否则每个文件都会"目标不存在，跳过" —— 那是最糟的失败方式：
+        # 阶段报 ok、回写计数却是 0。
+        out_root = _content_root(out_dir) or out_dir
         for fname, us in by_file.items():
-            target = out_dir / "data" / fname
+            target = out_root / "data" / fname
             if not target.is_file():
                 res.warnings.append(f"目标文件不存在，跳过：{fname}")
                 res.files_skipped += 1
@@ -629,7 +718,7 @@ class RpgMakerAdapter(EngineAdapter):
             if n:
                 res.files_written += n
 
-        # 字体：替换 fonts/ 下的文件
+        # 字体：把补好的字体放进 out，并让 CSS 指向它
         if font_patches:
             n = 0
             installed: dict[str, str] = {}
@@ -640,7 +729,25 @@ class RpgMakerAdapter(EngineAdapter):
                     import shutil as _sh
 
                     _sh.copy2(src, dest)
-                    installed[rel] = rel
+                    # 两份都要有，缺一不可：
+                    #
+                    # 1. `dest`（= out/<rel>）是**游戏会去加载的名字**：
+                    #    fonts 阶段产出的字体叫 `<原字体名>.zh.ttf`，与
+                    #    `font_id`（`<原字体名>.ttf`）不同名，所以必须把它
+                    #    复制成 `font_id` 那个名字，游戏才找得到。
+                    # 2. 再复制一份**保留补丁自己的文件名**，这样 CSS 可以
+                    #    明确指向新字体；只靠覆盖同名文件的话，"用上了新字体"
+                    #    这件事在产物里没有任何痕迹可查。
+                    #
+                    # 值给 `wire_fonts` 用的是**补丁自己的文件名**。
+                    # 早先这里写的是 `installed[rel] = rel`（原文件名），
+                    # 于是 CSS 被"改写成原来的名字"（`fixed == old_css`），
+                    # 看起来流程走完了，实际上新字体从未被引用 ——
+                    # 游戏继续加载旧字体，用户看到口口口。
+                    extra = dest.parent / Path(src).name
+                    if extra != dest:
+                        _sh.copy2(src, extra)
+                    installed[rel] = src.as_posix() if isinstance(src, Path) else str(src)
                     n += 1
                 except Exception as exc:  # noqa: BLE001
                     res.warnings.append(f"字体回写失败 {rel}：{exc}")

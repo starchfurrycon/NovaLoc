@@ -27,8 +27,33 @@ from . import prompts
 from .guards import guard
 from .json_parse import parse_translations
 from .ollama_client import ModelMissing, OllamaClient, OllamaError, OllamaNotRunning
+from .sanitize import has_lone_surrogate, sanitize_for_json
 
 log = logging.getLogger(__name__)
+
+#: 批量/单条调用里"失败后值得重试"的异常。
+#:
+#: 为什么要把 `UnicodeEncodeError`/`ValueError` 显式列进来：
+#: 真实游戏上的翻译跑了 27 分钟后被
+#: `UnicodeEncodeError: ... surrogates not allowed` 整个打断。
+#: 那个异常继承自 `ValueError`，而这里原本只捕
+#: `(ProviderError, OllamaError, ModelMissing, OllamaNotRunning)` ——
+#: **一个都不匹配**，于是它穿过重试层、穿过逐条降级，一路逃到
+#: `stage_translate`，让一整轮翻译作废。
+#:
+#: 单一文本触发的问题必须只让那一批失败，不能让整个项目失败。
+#: 捕获过宽的风险是掩盖真 bug，所以 `sanitize` 层已经先做了输入净化；
+#: 这里只是**兜底**：任何"这一批的文本有问题"都退化为该批失败，
+#: 由上层标记 FAILED 并在审校页提示，而不是中断整轮。
+_RETRYABLE: tuple[type[BaseException], ...] = (
+    ProviderError,
+    OllamaError,
+    ModelMissing,
+    OllamaNotRunning,
+    UnicodeEncodeError,
+    UnicodeDecodeError,
+    ValueError,
+)
 
 #: 需要"更聪明"的文本类型：独占一批，避免被 UI 短标签的风格带偏
 _CAREFUL_KINDS = {TextKind.ITEM_DESC, TextKind.NARRATION, TextKind.CREDIT}
@@ -235,7 +260,7 @@ class OllamaTranslationProvider:
             for li in missing:
                 try:
                     got = self._call_single(batch_items[li], masked[li])
-                except (ProviderError, OllamaError, ModelMissing, OllamaNotRunning) as exc:
+                except _RETRYABLE as exc:
                     log.debug("补漏第 %d 条失败：%s", li, exc)
                     continue
                 if got:
@@ -317,7 +342,13 @@ class OllamaTranslationProvider:
                         raw_by_index = self._call_batch(batch_items, masked_all)
                     err = None
                     break
-                except (ProviderError, OllamaError, ModelMissing, OllamaNotRunning) as exc:
+                except _RETRYABLE as exc:
+                    # `_RETRYABLE` 里额外含 `UnicodeEncodeError`/`ValueError`：
+                    # 它们继承自 ValueError，不属于 ProviderError/OllamaError，
+                    # 早先的 `except (ProviderError, OllamaError, ModelMissing,
+                    # OllamaNotRunning)` **一个都不匹配**，于是异常穿过整个
+                    # 重试层逃到 stage_translate，让一轮跑了 27 分钟的翻译
+                    # 全部作废（实测）。
                     err = str(exc)
                     self.stats["retries"] += 1
                     log.warning("批 %d（%d 条）第 %d 次失败：%s", bi, len(batch_items), attempt + 1, err)
@@ -333,7 +364,7 @@ class OllamaTranslationProvider:
                                 got = self._call_single(it, masked_all[li])
                                 if got:
                                     singles[li] = got
-                            except (ProviderError, OllamaError) as exc2:
+                            except _RETRYABLE as exc2:
                                 single_err = str(exc2)
                         if singles:
                             raw_by_index, err = singles, single_err
@@ -359,7 +390,7 @@ class OllamaTranslationProvider:
                         continue
                     try:
                         got = self._call_single(batch_items[li], masked_all[li])
-                    except (ProviderError, OllamaError, ModelMissing, OllamaNotRunning) as exc:
+                    except _RETRYABLE as exc:
                         log.debug("补空第 %d 条失败：%s", li, exc)
                         continue
                     if got:
@@ -373,6 +404,15 @@ class OllamaTranslationProvider:
                 item = items[global_i]
                 entry = out[global_i]
                 raw_masked = raw_by_index.get(local_i, "")
+                # 出站净化：模型偶尔把 `\uddd1` 这类**孤立代理项**当字面量
+                # 吐出来，`json.loads` 会忠实还原成一个非法字符。留着它
+                # 会污染条目（并且被当作下一批的输入反复触发），
+                # 写入 JSON 时也会炸。换成 U+FFFD 保留长度与占位符位置。
+                if has_lone_surrogate(raw_masked):
+                    self.stats["surrogate_sanitized"] = (
+                        self.stats.get("surrogate_sanitized", 0) + 1
+                    )
+                    raw_masked = sanitize_for_json(raw_masked)
 
                 if not raw_masked:
                     entry.status = EntryStatus.FAILED

@@ -279,8 +279,27 @@ class FontCoverage(BaseModel):
     covers_cjk: bool = False
     """是否至少覆盖常用汉字（GB2312 一级字表抽样）。"""
 
-    missing: list[str] = Field(default_factory=list)
-    """针对当前项目所需字符集缺失的字符（去重排序）。"""
+    missing: str = ""
+    """针对当前项目所需字符集缺失的字符，**按字符拼接成一个字符串**。
+
+    为什么是 `str` 而不是 `list[str]`：上游 `fonts.service.FontAudit.missing`
+    就是 `str`（`"".join(missing)`），`stages.py` 直接把 `audit.missing`
+    赋给这个字段。以前这里声明成 `list[str]`，于是赋值处把一个**字符串**
+    塞进了一个"列表"字段 —— 因为 pydantic 默认不校验赋值（没有
+    `validate_assignment`），异常一直没被触发，直到序列化时才炸：
+
+        PydanticSerializationUnexpectedValue(
+            Expected `list[str]` - serialized value may not be as expected
+            [field_name='missing', input_value='ⅠⅡⅢ…☎♀♂♪♫❤载', input_type=str])
+
+    也就是说 `missing` 从来不是列表。改成 `str` 后与上游一致，
+    下游 `len()`（字符个数）与 `"".join()`（对列表做 join 等价于原样返回）
+    两种写法都仍然正确 ——。
+
+    用户可见的影响：`missing_count` 一直等于 `len(字符串)`，
+    也就是**丢失的字符数**，这个数本来就是对的；坏掉的是类型契约本身
+    （序列化告警 + 任何真想按列表消费它的地方都会拿到单个字符）。
+    """
 
     is_game_font: bool = False
     """True 表示这是游戏自带（需要被替换/注入）的字体，

@@ -814,6 +814,10 @@ class Pipeline:
                     "ocr_ms": round(res.ocr_ms, 1),
                     "total_ms": round(res.total_ms, 1),
                     "error": res.error,
+                    # 整图级提醒要落盘：它解释了"这张图为什么没被处理"
+                    # （例如"跳过了 2 个疑似幻觉文字块"）。只写日志的话，
+                    # 用户在审校页看到"未处理"却不知道原因。
+                    "warnings": list(res.warnings),
                     "blocks": [
                         {
                             "id": o.block_id,

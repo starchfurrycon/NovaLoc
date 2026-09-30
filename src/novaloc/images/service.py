@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -97,6 +98,12 @@ class TextureResult:
     ocr_ms: float = 0.0
     total_ms: float = 0.0
     error: str = ""
+    warnings: list[str] = field(default_factory=list)
+    """整图级别的提醒（区别于 `BlockOutcome.warnings` 的逐块提醒）。
+
+    例如"跳过了 N 个疑似幻觉文字块"。放进结果里而不是只写日志，
+    是因为这类信息解释了"为什么这张图没被处理" —— 用户需要看得见。
+    """
 
     @property
     def ok(self) -> bool:
@@ -175,6 +182,13 @@ def _norm(s: str) -> str:
     import unicodedata
 
     return unicodedata.normalize("NFKC", str(s or "")).replace(" ", "").replace("\n", "").strip()
+
+
+#: 单个字母/数字/符号的"文字块"一律判为噪声 —— 见 `_is_plausible_text_block`
+_SINGLE_GLYPH_RE = re.compile(r"^[\w\W]$", re.UNICODE)
+
+#: 多字符块但占画面比例超过这个值 → 判为幻觉
+_MAX_BLOCK_AREA_FRAC = 0.85
 
 
 class TextureTranslator:
@@ -368,6 +382,60 @@ class TextureTranslator:
     # 主流程
     # ------------------------------------------------------------------
 
+    def _is_plausible_text_block(self, block: Any, img_w: int, img_h: int) -> bool:
+        """这个"文字块"是否值得翻译并重绘。**宁可漏，不可错。**
+
+        ## 为什么需要它（真实游戏实测）
+
+        在一个真实 RPG Maker MV 游戏的 `www/img/pictures/stand_images/`
+        （**人物立绘**，386x680）上跑 OCR，识别出单个字符并被自动"翻译"：
+
+        ==================== ======== ======== ==========
+        图片                 识别     置信度   区域占整图
+        ==================== ======== ======== ==========
+        damage_nomal.png     '2'      0.596    48%
+        victory_near_pinch   'S'      0.598    17%
+        victory_nomal.png    '2'      0.718    41%
+        wait_pinch.png       '0'      0.546    40%
+        ==================== ======== ======== ==========
+
+        其中 `'0'` 被翻译层翻成了 `'VS'` —— 一个**误读**经过翻译被加固成
+        一个像样的词，再重绘到立绘上。用户永远不会知道那里本来没有字。
+        （本项目的硬约束是"贴图文字绝不来自生成模型"，但误读同样属于
+        "往画面上加了原本不存在的东西"。）
+
+        ## 两条判据，缺一不可
+
+        1. **单字符一律不接受**。上表四条全是单字符。游戏 UI 里真有独立
+           数字的情况（分数、金币）几乎都以变量渲染在引擎文本层，不是
+           烘焙进贴图；为极少数例外放过这类块，代价就是上面的 `VS`。
+        2. **多字符块占画面超过 85% 判为幻觉**。整张图都是一块"文字"
+           在立绘上必然是把画面本身当成了字。
+
+        注意判据 2 的阈值定得**很宽**（85%），因为实测
+        `system/Loading.png`（400x100）的 `Now Loading...` 一个块就占
+        **44%** —— 那张图本身就是一条 loading 条。占比不能用来卡真文字，
+        卡住立绘幻觉的是判据 1。这就是为什么两条各自独立、阈值都很保守。
+        """
+        text = str(getattr(block, "source", "") or "")
+        if not text.strip():
+            return False
+
+        # 判据 1：单字符
+        if len(text.strip()) < 2:
+            return False
+
+        # 判据 2：区域占比（很宽的阈值，只挡"整张图当成一块字"）
+        box = getattr(block, "box", None)
+        if box and len(box) == 4 and img_w > 0 and img_h > 0:
+            bw = max(0, int(box[2]) - int(box[0]))
+            bh = max(0, int(box[3]) - int(box[1]))
+            if bw <= 0 or bh <= 0:
+                return False
+            if (bw * bh) / float(img_w * img_h) > _MAX_BLOCK_AREA_FRAC:
+                return False
+        return True
+
     def process(
         self,
         image_path: str | Path,
@@ -413,6 +481,23 @@ class TextureTranslator:
             b for b in blocks
             if (b.box[2] - b.box[0]) >= min_box and (b.box[3] - b.box[1]) >= min_box
         ]
+
+        # ---- 1a. 挡住"立绘上读出的单字符"这类幻觉 ----
+        # 实测：真实游戏的人物立绘被读出 '2' / 'S' / '0'，
+        # 其中 '0' 被翻译成 'VS' 并重绘进画面。见 `_is_plausible_text_block`。
+        kept: list[Any] = []
+        dropped: list[str] = []
+        for b in blocks:
+            if self._is_plausible_text_block(b, asset.width, asset.height):
+                kept.append(b)
+            else:
+                dropped.append(str(getattr(b, "source", ""))[:20])
+        if dropped:
+            result.warnings.append(
+                f"跳过 {len(dropped)} 个疑似幻觉文字块（单字符或占画面过大）："
+                + "、".join(repr(d) for d in dropped[:8])
+            )
+        blocks = kept
 
         # ---- 1b. 视觉兜底：只对低置信度的块重读文字，不改框 ----
         # 专用 OCR 在定位上碾压 VLM（旋转文本 Hmean 93.8 vs 2.1），

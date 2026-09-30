@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from .sanitize import sanitize_for_json, sanitize_tree
+
 log = logging.getLogger(__name__)
 
 
@@ -76,6 +78,14 @@ class OllamaClient:
 
     def _request(self, method: str, path: str, **kw: Any) -> Any:
         url = f"{self.host}{path}"
+        # 编码边界净化：httpx 的 `json=` 会先 json.dumps(...).encode("utf-8")，
+        # 而孤立代理项在 UTF-8 里**没有合法表示**，于是会在发请求之前抛
+        # UnicodeEncodeError。它继承自 ValueError，调用方的
+        # `except (ProviderError, OllamaError, ...)` 接不住，会一路逃出
+        # translate_batch，让整轮（实测 27 分钟）翻译作废。
+        # 见 `novaloc.translate.sanitize` 的模块文档。
+        if "json" in kw:
+            kw["json"] = sanitize_tree(kw["json"])
         try:
             resp = self.client.request(method, url, **kw)
         except httpx.ConnectError as exc:
@@ -84,6 +94,12 @@ class OllamaClient:
             ) from exc
         except httpx.TimeoutException as exc:
             raise OllamaError(f"请求 Ollama 超时（{path}）：{exc}") from exc
+        except UnicodeEncodeError as exc:
+            # 兜底：万一有别的路径绕过了上面的净化，也不要把
+            # UnicodeEncodeError 漏给调用方（它会被重试层忽略）。
+            raise OllamaError(
+                f"请求体含无法编码的字符（孤立代理项），已拒绝发送：{exc}"
+            ) from exc
 
         if resp.status_code == 404:
             body = _safe_json(resp)
@@ -206,8 +222,11 @@ class OllamaClient:
             raise OllamaError(str(data["error"]))
 
         content = (data.get("message") or {}).get("content", "")
+        # 出站净化：模型偶尔把 `\uddd1` 当字面量吐出来，json.loads 会忠实
+        # 还原成一个孤立代理项。不清理的话它会被当作下一批的输入发回去，
+        # 于是同一处错误反复出现（实测 批 11/39/36/1 都报同一个字符）。
         return ChatResult(
-            text=content,
+            text=sanitize_for_json(content),
             model=data.get("model", model),
             done_reason=data.get("done_reason", ""),
             eval_count=data.get("eval_count", 0),
