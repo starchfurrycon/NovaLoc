@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import tomllib
 from pathlib import Path
@@ -14,6 +16,8 @@ import tomli_w
 from pydantic import BaseModel, Field
 
 from . import paths
+
+log = logging.getLogger(__name__)
 
 
 class OllamaConfig(BaseModel):
@@ -205,24 +209,67 @@ class Config(BaseModel):
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:
-        p = path or paths.config_file()
-        cfg = cls()
-        if p.exists():
+        """读取配置。
+
+        **单一事实来源是 ``<data_root>/config.json``（JSON）**。
+
+        早先这里默认读写 ``<config_dir>/config.toml``（TOML），而 API 层
+        （``api/jobs.py``）和 CLI 读写 ``<data_root>/config.json``（JSON）——
+        同一份配置有两个位置、两种格式。后果是用户在网页设置里改的项，
+        命令行 ``novaloc config show`` 看不到，反之亦然；两边各自保存还会
+        互相覆盖（同一个 JSON 路径，一边用 tomli_w 写、一边用
+        model_dump_json 写）。
+
+        现在统一到 JSON：
+        1. ``<data_root>/config.json`` —— 权威位置；
+        2. 找不到时回退读旧的 ``<config_dir>/config.toml``，**并自动迁移**
+           成 JSON，老用户不丢配置。
+        """
+        # 1) 权威：JSON
+        j = path if (path is not None and path.suffix == ".json") else paths.config_json()
+        if j.is_file():
             try:
-                raw = tomllib.loads(p.read_text(encoding="utf-8"))
+                cfg = cls.model_validate_json(j.read_text(encoding="utf-8"))
+                cfg.data_root = str(paths.data_root())
+                cfg._apply_env()
+                return cfg
+            except Exception as exc:  # noqa: BLE001
+                log.warning("配置文件损坏，改用默认配置：%s", exc)
+
+        # 2) 回退：旧 TOML，读到就迁移
+        legacy = path or paths.config_file()
+        if legacy.is_file():
+            try:
+                raw = tomllib.loads(legacy.read_text(encoding="utf-8"))
                 cfg = cls.model_validate(raw)
+                cfg.data_root = str(paths.data_root())
+                cfg._apply_env()
+                try:
+                    cfg.save()
+                    log.info("已把旧配置 %s 迁移为 %s", legacy, paths.config_json())
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("旧配置迁移失败（不影响本次运行）：%s", exc)
+                return cfg
             except Exception:  # 配置坏了不能让程序起不来
-                cfg = cls()
+                pass
+
+        cfg = cls()
         cfg.data_root = str(paths.data_root())
         cfg._apply_env()
         return cfg
 
     def save(self, path: Path | None = None) -> Path:
-        p = path or paths.config_file()
+        """写出配置。默认写权威位置 ``<data_root>/config.json``。"""
+        p = path or paths.config_json()
         data = self.model_dump(mode="json")
         data.pop("data_root", None)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(tomli_w.dumps(data).encode("utf-8"))
+        if p.suffix == ".json":
+            p.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        else:
+            p.write_bytes(tomli_w.dumps(data).encode("utf-8"))
         return p
 
     def _apply_env(self) -> None:

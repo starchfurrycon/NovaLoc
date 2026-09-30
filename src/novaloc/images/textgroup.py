@@ -243,7 +243,11 @@ def allocate_translation(group: TextGroup, translated: str) -> list[tuple[ImageT
             for i, b in enumerate(group.blocks)
         ]
 
-    return list(zip(group.blocks, pieces))
+    # pieces 与 group.blocks 严格一一对应（上面按 block 逐一 append），
+    # 这里用 strict=True 把它变成**断言**：万一将来有人改动了切分逻辑
+    # 让两者长度不等，立刻抛错，而不是被 zip 静默截断 ——
+    # 截断的后果是某些文字块拿不到译文，图上留下原始外文。
+    return list(zip(group.blocks, pieces, strict=True))
 
 
 def _cut_points(text: str, expected_parts: int) -> list[int]:

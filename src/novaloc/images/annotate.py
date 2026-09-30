@@ -16,8 +16,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 
@@ -55,16 +56,21 @@ def _draw_corners(
     h, w = arr.shape[:2]
     pts = [(int(round(x)), int(round(y))) for x, y in quad]
     for i in range(4):
-        x0, y0 = pts[i]
-        x1, y1 = pts[(i + 1) % 4]
-        # 从每个顶点出发沿两条边各画 22% 的长度
+        # 从每个顶点出发沿两条边各画一段角标
         for (ax, ay), (bx, by) in ((pts[(i - 1) % 4], pts[i]), (pts[i], pts[(i + 1) % 4])):
             dx, dy = bx - ax, by - ay
-            length = max(1.0, (dx * dx + dy * dy) ** 0.5)
-            seg = 0.22
-            ex, ey = int(round(ax + dx * seg)), int(round(ay + dy * seg))
+            length = (dx * dx + dy * dy) ** 0.5
+            # 角标长度 = 22% 边长，但**至少 3 像素**。
+            # 早先这里算出了 length 却没用（ruff F841），一律硬编码 22%；
+            # 于是小框（OCR 出的小字，边长只有 1~3 像素）画出来的角标
+            # 不足 1 像素，取整后退化成同一个点 —— 框"画了但看不见"，
+            # 审校页面一片空白，用户以为这张图没检出任何文字。
+            seg_len = min(length, max(length * 0.22, 3.0))
+            if length <= 0:
+                continue
+            k = seg_len / length
+            ex, ey = int(round(ax + dx * k)), int(round(ay + dy * k))
             _line(arr, ax, ay, ex, ey, color, thick, h, w)
-        del x0, y0, x1, y1
 
 
 def _line(

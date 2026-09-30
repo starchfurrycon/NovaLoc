@@ -1885,6 +1885,27 @@ def serve(
         )
         raise typer.Exit(code=1) from None
 
+    if reload:
+        # uvicorn 的 --reload 需要**可导入字符串**才能起子进程重新导入代码。
+        # 传 app 实例时它只打一行 warning 然后**静默忽略** reload
+        # （"You must pass the application as an import string to enable
+        # 'reload' or 'workers'"）—— 用户以为开了热重载，其实没有。
+        # 这里改传工厂字符串，并让 uvicorn 自己调 create_app()。
+        target = "novaloc.api.app:create_app"
+        console.print("[dim]开发模式：热重载已启用。[/dim]")
+        try:
+            uvicorn.run(
+                target,
+                factory=True,
+                host=bind_host,
+                port=bind_port,
+                reload=True,
+                log_level="info",
+            )
+        except KeyboardInterrupt:
+            console.print("\n[yellow]已停止。[/yellow]")
+        return
+
     try:
         application = create_app()
     except Exception as exc:  # noqa: BLE001
@@ -1901,7 +1922,7 @@ def serve(
             pass
 
     try:
-        uvicorn.run(application, host=bind_host, port=bind_port, reload=reload, log_level="info")
+        uvicorn.run(application, host=bind_host, port=bind_port, log_level="info")
     except KeyboardInterrupt:
         console.print("\n[yellow]已停止。[/yellow]")
 
@@ -2024,10 +2045,12 @@ def ollama_pull(
         ) as prog:
             tid = prog.add_task(model, total=100.0)
 
-            def on_progress(obj: dict[str, Any], _tid: Any = tid) -> None:
+            def on_progress(
+                obj: dict[str, Any], _tid: Any = tid, _model: str = model
+            ) -> None:
                 nonlocal total_mb, last_line
                 if obj.get("error"):
-                    prog.update(_tid, description=f"[red]{model} 失败[/red]")
+                    prog.update(_tid, description=f"[red]{_model} 失败[/red]")
                     return
                 if obj.get("status") is None:
                     return
@@ -2039,7 +2062,7 @@ def ollama_pull(
                 line = ollama_setup.format_pull_line(obj)
                 if line != last_line:
                     last_line = line
-                    prog.update(_tid, description=f"{model} · {line[:70]}")
+                    prog.update(_tid, description=f"{_model} · {line[:70]}")
 
             ok = ollama_setup.pull_model(model, url, on_progress=on_progress)
             prog.update(tid, completed=100.0 if ok else 0.0)

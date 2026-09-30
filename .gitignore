@@ -61,3 +61,23 @@ out_*/
 
 # --- 开发脚手架（不入库） ---
 .scratch/
+
+# --- 测试夹具的字体与产物 ---
+# 字体文件**不入库**：两个 CJK TTF 就有 21 MB，而且各自带独立许可证
+# （LXGW Neo XiHei 是 IPA-1.0，不可再分发；WenKai 是 OFL-1.1）。
+# 把字体塞进仓库既撑大体积又可能违反许可。缺失时相关测试会 skip，
+# 需要跑的人按 tests/README.md 把字体放进 tests/fixtures/fonts/ 即可。
+tests/fixtures/fonts/
+# 测试跑出来的中间产物（合并字体、重建贴图等），每次运行都会重建
+tests/fixtures/out*/
+tests/fixtures/tex_test/
+tests/fixtures/pipe_test/
+tests/fixtures/fontsvc/
+tests/fixtures/*_out/
+tests/fixtures/*_out2/
+tests/fixtures/*_out3/
+# `wire_*` 是字体接线测试**运行时**从测试模板复制出来的游戏副本，
+# 不是需要入库的素材（原始模板也在同一目录下，见 wire_mv / wire_renpy）。
+tests/fixtures/wire_*/
+tests/fixtures/_wire/
+tests/fixtures/arwes-test/

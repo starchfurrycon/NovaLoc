@@ -19,16 +19,14 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
-from typing import Any
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from ..models import TextBlockStyle
-from .ocr_ppocrv6 import order_quad, quad_geometry
+from .ocr_ppocrv6 import order_quad
 
 log = logging.getLogger(__name__)
 

@@ -36,7 +36,7 @@ import logging
 import re
 from pathlib import Path
 
-from ..core.registry import Context, register
+from ..core.registry import register
 from ..models import ExtractReport, FontCoverage, TextKind, TextLocation, TextUnit
 from .base import ApplyResult, EngineAdapter, EngineInfo
 

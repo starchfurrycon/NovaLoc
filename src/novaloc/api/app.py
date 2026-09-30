@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -19,13 +18,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from ..core import paths
 from ..core.events import Event, EventBus
-from ..core.registry import Context, Providers
+from ..core.registry import Context
 from ..core.workspace import Workspace
 from ..engines import available_engines, detect_engine
-from ..models import EntryStatus, ImageAsset, TranslationEntry
-from ..pipeline import Pipeline, PipelineError, STAGES, STAGE_LABELS, run_qa
+from ..models import EntryStatus, TranslationEntry
+from ..pipeline import STAGE_LABELS, STAGES, Pipeline
 from .jobs import Job, JobManager, load_config, save_config
 
 log = logging.getLogger(__name__)
@@ -647,7 +645,6 @@ def create_app() -> FastAPI:
             return
 
         # 先把历史事件补发一遍：用户中途刷新页面也能看到完整进度
-        sent = 0
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
@@ -660,7 +657,6 @@ def create_app() -> FastAPI:
 
         for ev in job.events():
             await websocket.send_json(ev)
-            sent += 1
 
         unsub = job.bus.subscribe(on_event)
         try:

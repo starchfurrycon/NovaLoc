@@ -38,6 +38,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ..core.paths import bundled_fonts_dir, fonts_dir
 from ..core.registry import Context
@@ -52,7 +53,7 @@ from .charset import (
 )
 from .coverage import load_font_info
 from .downloader import download
-from .merge import MergeReport, merge_fonts_multi, replace_with_font, subset_font_for_chars
+from .merge import MergeReport, merge_fonts_multi, subset_font_for_chars
 from .qa import FontQAReport, verify_font
 
 log = logging.getLogger(__name__)
@@ -109,6 +110,67 @@ class PatchResult:
         if self.qa:
             bits.append("QA 通过" if self.qa.ok else f"QA 有 {len(self.qa.issues)} 项问题")
         return "  ".join(bits)
+
+
+#: 系统字体的进程级索引缓存。
+#: 键是"各系统字体目录的 mtime 摘要"，值是 ``[{path, family, cmap}]``。
+#: 目的：把"每次按家族名找字体都要 rglob + 解析整个字体目录"
+#: （实测 0.3~1.5 秒/次）降为**一次**扫描。
+#: 系统字体目录列表复用 :func:`..fonts.coverage.system_font_dirs`，
+#: 不再重复实现一份平台判断（早先差点写出两份不一致的实现）。
+_SYSTEM_FONT_INDEX: dict[str, list[dict[str, Any]]] = {}
+
+
+def _system_font_index(*, refresh: bool = False) -> list[dict[str, Any]]:
+    """扫描系统字体目录并缓存。返回 ``[{path, family, cmap}, ...]``。
+
+    缓存键用各目录 mtime 拼成：用户装了新字体会让目录 mtime 变化，
+    自动失效重扫；否则一次进程内只扫一遍。
+    """
+    from .coverage import system_font_dirs
+
+    use = system_font_dirs()
+    try:
+        stamp = "|".join(f"{d}:{int(d.stat().st_mtime)}" for d in use)
+    except OSError:
+        stamp = "|".join(str(d) for d in use)
+    key = f"{stamp}|{len(use)}"
+    if not refresh and key in _SYSTEM_FONT_INDEX:
+        return _SYSTEM_FONT_INDEX[key]
+
+    index: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for d in use:
+        try:
+            files = sorted(d.rglob("*"))
+        except OSError:
+            continue
+        for f in files:
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in (".ttf", ".otf", ".ttc", ".otc"):
+                continue
+            try:
+                rp = str(f.resolve())
+            except OSError:
+                continue
+            if rp in seen:
+                continue
+            seen.add(rp)
+            try:
+                info = load_font_info(f)
+            except Exception:  # noqa: BLE001
+                continue
+            if info is None:
+                continue
+            index.append({
+                "path": f,
+                "family": info.family or "",
+                "cmap": info.cmap or {},
+            })
+    _SYSTEM_FONT_INDEX.clear()
+    _SYSTEM_FONT_INDEX[key] = index
+    return index
 
 
 class FontService:
@@ -218,27 +280,59 @@ class FontService:
 
     def _find_system_font(self, family: str) -> Path | None:
         """在系统字体目录里按家族名找。找不到返回 None。"""
-        import platform
-
-        dirs: list[Path] = []
-        if platform.system() == "Windows":
-            dirs.append(Path(r"C:\Windows\Fonts"))
-        elif platform.system() == "Darwin":
-            dirs = [Path("/System/Library/Fonts"), Path("/Library/Fonts")]
-        else:
-            dirs = [Path("/usr/share/fonts"), Path("/usr/local/share/fonts")]
-        for d in dirs:
-            if not d.is_dir():
-                continue
-            for f in d.rglob("*"):
-                if f.is_file() and f.suffix.lower() in (".ttf", ".otf", ".ttc", ".otc"):
-                    if self._family_matches(f, family):
-                        return f
+        for info in _system_font_index():
+            if family.lower() in info["family"].lower():
+                return info["path"]
         return None
 
+    def find_preferred_cjk_font(self, families: list[str] | None = None) -> Path | None:
+        """**一次扫描**挑出最合适的中文字体。
+
+        为什么必须一次扫描：``_find_system_font`` 每次都要 rglob 整个系统
+        字体目录并逐个解析 name 表（实测 0.3~1.5 秒/次）。贴图管线要为
+        十几二十个家族名各找一个字体，逐次调用就是**每张图十几秒**的纯浪费，
+        而且是每个阶段都重复付。
+
+        返回第一个匹配到的家族；都不匹配时，退而返回任何能覆盖
+        "游戏常用汉字+符号" 的已装字体。
+        """
+        index = _system_font_index()
+        for fam in (families or []):
+            if not fam:
+                continue
+            low = fam.lower()
+            for info in index:
+                if low in info["family"].lower():
+                    return info["path"]
+        # 兜底：挑一个汉字覆盖最好的
+        best: tuple[int, Path] | None = None
+        probe = "你好世界游戏开始设置退出攻击生命魔法金币确定取消"
+        for info in index:
+            cmap = info.get("cmap") or {}
+            hits = sum(1 for c in probe if ord(c) in cmap)
+            if hits and (best is None or hits > best[0]):
+                best = (hits, info["path"])
+        if best and best[0] >= len(probe) * 0.8:
+            return best[1]
+        return None
+
+
     def supplement_candidates(self, base_font: Path | None = None) -> list[Path]:
-        """可用的补充字体候选（按风格优先级排序）。"""
+        """可用的补充字体候选（按风格优先级排序）。
+
+        搜索范围：随包字体目录 → ``<data_root>/fonts/cache`` →
+        ``<data_root>/fonts`` 根目录 → 系统字体。
+
+        早先漏了 ``fonts/`` **根目录**：用户按文档把字体丢进
+        ``D:\\NovaLoc\\fonts\\`` 却完全不生效，而 ``fonts/cache``
+        反而在扫描范围内 —— 表现是"我明明放了字体，工具说没有"。
+        """
         cands = default_supplement_candidates(bundled_fonts_dir(), [self._font_cache_dir()])
+        # fonts/ 根目录（用户手工放字体的地方）
+        root = fonts_dir()
+        for p in sorted(root.glob("*.tt[fc]")) + sorted(root.glob("*.ot[fc]")):
+            if p.is_file() and p not in cands:
+                cands.append(p)
         # 把配置里指定的字体排到前面，保证风格优先
         prefer = [
             getattr(self.cfg.font, "ui_font", ""),
@@ -317,6 +411,35 @@ class FontService:
 
         # ---- 规划 ----
         cands = candidates if candidates is not None else self.supplement_candidates(base_font)
+
+        # 基准字体**不能**当自己的补充候选。
+        # 否则规划器会看到"所有缺字都能被覆盖"（其实就是基准字体自己），
+        # 于是判定 100% 覆盖、source_paths 为空，随后合并阶段发现
+        # "没有任何补充字体提供缺失字形"而报错 —— 一个纯粹自相矛盾的失败。
+        # 而 `supplement_candidates()` 的扫描目录里**天然包含**基准字体
+        # （用户把游戏原字体放进了 fonts/ 或 fonts/cache/），所以这不是
+        # 假设性问题，是必然踩到的路径。
+        try:
+            base_resolved = base_font.resolve()
+        except OSError:
+            base_resolved = base_font
+        cands = [
+            c for c in cands
+            if (c.resolve() if c.exists() else c) != base_resolved
+        ]
+        # 去重但保持顺序（同一字体可能同时出现在 cache 与 fonts/ 根目录）
+        seen_c: set[str] = set()
+        uniq: list[Path] = []
+        for c in cands:
+            try:
+                k = str(c.resolve())
+            except OSError:
+                k = str(c)
+            if k not in seen_c:
+                seen_c.add(k)
+                uniq.append(c)
+        cands = uniq
+
         # 需要联网获取的字体：**只考虑可再分发的**
         # （OFL/Apache/MIT/公有领域）。IPA、CC-BY-ND 以及微软/华为等
         # 系统字体只允许本机已装的情况下使用，绝不自动下载。

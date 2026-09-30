@@ -86,7 +86,7 @@ _STOPWORDS = {
     "what", "when", "where", "which", "there", "their", "them", "then", "than",
     "into", "onto", "over", "under", "about", "after", "before", "again",
     "yes", "no", "not", "but", "for", "are", "was", "were", "his", "her",
-    "she", "him", "they", "them", "our", "out", "one", "two", "all", "any",
+    "she", "him", "they", "our", "out", "one", "two", "all", "any",
     "can", "could", "would", "should", "must", "may", "might", "just", "only",
     "very", "more", "most", "some", "such", "each", "every", "both", "few",
     "press", "click", "select", "cancel", "back", "next", "start", "load",

@@ -32,8 +32,8 @@ from fontTools.merge import Merger
 from fontTools.subset import Options as SubsetOptions
 from fontTools.subset import Subsetter
 from fontTools.ttLib import TTFont
-from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 from fontTools.ttLib.scaleUpem import scale_upem
+from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
 from .coverage import load_font_info
 
@@ -214,7 +214,7 @@ def rename_glyphs(font: TTFont, prefix: str) -> dict[str, str]:
         try:
             top = font[tag].cff.topDictIndex[0]
             cs = top.CharStrings
-            cs.glyphOrder = [mapping.get(n, n) for n in cs.keys()]
+            cs.glyphOrder = [mapping.get(n, n) for n in cs]
             top.charset = [mapping.get(n, n) for n in top.charset]
             if hasattr(top, "FDArray"):
                 for fd in top.FDArray:
@@ -497,6 +497,14 @@ def merge_fonts(
 
     ``required_chars`` 必须是**项目实际会用到的全部字符**（来自译文 + 界面符号），
     而不是抽样 —— 抽样会漏字，漏字就是口口口。
+
+    .. deprecated:: 0.1.0
+       这是"单个补充字体"的早期形态，**产品代码已不再调用它**
+       （``FontService.patch_font`` 走 :func:`merge_fonts_multi`）。
+       保留仅为公开 API 兼容（``fonts/__init__.py`` 有导出）。
+       新代码请用 :func:`merge_fonts_multi` —— 它支持多个补充字体、
+       探测每个字体能提供哪些字符、并按 UPEM 换算垂直度量。
+       单一补充字体在实际游戏里不够用：实测最好的单字体只有 98.33% 覆盖。
     """
     report = MergeReport(ok=False, method="merge")
     required = set(required_chars) | set(extra_symbols)

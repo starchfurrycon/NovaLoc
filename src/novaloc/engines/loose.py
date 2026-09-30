@@ -20,7 +20,7 @@ import logging
 import re
 from pathlib import Path
 
-from ..core.registry import Context, register
+from ..core.registry import register
 from ..models import ExtractReport, FontCoverage, ImageAsset, TextKind, TextLocation, TextUnit
 from .base import ApplyResult, EngineAdapter, EngineInfo
 
@@ -54,7 +54,7 @@ class LooseFilesAdapter(EngineAdapter):
         n_img = 0
         n_txt = 0
         # 只看两层，避免在超大素材库上耗时
-        for depth, pattern in ((1, "*"), (2, "*/*")):
+        for pattern in ("*", "*/*"):
             for p in game_dir.glob(pattern):
                 if not p.is_file():
                     continue

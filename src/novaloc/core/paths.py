@@ -105,7 +105,20 @@ def bundled_fonts_dir() -> Path:
     return Path(__file__).resolve().parent / "assets" / "fonts"
 
 
+def config_json() -> Path:
+    """**权威**配置文件：``<data_root>/config.json``。
+
+    配置和游戏数据一起放在大分区上（C 盘常年吃紧），
+    网页设置页、CLI、以及核心 :class:`..core.config.Config` 都读写这一个文件。
+    """
+    return data_root() / "config.json"
+
+
 def config_file() -> Path:
+    """旧版 TOML 配置位置，仅用于向后兼容读取与一次性迁移。
+
+    新代码请用 :func:`config_json`。
+    """
     return config_dir() / "config.toml"
 
 

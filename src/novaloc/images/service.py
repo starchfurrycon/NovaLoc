@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -42,7 +43,7 @@ from ..models import (
 )
 from .inpaint import InpaintResult, inpaint_boxes, load_lama
 from .io import imread_bgr, imwrite_bgr
-from .ocr_ppocrv6 import PPOcrV6Engine, as_rgb_array
+from .ocr_ppocrv6 import PPOcrV6Engine
 from .render import (
     BlockRender,
     detect_stroke,
@@ -50,7 +51,7 @@ from .render import (
     paste_quad,
     render_text_block_checked,
 )
-from .textgroup import TextGroup, allocate_translation, group_blocks
+from .textgroup import allocate_translation, group_blocks
 
 log = logging.getLogger(__name__)
 
@@ -506,7 +507,19 @@ class TextureTranslator:
         # 纯文本。早先这里直接把结果当字符串用，导致 ``.strip()`` 抛
         # AttributeError，异常又被上层吞掉，表现为"一张贴图都没汉化"，
         # 极难排查。所以这里统一做一次归一化，两种形态都接受。
-        for (i, _t), res in zip(pending, results):
+        #
+        # 数量必须对齐：``zip`` 在长度不等时**静默截断**，
+        # 于是译文会被贴到**错误的文字块**上 —— 图上出现别的按钮的台词，
+        # 而且不报任何错。内置 provider 会预填等长列表（见
+        # ``translate_batch`` 的 ``out = [self._blank(it) for it in items]``），
+        # 但外部/自定义回调没有这个保证，所以这里显式检查并告警。
+        if len(results) != len(pending):
+            log.warning(
+                "翻译回调返回 %d 条，但请求了 %d 条（贴图 %s）："
+                "长度不一致，已按最小长度对齐，多出的文字块保持未翻译",
+                len(results), len(pending), path.name,
+            )
+        for (i, _t), res in zip(pending, results, strict=False):
             text = self._entry_text(res)
             if text:
                 out[i] = text
@@ -526,30 +539,78 @@ class TextureTranslator:
         return str(res).strip()
 
     def _pick_font(self) -> str:
-        """挑一个中文字体用于重绘。
+        """挑一个中文字体用于重绘，返回**字体文件路径**。
 
-        优先级：配置指定的显示字体 → 系统常见中文字体。
-        找不到就抛错 —— 没有中文字体就绝对不该往图里画字。
+        优先级：
+        1. 配置里 ``font.ui_font`` / ``font.display_font`` / ``font.dialog_font``
+           指定的家族 —— 先在本机已装字体里按家族名找，再走字体目录
+           （必要时下载可再分发的 OFL 字体）；
+        2. 本机已装的中文字体（系统字体，只在本机使用、不打包）；
+        3. 字体缓存里的可再分发中文字体。
+
+        找不到就抛错 —— **没有中文字体就绝对不该往图里画字**，
+        否则画出来的是方块甚至空白。
+
+        早先这里读 ``FontSpec.local_path`` 这个**不存在的字段**，
+        ``getattr`` 带默认值所以永远拿到空串，目录查找分支从不执行，
+        实际总是落到下面那串硬编码的 Windows 路径上 —— 非 Windows
+        直接报"找不到可用的中文字体"。改为走 ``FontService`` 解析。
         """
         from ..fonts.catalog import find_by_family
+        from ..fonts.service import FontService
 
-        want = getattr(self.cfg.font, "display_font", "") or getattr(self.cfg.font, "ui_font", "")
-        spec = find_by_family(want) if want else None
-        if spec is not None:
-            local = Path(getattr(spec, "local_path", "") or "")
-            if local.is_file():
-                return str(local)
+        svc = FontService(self.ctx)
 
-        for cand in (
-            r"C:\Windows\Fonts\msyhbd.ttc",
-            r"C:\Windows\Fonts\msyh.ttc",
-            r"C:\Windows\Fonts\simhei.ttf",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
-        ):
+        # half 指的是字重倾向：标题/按钮常用粗体
+        want = (
+            getattr(self.cfg.font, "display_font", "")
+            or getattr(self.cfg.font, "ui_font", "")
+            or getattr(self.cfg.font, "dialog_font", "")
+        )
+
+        tried: list[str] = []
+        if want:
+            spec = find_by_family(want)
+            if spec is not None:
+                tried.append(spec.id)
+                # 本机已装？
+                for fam in (spec.family, spec.display_zh, want):
+                    if not fam:
+                        continue
+                    local = svc._find_system_font(fam)
+                    if local is not None:
+                        return str(local)
+                # 缓存 / 可再分发下载
+                try:
+                    got = svc.ensure_font(spec)
+                except Exception as exc:  # noqa: BLE001
+                    log.info("按配置获取字体 %s 失败：%s", spec.id, exc)
+                    got = None
+                if got is not None and Path(got).is_file():
+                    return str(got)
+
+        # 本机系统字体（不打包，仅本机渲染使用）。
+        # 用 find_preferred_cjk_font **一次**选完，不再逐个家族名调用 ——
+        # 后者即使有索引缓存也要遍历十几遍，贴在每张图上就是白付的开销。
+        local = svc.find_preferred_cjk_font([
+            "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", "DengXian", "等线",
+            "Source Han Sans SC", "Noto Sans CJK SC", "Noto Sans SC",
+            "PingFang SC", "WenQuanYi Micro Hei", "LXGW WenKai GB Screen",
+            "LXGW Neo XiHei", "MS Gothic", "Yu Gothic",
+        ])
+        if local is not None:
+            return str(local)
+
+        # 最后：字体缓存里任何可用的中文字体（含补充候选池）
+        for cand in svc.supplement_candidates(None):
             if Path(cand).is_file():
-                return cand
-        raise RuntimeError("找不到可用的中文字体，拒绝在贴图上绘制中文")
+                return str(cand)
+
+        raise RuntimeError(
+            "找不到可用的中文字体，拒绝在贴图上绘制中文"
+            + (f"（已尝试：{', '.join(tried)}）" if tried else "")
+            + "。请先在设置里指定 font.ui_font，或运行 `novaloc fonts list` 查看可下载字体。"
+        )
 
     def _draw_block(
         self,

@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 License = Literal["OFL-1.1", "Apache-2.0", "MIT", "IPA-1.0", "Public-Domain"]

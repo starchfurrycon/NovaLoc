@@ -47,22 +47,36 @@ def _windows_extra_paths() -> list[Path]:
     """Windows 上 Ollama 安装器实际会落到的位置。"""
     cands: list[Path] = []
 
-    local = os.environ.get("LOCALAPPDATA")
+    local = _getenv_any("LOCALAPPDATA", "LocalAppData")
     if local:
         cands.append(Path(local) / "Programs" / "Ollama" / "ollama.exe")
 
-    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    pf = _getenv_any("PROGRAMFILES", "ProgramFiles") or r"C:\Program Files"
     cands.append(Path(pf) / "Ollama" / "ollama.exe")
     # 32 位 PowerShell 下 ProgramFiles 会指向 x86，补一份以防万一
     cands.append(Path(r"C:\Program Files\Ollama\ollama.exe"))
 
-    home = os.environ.get("USERPROFILE")
+    home = _getenv_any("USERPROFILE", "UserProfile")
     if home:
         # 便携版（Ollama.Ollama.Portable）有时被解到用户目录
         cands.append(Path(home) / "Ollama" / "ollama.exe")
         cands.append(Path(home) / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe")
 
     return cands
+
+
+def _getenv_any(*names: str) -> str:
+    """按顺序取环境变量，兼容不同的键大小写形式。
+
+    Windows 环境变量名不区分大小写，但 ``os.environ`` 暴露的键大小写
+    取决于进程启动方式 —— 有的环境给 ``ProgramFiles``，有的给
+    ``PROGRAMFILES``。直接写死一种就会在某些机器上找不到路径。
+    """
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return ""
 
 
 def find_ollama() -> Path | None:
@@ -202,10 +216,7 @@ def install_hint() -> str:
 
 def _progress_changed(last: dict[str, Any], cur: dict[str, Any]) -> bool:
     """NDJSON 里大量行内容完全一样，过滤掉免得刷屏。"""
-    for k in ("status", "digest", "completed", "total"):
-        if last.get(k) != cur.get(k):
-            return True
-    return False
+    return any(last.get(k) != cur.get(k) for k in ("status", "digest", "completed", "total"))
 
 
 def pull_model(
@@ -331,7 +342,7 @@ RECOMMENDED_MODELS: tuple[tuple[str, str], ...] = (
 )
 
 #: 模型名 → 中文说明，便于其它模块按名字取提示。
-MODEL_NOTES: dict[str, str] = {name: note for name, note in RECOMMENDED_MODELS}
+MODEL_NOTES: dict[str, str] = dict(RECOMMENDED_MODELS)
 
 
 def recommended_names() -> list[str]:

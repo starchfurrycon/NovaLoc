@@ -445,9 +445,7 @@ class OllamaTranslationProvider:
                     cand = restored
                 g_old = guard(sources[i], cur, length_ratio=self.cfg.translate.max_chars_ratio, target_lang=target_lang)
                 g_new = guard(sources[i], cand, length_ratio=self.cfg.translate.max_chars_ratio, target_lang=target_lang)
-                if g_new.fatal and not g_old.fatal:
-                    out.append(cur)
-                elif len(g_new.warnings) > len(g_old.warnings):
+                if g_new.fatal and not g_old.fatal or len(g_new.warnings) > len(g_old.warnings):
                     out.append(cur)
                 else:
                     out.append(g_new.text)

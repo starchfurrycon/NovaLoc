@@ -31,7 +31,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ..core.registry import Context, register
+from ..core.registry import register
 from ..models import ExtractReport, FontCoverage, TextKind, TextLocation, TextUnit
 from .base import ApplyResult, EngineAdapter, EngineInfo
 
@@ -114,9 +114,7 @@ class UnityAdapter(EngineAdapter):
         for d in game_dir.iterdir():
             if not d.is_dir():
                 continue
-            if d.name.endswith("_Data"):
-                raw_roots.append(d)
-            elif d.name == "StreamingAssets":
+            if d.name.endswith("_Data") or d.name == "StreamingAssets":
                 raw_roots.append(d)
         resolved = sorted({r.resolve() for r in raw_roots})
         roots: list[Path] = []
@@ -481,7 +479,12 @@ class UnityAdapter(EngineAdapter):
             esc = src.replace("\\", "\\\\").replace('"', '\\"')
             pat = re.compile(r'(msgid\s+"' + re.escape(esc) + r'"\s*\n)(msgstr\s+"(?:[^"\\]|\\.)*")')
             new_val = tr[u.uid].replace("\\", "\\\\").replace('"', '\\"')
-            text, k = pat.subn(lambda m: m.group(1) + f'msgstr "{new_val}"', text, count=1)
+            # new_val 必须**绑定为默认参数**：否则 lambda 闭包捕获的是
+            # 循环变量本身，一旦将来有人把 subn 挪到循环外执行，
+            # 所有替换都会用最后一轮的 new_val —— 典型的迟绑定陷阱。
+            text, k = pat.subn(
+                lambda m, _v=new_val: m.group(1) + f'msgstr "{_v}"', text, count=1
+            )
             n += k
         if n:
             path.write_text(text, encoding="utf-8", newline="")

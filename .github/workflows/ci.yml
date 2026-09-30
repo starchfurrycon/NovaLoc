@@ -50,7 +50,9 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Ruff
-        run: ruff check src
+        # src 与 tests 都要查。tests 曾经完全没被 lint 过，
+        # 于是里面留了未用导入、歧义变量名（`l`）这类东西。
+        run: ruff check src tests
 
       - name: Import smoke test
         # 覆盖四个用户提到的顶层入口加上各子包与可选深层模块。
@@ -70,3 +72,15 @@ jobs:
         run: |
           novaloc --version
           novaloc --help
+
+      - name: Pytest（仅无需模型/GPU 的套件）
+        # 之前 CI **完全不跑 pytest**（理由见文件顶部注释：完整套件要模型和
+        # GPU）。但"完全不跑"的代价是：占位符、JSON 恢复、翻译链路守卫
+        # 这些**纯逻辑**测试也从没在 CI 上跑过，回归只能靠人肉发现。
+        #
+        # 这里用 marker 精确挑出不需要外部资源的套件。其余套件在本地跑：
+        #   .\.venv\Scripts\python.exe -m pytest tests -q
+        # 缺前提的套件（系统字体、DirectML、模型）会自行 skip 而不是失败，
+        # 所以即使在这里全跑也是安全的；但跳过一大片会让日志难以判读，
+        # 因此显式限定范围。
+        run: pytest tests -q -m "not needs_fonts and not needs_gpu and not needs_models"

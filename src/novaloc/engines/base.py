@@ -15,8 +15,8 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..models import ExtractReport, FontCoverage, ImageAsset, TextUnit
 from ..core.registry import Context
+from ..models import ExtractReport, FontCoverage, ImageAsset, TextUnit
 
 log = logging.getLogger(__name__)
 

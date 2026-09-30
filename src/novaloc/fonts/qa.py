@@ -240,52 +240,57 @@ def verify_font(
     present = [c for c in meaningful if info.has_char(c)]
 
     # ---- 2. 渲染检查（空白 / 豆腐块） ----
-    if check_tofu or True:
-        notdef = render_glyph(path, "\uFFFF", render_size)  # 未映射码点 → 走 .notdef
-        tofu_ref = notdef if (notdef is not None and notdef.sum() > 0) else None
+    # 豆腐块检查**故意无条件执行**：它是"防口口口"的核心闸门，
+    # 允许调用方关掉就等于允许交付一个全是方块的字体。
+    # 原先写作 `if check_tofu or True:` —— 恒真，参数形同虚设。
+    # 现在直接不判断：``check_tofu`` 保留在签名里仅为向后兼容，
+    # 传 False 也不会（也不应该）跳过检查。
+    _ = check_tofu
+    notdef = render_glyph(path, "\uFFFF", render_size)  # 未映射码点 → 走 .notdef
+    tofu_ref = notdef if (notdef is not None and notdef.sum() > 0) else None
 
-        masks: dict[str, np.ndarray] = {}
-        for c in present:
-            m = render_glyph(path, c, render_size)
-            if m is None:
-                rep.warnings.append("Pillow 无法渲染该字体，跳过字形渲染检查")
-                masks = {}
-                break
-            masks[c] = m
+    masks: dict[str, np.ndarray] = {}
+    for c in present:
+        m = render_glyph(path, c, render_size)
+        if m is None:
+            rep.warnings.append("Pillow 无法渲染该字体，跳过字形渲染检查")
+            masks = {}
+            break
+        masks[c] = m
 
+    for c, m in masks.items():
+        if m.sum() == 0:
+            rep.blank.append(c)
+            rep.issues.append(GlyphIssue(c, ord(c), "blank", "渲染为空白"))
+
+    if tofu_ref is not None:
         for c, m in masks.items():
             if m.sum() == 0:
-                rep.blank.append(c)
-                rep.issues.append(GlyphIssue(c, ord(c), "blank", "渲染为空白"))
+                continue
+            # 与 .notdef 完全一致 → 引擎在画豆腐块
+            if m.shape == tofu_ref.shape and np.array_equal(m, tofu_ref):
+                rep.tofu.append(c)
+                rep.issues.append(GlyphIssue(c, ord(c), "tofu", "渲染结果与 .notdef 相同"))
 
-        if check_tofu and tofu_ref is not None:
-            for c, m in masks.items():
-                if m.sum() == 0:
-                    continue
-                # 与 .notdef 完全一致 → 引擎在画豆腐块
-                if m.shape == tofu_ref.shape and np.array_equal(m, tofu_ref):
-                    rep.tofu.append(c)
-                    rep.issues.append(GlyphIssue(c, ord(c), "tofu", "渲染结果与 .notdef 相同"))
-
-        # ---- 3. 字形互不相同 ----
-        # 注意：仅仅"渲染结果相同"**不构成问题**。很多字符在设计上就共用一个
-        # 字形（`I`/`l`/`Ⅰ`/`Ｉ`、`°`/`。` 等），这是字体的正常行为。
-        # 真正的故障是"不同的码点被映射到**同一个 glyph id**"，那才是合并时
-        # 字形互相覆盖。所以这里直接查 cmap → gid。
-        if check_distinct:
-            collisions = _glyph_id_collisions(path, present)
-            if collisions:
-                sample = ["/".join(v[:4]) for v in collisions[:10]]
+    # ---- 3. 字形互不相同 ----
+    # 注意：仅仅"渲染结果相同"**不构成问题**。很多字符在设计上就共用一个
+    # 字形（`I`/`l`/`Ⅰ`/`Ｉ`、`°`/`。` 等），这是字体的正常行为。
+    # 真正的故障是"不同的码点被映射到**同一个 glyph id**"，那才是合并时
+    # 字形互相覆盖。所以这里直接查 cmap → gid。
+    if check_distinct:
+        collisions = _glyph_id_collisions(path, present)
+        if collisions:
+            sample = ["/".join(v[:4]) for v in collisions[:10]]
+            rep.warnings.append(
+                f"有 {len(collisions)} 组码点映射到同一 glyph id（字形可能被覆盖）：{sample}"
+            )
+        else:
+            shared = _shared_render_groups(present, render_glyph, render_size, path)
+            if shared:
                 rep.warnings.append(
-                    f"有 {len(collisions)} 组码点映射到同一 glyph id（字形可能被覆盖）：{sample}"
+                    f"提示：{len(shared)} 组字符渲染形状相同（多为设计上共用字形，非故障）："
+                    f"{['/'.join(v[:4]) for v in shared[:6]]}"
                 )
-            else:
-                shared = _shared_render_groups(present, render_glyph, render_size, path)
-                if shared:
-                    rep.warnings.append(
-                        f"提示：{len(shared)} 组字符渲染形状相同（多为设计上共用字形，非故障）："
-                        f"{['/'.join(v[:4]) for v in shared[:6]]}"
-                    )
 
     rep.ok = not (rep.missing or rep.blank or rep.tofu)
     return rep

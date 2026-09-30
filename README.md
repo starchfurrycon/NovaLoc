@@ -146,7 +146,16 @@ novaloc doctor      # 检查环境，会告诉你缺什么
 novaloc serve
 ```
 
-打开 http://127.0.0.1:8000 。
+浏览器会自动打开，默认地址是 **http://127.0.0.1:8791**
+（即配置里的 `ui.host` / `ui.port`）。想换端口：
+
+```powershell
+novaloc serve --port 9000
+```
+
+> 注意：`scripts/dev.ps1`（前端开发模式）用的是 **8000** 端口，
+> 因为 `web/vite.config.ts` 把 `/api` 与 `/ws` 代理到 8000。
+> 日常使用不需要 Node，用上面的 8791 即可 —— `web/dist` 已随仓库提供。
 
 ### 命令行
 

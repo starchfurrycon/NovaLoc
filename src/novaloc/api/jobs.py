@@ -23,15 +23,14 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..core.config import Config
 from ..core.events import Event, EventBus
 from ..core.registry import Context
-from ..core.workspace import Workspace
 
 log = logging.getLogger(__name__)
 
@@ -157,23 +156,22 @@ class JobManager:
 
 
 def load_config() -> Config:
-    from ..core import paths
+    """读取配置。
 
-    f = paths.data_root() / "config.json"
-    if f.is_file():
-        try:
-            return Config.model_validate_json(f.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("配置读取失败，改用默认配置：%s", exc)
-    return Config()
+    直接委托给 :meth:`Config.load` —— 配置的读写规则只应有**一处**实现。
+    早先这里自己拼 JSON 路径、自己 model_validate_json，与
+    ``Config.load()`` 的 TOML 路径各说各话，用户在网页改的设置命令行看不到。
+    """
+    try:
+        return Config.load()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("配置读取失败，改用默认配置：%s", exc)
+        return Config()
 
 
 def save_config(cfg: Config) -> None:
-    from ..core import paths
-
-    f = paths.data_root() / "config.json"
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(cfg.model_dump_json(indent=2), encoding="utf-8")
+    """写出配置（委托 :meth:`Config.save`，统一 JSON 位置与格式）。"""
+    cfg.save()
 
 
 __all__ = ["Job", "JobManager", "load_config", "save_config"]

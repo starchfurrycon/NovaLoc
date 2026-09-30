@@ -56,9 +56,7 @@ def clean_translation(text: str) -> str:
     t = _MD_FENCE_RE.sub("", t).strip()
     # 去掉整体包裹的成对引号
     for q in ('"', "'", "“”", "「」", "『』"):
-        if len(q) == 1 and len(t) >= 2 and t[0] == q and t[-1] == q:
-            t = t[1:-1].strip()
-        elif len(q) == 2 and len(t) >= 2 and t[0] == q[0] and t[-1] == q[1]:
+        if len(q) == 1 and len(t) >= 2 and t[0] == q and t[-1] == q or len(q) == 2 and len(t) >= 2 and t[0] == q[0] and t[-1] == q[1]:
             t = t[1:-1].strip()
     return t
 
@@ -109,9 +107,8 @@ def looks_untranslated(source: str, target: str) -> bool:
     if s == t:
         return True
 
-    if count_cjk(target) == 0 and has_latin(target):
-        return True
-    return False
+    # 译文一个汉字都没有、却还有拉丁字母 → 模型原样吐回来了
+    return count_cjk(target) == 0 and has_latin(target)
 
 
 def check_leak(target: str) -> list[str]:

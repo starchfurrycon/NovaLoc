@@ -189,17 +189,38 @@ class Providers:
         raise ProviderError("没有可用的翻译适配器：\n  " + "\n  ".join(errors or ["（未配置）"]))
 
     def diagnostics(self) -> dict[str, list[dict[str, Any]]]:
-        """给 UI 用的健康检查。"""
+        """给 UI 用的健康检查。
+
+        ``engine`` 是特例：适配器**没有** ``available()`` ——
+        引擎能不能用取决于"这个游戏是不是该引擎的"，而不是一个
+        全局可用性。早先这里对所有 kind 一律调 ``available()``，
+        于是每个引擎都被报成 ``available=False``，
+        detail 是 ``'RpgMakerAdapter' object has no attribute 'available'``。
+        用户看到"四个引擎全部不可用"会以为整个工具坏了。
+        """
         out: dict[str, list[dict[str, Any]]] = {}
         for kind in _REGISTRY:
             rows: list[dict[str, Any]] = []
             for name in self.names(kind):
+                if kind == "engine":
+                    # 引擎适配器：注册即"可用"，实际可用性在 detect() 时判定
+                    rows.append({
+                        "name": name,
+                        "available": True,
+                        "detail": "已注册（是否适用取决于目标游戏）",
+                    })
+                    continue
                 try:
                     inst = self.get(kind, name)
-                    ok, why = inst.available()
+                    fn = getattr(inst, "available", None)
+                    if not callable(fn):
+                        ok, why = True, "已注册"
+                    else:
+                        res = fn()
+                        ok, why = (res if isinstance(res, tuple) else (bool(res), ""))
                 except Exception as exc:  # noqa: BLE001
                     ok, why = False, str(exc)
-                rows.append({"name": name, "available": ok, "detail": why})
+                rows.append({"name": name, "available": bool(ok), "detail": why})
             out[kind] = rows
         return out
 

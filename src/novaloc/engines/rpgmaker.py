@@ -26,9 +26,9 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
-from ..core.registry import Context, register
+from ..core.registry import register
 from ..models import (
     ExtractReport,
     FontCoverage,

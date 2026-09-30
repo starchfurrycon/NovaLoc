@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-from ..core.registry import TranslateItem
 from ..models import TextKind
 
 #: 每种文本类型给模型的额外提示

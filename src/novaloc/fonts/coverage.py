@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,13 +103,19 @@ def _name_of(font: TTFont, name_id: int) -> str:
     try:
         for rec in font["name"].names:
             if rec.nameID == name_id:
-                for enc in ("utf-16-be", "utf-8", "latin-1"):
+                # 早先这里套了 ``for enc in ("utf-16-be","utf-8","latin-1")``，
+                # 但 ``rec.toUnicode()`` **不接受编码参数**，三次尝试做的事
+                # 完全一样 —— 成功则第一次就返回，失败则白失败三次。
+                # 改为尝试一次，失败再退回原始字节的宽松解码。
+                try:
+                    v = rec.toUnicode()
+                except Exception:  # noqa: BLE001
                     try:
-                        v = rec.toUnicode()
-                        if v:
-                            return v.strip()
+                        v = str(rec.string, "utf-8", "replace")
                     except Exception:  # noqa: BLE001
                         continue
+                if v and v.strip():
+                    return v.strip()
     except Exception:  # noqa: BLE001
         pass
     return ""

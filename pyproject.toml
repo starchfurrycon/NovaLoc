@@ -86,8 +86,29 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
-ignore = ["E501", "B008"]
+# E501：行宽由 formatter 控制，硬折行反而更难读。
+# B008：typer 的 `x: int = typer.Option(...)` 就是它推荐的写法。
+# SIM105/SIM102/SIM117 是纯风格偏好，不改语义：
+#   - SIM105 想让我把 `try/except/pass` 换成 `contextlib.suppress`。
+#     项目里这些地方**都带解释性注释**说明为什么吞掉异常
+#     （例如"事件循环已关闭"），换成 suppress 反而丢了上下文。
+#   - SIM102 合并嵌套 if 会超过 110 列，或把"先判空再判条件"的
+#     阅读顺序打散。
+#   - SIM117 合并 with 会让 `open(...) as f, some_ctx() as g` 这种
+#     长组合串成一行。
+ignore = ["E501", "B008", "SIM105", "SIM102", "SIM117"]
+
+[tool.ruff.lint.per-file-ignores]
+# UP042 建议 `class X(str, Enum)` → `enum.StrEnum`。本项目 target 是
+# py311+，迁移是安全的（全部调用点都走 `.value`），但 5 个枚举分散在
+# models.py，是一次独立的行为面改动（StrEnum 的 __str__ 返回取值而非
+# "TextKind.DIALOGUE"，会改变日志/调试输出）。留作单独一次改动，
+# 这里显式豁免而不是装作没这回事。
+"src/novaloc/models.py" = ["UP042"]
 
 [tool.pytest.ini_options]
+# 早先写的是 ["tests"]，但仓库里**没有 tests/ 目录** ——
+# pytest 会以 "no tests ran"（退出码 5）静默通过，CI 看起来是绿的
+# 其实一条测试都没跑。真实测试套件在 tests/ 下，见该目录 README。
 testpaths = ["tests"]
 asyncio_mode = "auto"

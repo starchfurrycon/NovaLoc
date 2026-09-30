@@ -20,9 +20,10 @@ from __future__ import annotations
 import logging
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..core.events import Event, EventBus, ProgressThrottle
 from ..core.registry import Context, TranslateItem
