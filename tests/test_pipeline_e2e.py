@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(ROOT / "src"))
 
 import pytest  # noqa: E402
+from _fake_game import build_fake_game  # noqa: E402
 
 from novaloc.core.config import Config  # noqa: E402
 from novaloc.core.events import EventBus  # noqa: E402
@@ -34,8 +36,19 @@ from novaloc.models import EntryStatus, Project, TranslationEntry  # noqa: E402
 from novaloc.pipeline import Pipeline, PipelineError, run_qa  # noqa: E402
 
 SB = FIXTURES
-GAME = SB / "rpgmaker_game"
 DATA = Path(r"D:\NovaLocData")  # 中间产物放到 D 盘，别占 C 盘
+
+
+def _game() -> Path:
+    """取合成游戏工程；没有就**自己造**（原因见 ``_fake_game.py``）。
+
+    ``tests/fixtures/rpgmaker_game/data`` 是 git-ignored 的，全新 clone
+    出来并不存在，以前只有 ``test_engine_rpgmaker.py`` 跑过之后才有 ——
+    也就是说本文件以前隐式依赖另一个套件先执行。
+    """
+    base = os.environ.get("NOVALOC_FAKE_GAME_DIR")
+    dest = Path(base) / "rpgmaker_game" if base else SB / "rpgmaker_game"
+    return build_fake_game(dest)
 
 
 def make_pipeline(ws: Workspace, ctx: Context, fake) -> Pipeline:
@@ -71,9 +84,9 @@ def main() -> int:
     def check(label: str, ok: bool, detail: str = "") -> None:
         checks.append((label, ok, detail))
 
-    if not GAME.exists():
-        print("缺少合成 RPG Maker 工程，请先跑 test_engine_rpgmaker.py")
-        return 1
+    # 自己造工程，不再依赖别的套件先跑过（以前这里会 print 提示后直接 return 1，
+    # 于是"单独跑本文件"永远是失败的，还会被误读成流水线坏了）
+    game = _game()
 
     # 每次从干净的工作区开始
     ws_root = DATA / "workspaces"
@@ -83,7 +96,7 @@ def main() -> int:
         shutil.rmtree(ws_dir)
     ws_root.mkdir(parents=True, exist_ok=True)
 
-    proj = Project(id=pid, name="流水线测试", game_dir=str(GAME))
+    proj = Project(id=pid, name="流水线测试", game_dir=str(game))
     ws = Workspace(proj, ws_dir)
     ws.save()
 
@@ -174,16 +187,28 @@ def main() -> int:
     r = pipe.stage_images_localize()
     print(f"    images_localize: {r.message}  {r.stats}")
     check("贴图阶段完成", r.ok, r.error)
-    # 合成贴图上写的是 "NEW GAME"，OCR 会把它切成 "NEW" 与 "V GAME" 两块，
-    # 我们的假翻译器只会加"【中】"前缀、仍全是 ASCII，所以**不会被重绘**
-    # （没有汉字可画）。这里真正要验证的是"OCR 认出来了、翻译回调被调用了"。
-    check("贴图被 OCR 识别并送去翻译", r.stats.get("blocks", 0) >= 2, str(r.stats))
+    # 合成贴图上写的是 "NEW GAME"。
+    #
+    # ⚠️ 这里以前断言的是 ``blocks >= 2``，注释还写着"OCR 会把它切成
+    # 'NEW' 与 'V GAME' 两块"。**那句话从来没被验证过** —— 它是照着一个
+    # 旧印象顺手写的；换成测试自造字体后实测是 **1 块**（整串
+    # "NEW GAME" 一起识别，见 `.scratch/_check_font_ocr.py` 的输出）。
+    # 真正的教训不是"该写几"，而是：这种"具体数量"的断言必须来自实测，
+    # 否则它只是在把某个偶然结果固化下来，一旦基础条件变了就变成噪音。
+    #
+    # 本用例真正要守的是"OCR 认出来了、翻译回调被调用了、块级结果被记下来了"，
+    # 所以下面用 >= 1 并配合 ocr_calls 的检查；具体块数由 textgroup 的
+    # 专属测试去管（那里才是它的归属）。
+    check("贴图被 OCR 识别并送去翻译", r.stats.get("blocks", 0) >= 1, str(r.stats))
     check("翻译回调被调用", r.stats.get("ocr_calls", 0) >= 1, str(r.stats))
     recs = ws.read_json("images/localize.json", []) or []
     all_blocks = [b for rec in recs for b in rec.get("blocks", [])]
     print(f"    识别到的文字块：{[(b['source'], b['target']) for b in all_blocks]}")
-    check("块级结果被记录下来（供审校页使用）", len(all_blocks) >= 2, str(len(all_blocks)))
+    check("块级结果被记录下来（供审校页使用）", len(all_blocks) >= 1, str(len(all_blocks)))
     check("块有译文", any(b.get("target") for b in all_blocks), str(all_blocks[:2]))
+    # 识别出的文字必须确实是贴图上那几个字（否则"有块"也可能是噪声）
+    joined_src = " ".join(str(b.get("source", "")) for b in all_blocks).upper()
+    check("识别出的内容与贴图相符", "NEW" in joined_src and "GAME" in joined_src, joined_src)
 
     # ---------------------------------------------------------------
     # 6. 质检
@@ -310,7 +335,7 @@ def main() -> int:
 
     # 原始目录只读
     check("原始游戏目录未被修改",
-          json.loads((GAME / "data" / "Map001.json").read_text(encoding="utf-8"))
+          json.loads((game / "data" / "Map001.json").read_text(encoding="utf-8"))
           ["events"][1]["pages"][0]["list"][1][2][0]
           == "Welcome, traveler.\\V[1] is waiting for you.")
 
@@ -376,6 +401,10 @@ def test_suite() -> None:
 
 pytestmark = [
     pytest.mark.slow,
+    # 整条流水线要真的把中文渲染进贴图，所以**需要本机有中文字体**。
+    # Linux CI runner 没有中文字体；少了这个标记就会红，
+    # 而且只报 `assert 1 == 0`，看不出是缺字体。
+    pytest.mark.needs_fonts,
 ]
 
 

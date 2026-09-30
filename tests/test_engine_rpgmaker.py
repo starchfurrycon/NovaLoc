@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -20,113 +19,29 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(ROOT / "src"))
 
+# 合成工程与最小字体都在共享模块里（见 tests/_fake_game.py 的说明：
+# 以前这个工程写在仓库内，导致跨套件的顺序耦合 + 生成物被提交）
+from _fake_game import build_fake_game  # noqa: E402
+
 from novaloc.core.config import Config  # noqa: E402
 from novaloc.core.events import EventBus  # noqa: E402
 from novaloc.core.registry import Context  # noqa: E402
 from novaloc.engines.rpgmaker import RpgMakerAdapter  # noqa: E402
 
-GAME = FIXTURES / "rpgmaker_game"
 
+def _fresh_game() -> Path:
+    """造一份工程。目标目录由会话级 fixture 决定（见 conftest.py）。
 
-def build_fake_game() -> Path:
-    """造一个结构真实的 RPG Maker MV 工程。"""
-    if GAME.exists():
-        shutil.rmtree(GAME)
-    data = GAME / "data"
-    (data).mkdir(parents=True)
+    保留这个入口是为了让本文件既能被 pytest 跑，也能像以前那样
+    ``python tests/test_engine_rpgmaker.py`` 单独跑 ——
+    那种情况下没有 fixture，就退回一个临时目录。
+    """
+    import os
+    import tempfile
 
-    # System.json：含 terms 嵌套 + 数值字段（不该被翻）
-    (data / "System.json").write_text(json.dumps({
-        "gameTitle": "The Legend of Testing",
-        "currencyUnit": "Gold",
-        "versionId": 12345,
-        "partyMembers": [1, 2],
-        "terms": {
-            "basic": ["Level", "Lv", "HP", "MP", "TP", "Experience"],
-            "commands": ["Fight", "Escape", "Attack", "Guard", "Item", "Skill", "Equip", "Status",
-                         "Formation", "Save", "Quit"],
-            "params": ["Max HP", "Max MP", "Attack", "Defense", "M.Attack", "M.Defense",
-                       "Agility", "Luck"],
-            "messages": {
-                "actionFailure": "There was no effect on %1!",
-                "actorDamage": "%1 took %2 damage!",
-            },
-        },
-    }, ensure_ascii=False), encoding="utf-8")
-
-    # Items.json：含 note 插件标签（只翻标签外的自然语言）
-    (data / "Items.json").write_text(json.dumps([
-        None,
-        {
-            "id": 1, "name": "Health Potion",
-            "description": "Restores 500 HP.\\nTastes faintly of mint.",
-            "note": "<CustomEffect:heal:500> A basic healing draught.",
-            "price": 100, "consumable": True,
-        },
-        {
-            "id": 2, "name": "Iron Sword",
-            "description": "A sturdy blade. Attack +15.",
-            "note": "<PassiveSkill:5>",  # 纯标签，不该产生文本单元
-            "price": 800, "params": [0, 15, 0, 0, 0, 0, 0, 0],
-        },
-    ], ensure_ascii=False), encoding="utf-8")
-
-    # MapInfos.json
-    (data / "MapInfos.json").write_text(json.dumps([
-        None,
-        {"id": 1, "name": "Town of Beginnings", "parentId": 0, "order": 1},
-        {"id": 2, "name": "Dark Cavern", "parentId": 0, "order": 2},
-    ], ensure_ascii=False), encoding="utf-8")
-
-    # Map001.json：事件指令（对白 / 选项 / 脸图名 / 脚本 / 注释）
-    (data / "Map001.json").write_text(json.dumps({
-        "displayName": "Town of Beginnings",
-        "events": [
-            None,
-            {
-                "id": 1, "name": "Village Elder",
-                "pages": [{
-                    "conditions": {},
-                    "list": [
-                        [101, 0, ["Face1", 0, 0, 0, "Elder"]],
-                        [401, 0, ["Welcome, traveler.\\V[1] is waiting for you."]],
-                        [401, 0, ["The sword costs \\C[6]500\\C[0] gold."]],
-                        [102, 0, ["Buy the sword", "Ask about the cave", "Leave"]],
-                        [402, 0, [0]],
-                        [401, 0, ["A wise choice."]],
-                        [402, 0, [1]],
-                        [401, 0, ["Beware the \\N[2] lurking within."]],
-                        [402, 0, [2]],
-                        [0, 0, []],
-                        # 脚本指令：绝不能被翻译
-                        [355, 0, ["$gameParty.gainGold(500);"]],
-                        [655, 0, ["console.log('debug message here');"]],
-                        # 注释：不翻
-                        [108, 0, ["This event handles the shop intro. Do not translate."]],
-                    ],
-                }],
-            },
-        ],
-    }, ensure_ascii=False), encoding="utf-8")
-
-    (GAME / "js").mkdir()
-    (GAME / "js" / "rpg_core.js").write_text("// engine", encoding="utf-8")
-    (GAME / "fonts").mkdir()
-    (GAME / "fonts" / "gamefont.css").write_text("@font-face{}", encoding="utf-8")
-    (GAME / "img" / "system").mkdir(parents=True)
-    # 一张有文字、尺寸够大的贴图（只验证"能被发现"，不做 OCR）
-    import numpy as np
-    from PIL import Image, ImageDraw, ImageFont
-
-    from novaloc.images.io import imwrite_bgr
-    im = Image.new("RGB", (400, 120), (20, 24, 40))
-    ImageDraw.Draw(im).text((20, 30), "NEW GAME",
-                            font=ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", 40),
-                            fill=(255, 220, 100))
-    imwrite_bgr(GAME / "img" / "system" / "Window.png", np.asarray(im)[:, :, ::-1])
-    # 故意放一张极小的图，验证尺寸过滤真的生效
-    imwrite_bgr(GAME / "img" / "system" / "Tiny.png", np.full((40, 40, 3), 50, "uint8"))
-    return GAME
+    base = os.environ.get("NOVALOC_FAKE_GAME_DIR")
+    dest = Path(base) / "rpgmaker_game" if base else Path(tempfile.mkdtemp()) / "rpgmaker_game"
+    return build_fake_game(dest)
 
 
 def main() -> int:
@@ -135,7 +50,7 @@ def main() -> int:
     def check(label: str, ok: bool, detail: str = "") -> None:
         checks.append((label, ok, detail))
 
-    game = build_fake_game()
+    game = _fresh_game()
     ctx = Context(config=Config(), events=EventBus())
     ad = RpgMakerAdapter(ctx)
 
@@ -150,7 +65,11 @@ def main() -> int:
     check("识别出游戏标题", any("Legend of Testing" in e for e in info.evidence))
 
     # 非 RPG Maker 目录不该误判
-    other = FIXTURES / "not_a_game"
+    #
+    # 放在 game 的**同级临时目录**里，不要往 tests/fixtures/ 里写 ——
+    # 那样会留下一个没人清理的 `not_a_game/`（它不在 .gitignore 里，
+    # 于是永远挂在工作区，`git add -A` 还会把它收进版本库）。
+    other = game.parent / "not_a_game"
     other.mkdir(parents=True, exist_ok=True)
     check("非 RPG Maker 目录不被误判", not ad.detect(other).ok,
           f"conf={ad.detect(other).confidence}")

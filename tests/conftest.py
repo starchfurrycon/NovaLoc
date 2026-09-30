@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -67,3 +68,28 @@ def font_fixtures() -> Path:
             f"缺少字体 fixture：{d}（把 LXGW 等 OFL 字体放进去即可启用该组测试）"
         )
     return d
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fake_game_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """为合成游戏建一个**会话级临时目录**，并把路径通过环境变量公布出去。
+
+    解决的是一类"跑全量套件时是绿的、单独跑某个文件就红"的隐蔽问题：
+    ``test_api_e2e.py`` / ``test_pipeline_e2e.py`` 直接读
+    ``tests/fixtures/rpgmaker_game``，但那个目录里的 ``data/`` 在
+    ``.gitignore`` 里（全新 clone 出来并不存在），**只有**
+    ``test_engine_rpgmaker.py`` 跑过之后才会被造出来。
+    于是套件之间就产生了执行顺序上的隐式依赖。
+
+    现在改成：谁需要就自己按环境变量里的路径去造。三个套件都调用同一个
+    共享构造函数（``tests/_fake_game.py``），所以谁先跑都对，
+    单独跑某一个也不会失败。生成物全在临时目录里，不再污染仓库。
+    """
+    d = tmp_path_factory.mktemp("fake_games")
+    old = os.environ.get("NOVALOC_FAKE_GAME_DIR")
+    os.environ["NOVALOC_FAKE_GAME_DIR"] = str(d)
+    yield d
+    if old is None:
+        os.environ.pop("NOVALOC_FAKE_GAME_DIR", None)
+    else:
+        os.environ["NOVALOC_FAKE_GAME_DIR"] = old

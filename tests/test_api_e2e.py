@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,12 +23,28 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(ROOT / "src"))
 
 import pytest  # noqa: E402
+from _fake_game import build_fake_game  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from novaloc.api.app import create_app  # noqa: E402
 
 SB = FIXTURES
-GAME = SB / "rpgmaker_game"
+
+
+def _game() -> Path:
+    """取合成游戏工程；没有就**自己造**。
+
+    以前这里写死 ``tests/fixtures/rpgmaker_game`` 并假设它已存在 ——
+    实际上那个目录里的 ``data/`` 是 git-ignored 的，全新 clone 出来
+    根本没有，**只有** ``test_engine_rpgmaker.py`` 先跑过才会有。
+    于是单独跑本文件必然失败，而跑全量套件时永远是绿的
+    （一种典型的"套件之间靠执行顺序耦合"）。
+
+    现在三个需要它的套件都用同一个共享构造函数，谁先跑都一样。
+    """
+    base = os.environ.get("NOVALOC_FAKE_GAME_DIR")
+    dest = Path(base) / "rpgmaker_game" if base else FIXTURES / "rpgmaker_game"
+    return build_fake_game(dest)
 
 
 class FakeTranslator:
@@ -125,7 +142,7 @@ def main() -> int:
         # ---------- 4. 建项目 ----------
         print("\n[4] 创建项目")
         r = client.post("/api/projects", json={
-            "name": "API 测试项目", "game_dir": str(GAME),
+            "name": "API 测试项目", "game_dir": str(_game()),
         })
         check("创建项目 200", r.status_code == 200, r.text[:200])
         proj = r.json()
@@ -332,6 +349,11 @@ def test_suite() -> None:
 
 pytestmark = [
     pytest.mark.slow,
+    # 端到端要真的把中文渲染进贴图，所以**需要本机有中文字体**。
+    # Linux CI runner 一个中文字体都没有；少了这个标记就会红成一片，
+    # 而且报出来的是 `IndexError: list index out of range` 这种
+    # 完全看不出原因的错。
+    pytest.mark.needs_fonts,
 ]
 
 

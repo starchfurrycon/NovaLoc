@@ -88,3 +88,12 @@ tests/fixtures/*_out3/
 tests/fixtures/wire_*/
 tests/fixtures/_wire/
 tests/fixtures/arwes-test/
+
+# 合成 RPG Maker 工程里的 `data/` 曾经只有 `test_engine_rpgmaker.py` 跑过
+# 才会有（被上面通用的 `data/` 规则忽略），而另外两个端到端套件直接读它 ——
+# 于是"单独跑某个测试文件"必然失败，"跑全量"却永远绿。
+# 现在合成工程一律造在会话级临时目录里（见 tests/conftest.py 的
+# `_fake_game_dir`），这里只是**防御性**地把可能的残留挡在版本库外。
+tests/fixtures/rpgmaker_game/data/
+tests/fixtures/rpgmaker_game/_testfont.ttf
+tests/fixtures/_novaloc_testfont.ttf

@@ -8,6 +8,7 @@ RPG Maker 目录不能被兜底适配器抢走），以及 Ren'Py 的回写要�
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(ROOT / "src"))
 
 import numpy as np  # noqa: E402
+from _fake_game import build_fake_game  # noqa: E402
 
 from novaloc.core.config import Config  # noqa: E402
 from novaloc.core.events import EventBus  # noqa: E402
@@ -28,6 +30,20 @@ from novaloc.engines.unity import UnityAdapter  # noqa: E402
 from novaloc.images.io import imwrite_bgr  # noqa: E402
 
 SB = FIXTURES
+
+
+def _rpg_game() -> Path:
+    """取合成 RPG Maker 工程；没有就自己造（原因见 ``_fake_game.py``）。
+
+    以前这里直接指向 ``tests/fixtures/rpgmaker_game`` 并假设它存在 ——
+    而它里面的 ``data/`` 是 git-ignored 的，只有
+    ``test_engine_rpgmaker.py`` 先跑过才会有。全新 clone 出来单独跑本文件，
+    "RPG Maker 被正确识别"这一条会因为 ``path.exists()`` 为假而**被静默跳过**，
+    于是这条检查事实上从来没在本文件里真正执行过。
+    """
+    base = os.environ.get("NOVALOC_FAKE_GAME_DIR")
+    dest = Path(base) / "rpgmaker_game" if base else SB / "rpgmaker_game"
+    return build_fake_game(dest)
 
 
 def build_renpy() -> Path:
@@ -121,7 +137,7 @@ def main() -> int:
     renpy = build_renpy()
     unity = build_unity()
     loose = build_loose()
-    rpg = SB / "rpgmaker_game"
+    rpg = _rpg_game()
 
     # ---------- 1. 识别优先级 ----------
     print("\n[1] 引擎识别")

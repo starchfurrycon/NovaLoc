@@ -126,15 +126,11 @@ jobs:
         #   1. 直接看 zip 内容 —— 最直接的"文件在不在"证据；
         #   2. **真装一遍再导入** —— 只有这样才能确认运行时
         #      `_web_dist()` 能在**安装位置**找到前端。
-        # 第 2 步曾经漏掉，导致第一次写完的 CI 步骤一跑就
-        # `ModuleNotFoundError: No module named 'fastapi'`：
-        # 直接从临时目录 import，绕过了依赖安装。
         run: |
           python - <<'PY'
           import glob
           import sys
           import zipfile
-          from pathlib import Path
 
           wheel = glob.glob("dist/*.whl")[0]
           names = zipfile.ZipFile(wheel).namelist()
@@ -149,13 +145,16 @@ jobs:
               sys.exit("wheel 里缺少 web_dist/assets/")
           PY
 
-          # 装到 site-packages，然后**在仓库之外**导入，确保命中的是
-          # 已安装的那份。在仓库里导入会找到源码树里的
-          # src/novaloc/web_dist，测了等于没测（这个错误第一次就犯过）。
-          python -m pip install --no-deps "$(ls dist/*.whl)"
+          # **必须带依赖装**（不要 --no-deps）：`novaloc.api.app` 依赖 fastapi，
+          # 本地用 --no-deps 试的时候没暴露，因为开发 venv 里早就装好了
+          # fastapi —— 一推到 CI 就 `ModuleNotFoundError: No module named
+          # 'fastapi'`。CI runner 是干净环境，必须让它把依赖装上。
+          python -m pip install "$(ls dist/*.whl)"
+
+          # **换到仓库外**再导入，确保命中的是已安装的那份。在仓库里导入
+          # 会找到源码树里的 src/novaloc/web_dist，测了等于没测。
           cd "$RUNNER_TEMP"
           python - <<'PY'
-          import sys
           from pathlib import Path
 
           import novaloc

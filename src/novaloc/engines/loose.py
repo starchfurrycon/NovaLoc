@@ -208,13 +208,34 @@ class LooseFilesAdapter(EngineAdapter):
             return notes
 
         # ① 集中放到 _fonts/ 便于查找
-        notes.extend(self.copy_fonts_into(out_dir, installed, out_dir / "_fonts"))
+        target = out_dir / "_fonts"
+        notes.extend(self.copy_fonts_into(out_dir, installed, target))
 
         # ② 同名文件就地替换
+        #
+        # **必须排除 `_fonts/`** —— 那是 ① 刚写进去的"我们自己的副本"。
+        # 它的**文件名就是游戏原字体的名字**（这正是"同名替换"的含义），
+        # 所以如果把它也纳入查找范围，`by_name` 就可能先命中它，
+        # 于是 `dst.resolve() == src.resolve()` 判定"同一个文件"而 `continue`，
+        # **真正的游戏字体永远不会被替换**。
+        #
+        # 这不是理论问题：`rglob` 的产出顺序取决于文件系统。
+        # 下划线 ASCII 是 0x5f，小于字母，所以在 Linux 上
+        # `_fonts` 排在 `fonts` **前面**，必然命中副本 → 必然不替换；
+        # 而 Windows 上恰好相反，测试一直是绿的。实测（WSL Debian）：
+        #
+        #     rglob("*") → _fonts, fonts, _fonts/game.ttf, fonts/game.ttf
+        #     by_name["game.ttf"] = _fonts/game.ttf   ← 命中的是副本
+        #
+        # 这类"只在某个平台/某次目录顺序下错"的 bug 最难查，所以这里
+        # 不去依赖顺序，直接把不该看的地方排除掉。
         by_name: dict[str, Path] = {}
         for p in out_dir.rglob("*"):
-            if p.is_file() and p.suffix.lower() in FONT_SUFFIXES:
-                by_name.setdefault(p.name.lower(), p)
+            if not p.is_file() or p.suffix.lower() not in FONT_SUFFIXES:
+                continue
+            if target in p.parents:  # 跳过我们自己刚写入的副本
+                continue
+            by_name.setdefault(p.name.lower(), p)
 
         replaced = 0
         for new_rel in installed.values():

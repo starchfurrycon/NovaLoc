@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 # fixture 目录：仓库自带的小体积游戏样本（原先是 .scratch/）
@@ -295,6 +296,15 @@ def _is_clockwise(pts: np.ndarray) -> bool:
 def test_suite() -> None:
     """pytest 入口：跑一遍完整报告并断言全通过。"""
     assert main() == 0
+
+
+pytestmark = [
+    # 这一套是真的用 Pillow 把中文画到贴图上（比对"重绘中文"的像素结果），
+    # 所以**需要本机有中文字体**。Linux CI runner 没有，于是抛
+    # `RuntimeError: 找不到可用的中文字体，拒绝在贴图上绘制中文` ——
+    # 这不是被测代码坏了，只是这台机器没装字体。
+    pytest.mark.needs_fonts,
+]
 
 
 if __name__ == "__main__":

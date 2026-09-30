@@ -137,6 +137,87 @@ def test_loose_replaces_same_named_font_in_place(tmp_path: Path) -> None:
     assert any("替换" in n for n in notes), f"没报告替换动作：{notes!r}"
 
 
+def test_loose_replacement_is_not_derailed_by_its_own_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**回归**：自己刚拷进 ``_fonts/`` 的副本不能顶替掉真正的游戏字体。
+
+    真实事故（只在 Linux CI 上暴露，Windows 一直是绿的）：
+    ``wire_fonts`` 先把补好的字体拷到 ``out/_fonts/game.ttf`` ——
+    注意它的**文件名就是游戏原字体的名字**（这正是"同名替换"的前提）。
+    然后扫描 ``out_dir`` 找同名文件时，如果这个副本也被扫进来，
+    ``by_name`` 就会命中它，接着 ``dst.resolve() == src.resolve()``
+    判定"是同一个文件"而 `continue`，**真正的 ``out/fonts/game.ttf``
+    永远不会被替换**。
+
+    而扫到什么完全取决于文件系统顺序。下划线 ASCII 0x5f 小于字母，
+    所以 Linux 上 ``_fonts`` 排在 ``fonts`` **前面**，必然命中副本；
+    Windows 的枚举顺序恰好相反，于是测试在开发机上骗过了所有人。实测：
+
+        rglob("*") → _fonts, fonts, _fonts/game.ttf, fonts/game.ttf
+        修复前 by_name["game.ttf"] = _fonts/game.ttf
+        修复后 by_name["game.ttf"] = fonts/game.ttf
+
+    修法是**显式排除 ``_fonts/``**，而不是去赌枚举顺序。
+
+    **为什么要 monkeypatch ``rglob``**：只在 Windows 上跑、
+    依赖"恰好先产出 fonts/"的测试根本抓不到这个 bug ——
+    这正是它当初溜进 CI 的原因。这里强制把 ``_fonts`` 里的条目
+    排在前面，把 Linux 的（不利）顺序**固定在测试里**，
+    这样在任何平台、任何文件系统上都必然复现。
+    """
+    out = tmp_path / "out"
+    (out / "fonts").mkdir(parents=True)
+    real = out / "fonts" / "game.ttf"
+    real.write_bytes(b"OLDFONT")
+
+    # 预先放一份**同名**文件在 _fonts/ 里，且字节与源文件相同，
+    # 这样 dst == src 的短路条件会成立（这正是真实事故的触发方式）。
+    newfont = tmp_path / "game.ttf"
+    newfont.write_bytes(b"NEWFONT-with-CJK")
+    (out / "_fonts").mkdir(parents=True)
+    (out / "_fonts" / "game.ttf").write_bytes(b"NEWFONT-with-CJK")
+
+    real_rglob = Path.rglob
+
+    def linux_order_rglob(self: Path, pattern: str):  # noqa: ANN202
+        items = list(real_rglob(self, pattern))
+        # 把 _fonts/ 下的条目提到最前，模拟 Linux 上 0x5f < 字母 的顺序
+        return iter(
+            sorted(items, key=lambda p: (0 if "_fonts" in p.parts else 1))
+        )
+
+    monkeypatch.setattr(Path, "rglob", linux_order_rglob)
+
+    notes = LooseFilesAdapter(_ctx()).wire_fonts(out, {"fonts/game.ttf": str(newfont)})
+
+    assert real.read_bytes() == b"NEWFONT-with-CJK", (
+        f"真正的游戏字体没被替换（命中了 _fonts/ 里的副本）：{notes!r}"
+    )
+    assert any("替换" in n and "_fonts" not in n for n in notes), (
+        f"没报告对真正游戏文件的替换：{notes!r}"
+    )
+
+
+def test_loose_does_not_count_its_own_copy_as_a_replacement(tmp_path: Path) -> None:
+    """报告里的"替换数"必须是**真正的游戏文件**，不能把自己拷的副本算进去。
+
+    否则会出现"报告说替换了 1 个"但那个文件其实就是我们自己刚写的那份 ——
+    用户以为游戏字体换掉了，其实一个都没换。
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    font = tmp_path / "novaloc_cjk.ttf"
+    font.write_bytes(b"NEWFONT-with-CJK")
+
+    # 输出目录里**没有**同名文件，只有我们要写入的 _fonts/
+    notes = LooseFilesAdapter(_ctx()).wire_fonts(out, {"fonts/orig.ttf": str(font)})
+    assert not any("就地替换" in n for n in notes), (
+        f"把拷进 _fonts/ 的副本当成了就地替换：{notes!r}"
+    )
+    assert (out / "_fonts" / font.name).is_file()
+
+
 def test_loose_states_its_limits(tmp_path: Path) -> None:
     """散装模式必须说明它无法自动改字体指向。"""
     out = tmp_path / "out"

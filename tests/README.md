@@ -52,10 +52,27 @@
 | 前提 | 影响的套件 | 怎么补 |
 | --- | --- | --- |
 | 中文字体 fixture | `test_font_service.py`、`test_charset_merge.py` | 把 OFL 中文字体（如 LXGW WenKai）放进 `tests/fixtures/fonts/` |
-| Windows 系统字体 | `test_font_real.py`、`test_merge.py`、`test_engine_rpgmaker.py` | Windows 自带；其它平台跳过 |
+| **本机装有中文字体** | `test_api_e2e.py`、`test_pipeline_e2e.py`、`test_vlm_fallback.py`（标了 `needs_fonts`） | Windows/macOS 自带；Linux 装 `fonts-noto-cjk`。这几套要真的把中文渲染进贴图，没有字体就会 `RuntimeError: 找不到可用的中文字体` |
+| Windows 系统字体 | `test_font_real.py`、`test_merge.py` | Windows 自带；其它平台跳过 |
 | DirectML / ONNX Runtime | OCR 相关断言 | 装 `pip install -e ".[dml]"`；无 GPU 时退化到 CPU（慢约 84 倍） |
 | PP-OCRv6 模型 | 贴图识别 | 首次运行自动下载到 `<data_root>/models/rapidocr` |
 | Ollama | 只影响真机端到端；测试用假服务端 | 见 README 的 Ollama 一节 |
+
+注意区分两种"要字体"：
+
+* **要一个能用的字体把字画上去** → 用 `tests/_minimal_font.py` 自己造，
+  不该依赖本机（`test_engine_rpgmaker.py` 就属于这种，它标 **不需要**
+  `needs_fonts`）；
+* **要真中文字体**（因为要画汉字、要跑 OCR 认中文）→ 标 `needs_fonts`。
+
+`_minimal_font.py` 的字形轮廓是**从 Pillow 内置字体里抽出来重新组装**的
+（Aileron，随 Pillow 分发），所以是真字母形状、OCR 能认，而仓库里
+**不需要放任何字体文件**。
+
+> ⚠️ 早先那版最小字体给每个字符都画同一个**方块**：PIL 能加载、能画上
+> 墨迹、静态检查全绿，但 OCR 完全认不出来（`NEW GAME` 40px 时"墨迹"
+> 占 88% 像素，就是一整块实心矩形），导致贴图汉化报告"0 处文字"。
+> 这正是本项目最怕的失败模式：**看起来成功，其实什么都没做**。
 
 **字体文件不入库**：`tests/fixtures/fonts/` 在 `.gitignore` 里。原因是体积
 （两个 CJK TTF 就有 21 MB）和许可证（LXGW Neo XiHei 是 IPA-1.0，
@@ -66,7 +83,29 @@
 各套件把自己写到 `tests/fixtures/<名字>/` 下（`out`、`tex_test`、
 `pipe_test`、`fontsvc` 等），这些目录都在 `.gitignore` 里。
 
-**已知局限**：少数套件会在固定目录里留下产物并被后续断言读取
-（例如合并出来的字体文件），所以套件之间有轻微的顺序耦合。
-需要干净复现时先删掉 `tests/fixtures/out*`、`tests/fixtures/tex_test`、
-`tests/fixtures/pipe_test` 再跑。
+**合成游戏工程不再落在仓库里**。以前 `test_engine_rpgmaker.py` 会把
+工程造到 `tests/fixtures/rpgmaker_game/`，其中 `data/` 被通用的
+`data/` 规则忽略 —— 于是全新 clone 出来**只有那个套件跑过之后**才存在。
+而 `test_api_e2e.py`、`test_pipeline_e2e.py`、`test_engines_all.py`
+都直接读它，后果是：
+
+* 单独跑其中任何一个都会失败（或更糟：像 `test_engines_all.py` 那样
+  因为 `if not path.exists(): continue` 而**静默跳过整条检查**，
+  看着是绿的）；
+* 跑全量套件却永远通过 —— 因为顺序恰好对。
+
+现在统一改成会话级临时目录：`conftest.py` 的 `_fake_game_dir` 建目录并把
+路径放进 `NOVALOC_FAKE_GAME_DIR`，需要的套件通过共享构造函数
+`tests/_fake_game.py` 自己造。**谁先跑都一样，单独跑也不会失败。**
+
+自查方式：逐个文件单独跑一遍
+
+```powershell
+.\.venv\Scripts\python.exe .scratch\_run_each_alone.py
+```
+
+**已知局限**：少数套件会把产物留在固定目录并被后续断言读取
+（例如合并出来的字体文件）。需要干净复现时先删掉
+`tests/fixtures/out*`、`tests/fixtures/tex_test`、`tests/fixtures/pipe_test`
+再跑。
+
