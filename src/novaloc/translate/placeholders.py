@@ -59,6 +59,11 @@ PLACEHOLDER_PATTERNS: tuple[re.Pattern[str], ...] = (
     # `<color=#ff0000>` 这种"属性紧跟标签名、中间没有空格"的写法，
     # 那正是 Unity/Ren'Py/RPG Maker 里最常见的富文本标签形态。
     re.compile(r"</?[A-Za-z][A-Za-z0-9]*(?:[^<>]*)?/?>"),
+    # RPG Maker 插件元数据标签：`<CustomEffect:heal:500>` `<PassiveSkill:5>`
+    # 这类标签的**内部**是插件读取的参数，翻译了插件就认不出来，
+    # 游戏行为直接出问题。上面的 HTML 规则匹配不到它（标签名后面
+    # 跟的是 `:` 而不是 `>`），所以必须单独一条。
+    re.compile(r"<[A-Za-z_][A-Za-z0-9_]*(?::[^<>\n]*)?>"),
     re.compile(r"&[A-Za-z][A-Za-z0-9]{1,10};"),
     re.compile(r"&#\d+;"),
     re.compile(r"&#x[0-9A-Fa-f]+;"),

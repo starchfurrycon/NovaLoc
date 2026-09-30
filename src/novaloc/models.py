@@ -42,6 +42,8 @@ class TextKind(str, Enum):
     MAP_NAME = "map_name"        # 地图/地点名
     CHARACTER_NAME = "character_name"  # 角色名（全篇必须统一）
     IMAGE_TEXT = "image_text"    # 从贴图里 OCR 出来的文字
+    BATTLE_MESSAGE = "battle_message"  # 战斗提示（"艾莉丝受到了 120 点伤害！"）
+    NOTE = "note"                # 数据条目备注（可能混有插件标签，只翻自然语言）
 
 
 class EntryStatus(str, Enum):
@@ -262,6 +264,13 @@ class FontCoverage(BaseModel):
 
     missing: list[str] = Field(default_factory=list)
     """针对当前项目所需字符集缺失的字符（去重排序）。"""
+
+    is_game_font: bool = False
+    """True 表示这是游戏自带（需要被替换/注入）的字体，
+    而不是系统字体或我们下载的候选字体。"""
+
+    coverage_ratio: float = 0.0
+    """对项目字符集的覆盖率（0~1）。"""
 
     @property
     def missing_count(self) -> int:

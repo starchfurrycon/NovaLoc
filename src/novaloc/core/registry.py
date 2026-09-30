@@ -115,6 +115,7 @@ _REGISTRY: dict[str, dict[str, type]] = {
     "ocr": {},
     "inpaint": {},
     "vision": {},
+    "engine": {},
 }
 
 
@@ -130,6 +131,11 @@ def register(kind: str, name: str):
         return cls
 
     return deco
+
+
+def list_registered(kind: str) -> list[str]:
+    """列出某一类里已注册的组件名。"""
+    return sorted(_REGISTRY.get(kind, {}))
 
 
 class Providers:
