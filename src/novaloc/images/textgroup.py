@@ -23,6 +23,13 @@ PP-OCRv6 是按视觉行切块的，它不知道哪几块属于同一句话。�
 * 水平相邻且间距不超过字高的 1.8 倍（超过就是两个独立区域）；
 * 合并后的整行宽度不超过最长单块的 6 倍（防止把整条横幅都串起来）。
 
+**但有一条硬性例外**：两块横向重叠超过较小块宽度的 15% 时，
+无论上面的保守判据怎么说都**必须**合并（见 :data:`OVERLAP_FORCES_MERGE`）。
+这不是为了排版好看，而是因为重绘流程是"擦掉本块、写上本块译文" ——
+框一旦重叠，擦掉其中一块就会抹掉另一块的笔画，而另一块的译文又盖在
+前一块的译文上，产物必然是"中文 + 残留外文"的花字。
+这条实测抓到过（`NEW GAME` → `新V GAME`），详见该常量的注释。
+
 合并只影响**送去翻译的文本**与**回填译文的分配**；每个块的框、颜色、
 字号仍然是自己的，所以贴回位置不受影响。
 """
@@ -57,6 +64,28 @@ MIN_MERGE_CHARS = 4
 #: 合并组里块数上限。再多就说明这行本来就是一串独立元素
 MAX_MERGE_BLOCKS = 4
 
+#: 横向重叠达到**较小块宽度的这个比例**时，两块**必须**合并。
+#:
+#: 这条规则是硬性的，会**越过** :data:`MIN_MERGE_CHARS` 与
+#: :data:`MAX_GAP_RATIO` 等所有"保守"判据。原因不是排版好看，
+#: 而是正确性：重绘是"先擦掉本块的框、再写本块的译文"，
+#: 两块一旦重叠，**擦 A 就会擦掉 B 的字**，而 B 的译文又画在
+#: A 的译文上面 —— 产物必然是花的。
+#:
+#: 实测（`NEW GAME` 贴图，PP-OCRv6 medium）：
+#:
+#:     'NEW'     box=(13, 29, 123, 76)
+#:     'V GAME'  box=(99, 27, 253, 78)   ← 与上一块横向重叠 24 px
+#:
+#: 这不是构造出来的：OCR 会把 'NEW GAME' 里的 'W' 读成 'V'，
+#: 于是切出这两块。逐块重绘后 OCR 回读产物得到 ``'新V GAME'`` ——
+#: 中文和残留英文叠在一起。而流水线当时报告的是
+#: ``ok=True / translated=2 / changed=True``，**看着完全成功**。
+#:
+#: 阈值取 0.15 而不是"大于 0"：OCR 的框本身有几个像素的抖动，
+#: 1~2 px 的轻微交叠是正常的，不该把相邻的独立 UI 元素硬并成一句。
+OVERLAP_FORCES_MERGE = 0.15
+
 
 @dataclass
 class TextGroup:
@@ -85,6 +114,21 @@ class TextGroup:
         return len(self.blocks) <= 1
 
     @property
+    def has_overlap(self) -> bool:
+        """组内是否存在"重叠到无法各自清理"的块对。
+
+        `True` 时**不能**用 :attr:`source` 拼接的文本去翻译 —— 重叠区
+        的文字会被数两遍（实测 `'NEW'` + `'V GAME'` → `'NEW V GAME'`，
+        多出一个凭空的 `V`）。调用方应改为对 :attr:`box` 区域**重读**。
+        """
+        bs = self.blocks
+        for i in range(len(bs)):
+            for j in range(i + 1, len(bs)):
+                if _forces_merge(bs[i].box, bs[j].box):
+                    return True
+        return False
+
+    @property
     def avg_height(self) -> float:
         if not self.blocks:
             return 0.0
@@ -109,13 +153,41 @@ def _size_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> f
     return abs(ha - hb) / max(ha, hb)
 
 
-def _mergeable(blocks: list[ImageTextBlock]) -> bool:
+def _overlap_px(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+    """两块在 x 轴上的重叠像素数（不重叠返回 0）。"""
+    return max(0, min(a[2], b[2]) - max(a[0], b[0]))
+
+
+def _forces_merge(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int]
+) -> bool:
+    """两块是否"重叠到无法各自清理"，因而必须合并。
+
+    判据是重叠宽度 / **较小块**的宽度 —— 用较小块做分母，是因为
+    "小块被大块吞掉"正是最糟的情形（擦大块必然抹掉小块的全部笔画）。
+    """
+    ov = _overlap_px(a, b)
+    if ov <= 0:
+        return False
+    narrower = min(max(1, a[2] - a[0]), max(1, b[2] - b[0]))
+    return ov / narrower >= OVERLAP_FORCES_MERGE
+
+
+def _mergeable(blocks: list[ImageTextBlock], *, forced: bool = False) -> bool:
     """这一组块是否"值得参与合并"。
 
     太短的标签不合并（见 :data:`MIN_MERGE_CHARS` 的说明）。
     纯数字块也不合并：它没有可翻译的语义，合并只会让它被别人的
     译文挤掉或挤歪。
+
+    ``forced=True`` 用于 :func:`_forces_merge` 判定为"必须合并"的情形：
+    这时**宁可排版难看也不能留残字**，所以越过上面两条保守判据。
+    块数上限仍然生效（那是防御性的，不是审美问题）。
     """
+    if len(blocks) > MAX_MERGE_BLOCKS:
+        return False
+    if forced:
+        return True
     for b in blocks:
         t = b.source.strip()
         if len(t) < MIN_MERGE_CHARS:
@@ -169,12 +241,21 @@ def group_blocks(
             h = max(1, min(prev.box[3] - prev.box[1], b.box[3] - b.box[1]))
             span = (b.box[2] - cur[0].box[0])
             widest = max(max(1, x.box[2] - x.box[0]) for x in cur)
+            # 逐块重绘要求各块的清理区域互不重叠，否则擦 A 会抹掉 B 的字。
+            # 所以"重叠到无法分开"是**必须合并**的硬条件，越过所有保守判据。
+            forced = _forces_merge(prev.box, b.box)
             ok = (
-                gap <= h * max_gap_ratio
-                and _size_ratio(prev.box, b.box) <= SAME_SIZE_TOLERANCE
-                and span <= widest * max_span_ratio
-                and len(cur) < MAX_MERGE_BLOCKS
-                and _mergeable(cur) and _mergeable([b])
+                len(cur) < MAX_MERGE_BLOCKS
+                and _mergeable(cur, forced=forced)
+                and _mergeable([b], forced=forced)
+                and (
+                    forced
+                    or (
+                        gap <= h * max_gap_ratio
+                        and _size_ratio(prev.box, b.box) <= SAME_SIZE_TOLERANCE
+                        and span <= widest * max_span_ratio
+                    )
+                )
             )
             if ok:
                 cur.append(b)
@@ -212,6 +293,20 @@ def allocate_translation(group: TextGroup, translated: str) -> list[tuple[ImageT
     """
     if group.is_single:
         return [(group.blocks[0], translated)]
+
+    # 重叠组：各块的框互相交叠，**根本没法逐块画** —— 画 A 会覆盖 B，
+    # 画 B 会覆盖 A。所以整句译文只交给第一块，绘制时用整组包围盒
+    # （见 `TextureTranslator._draw_block(draw_box=...)`）。
+    # 其余块返回空串，由调用方记为 SKIPPED，不留任何原始外文。
+    if group.has_overlap:
+        log.debug(
+            "重叠组不切分，整句交给首块（%d 块，%r）",
+            len(group.blocks), translated,
+        )
+        return [
+            (b, translated if i == 0 else "")
+            for i, b in enumerate(group.blocks)
+        ]
 
     texts = [b.source.strip() for b in group.blocks]
     total = sum(len(t) for t in texts)
@@ -284,4 +379,14 @@ def _is_han(ch: str) -> bool:
     return 0x3400 <= ord(ch) <= 0x9FFF or 0xF900 <= ord(ch) <= 0xFAFF
 
 
-__all__ = ["MAX_GAP_RATIO", "SAME_LINE_OVERLAP", "TextGroup", "allocate_translation", "group_blocks"]
+__all__ = [
+    "MAX_GAP_RATIO",
+    "MAX_MERGE_BLOCKS",
+    "MIN_MERGE_CHARS",
+    "OVERLAP_FORCES_MERGE",
+    "SAME_LINE_OVERLAP",
+    "SAME_SIZE_TOLERANCE",
+    "TextGroup",
+    "allocate_translation",
+    "group_blocks",
+]

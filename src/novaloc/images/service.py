@@ -333,6 +333,37 @@ class TextureTranslator:
             self._lama = load_lama(path)
         return self._lama
 
+    def _reread_group(self, image: Any, group: Any) -> str:
+        """对整组的包围盒重读一次，返回拼接后的文字（读不出则空串）。
+
+        只在组内块互相重叠时调用 —— 那时 :attr:`TextGroup.source` 的拼接
+        结果会把重叠区的文字数两遍。
+
+        几何一律**不用**重读结果（`PP-OCRv6` 在定位上碾压其它方案，
+        而这里是同一套 OCR，没理由换框），只取文字。
+        多块时按 x 排序拼接，避免顺序抖动导致译文不稳定。
+        """
+        x1, y1, x2, y2 = group.box
+        h, w = image.shape[0], image.shape[1]
+        # 留一点边：紧贴笔画裁会切掉抗锯齿边缘，反而降低识别率
+        pad = max(2, int(max(1, y2 - y1) * 0.08))
+        crop = image[
+            max(0, y1 - pad):min(h, y2 + pad),
+            max(0, x1 - pad):min(w, x2 + pad),
+        ]
+        if crop.size == 0:
+            return ""
+        try:
+            page = self.ocr.read(crop, asset_uid=f"{group.blocks[0].id}-reread")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("重叠组重读失败：%s", exc)
+            return ""
+        if page.error:
+            log.debug("重叠组重读报错：%s", page.error)
+            return ""
+        parts = [b.source.strip() for b in sorted(page.blocks, key=lambda b: b.box[0])]
+        return " ".join(p for p in parts if p).strip()
+
     # ------------------------------------------------------------------
     # 主流程
     # ------------------------------------------------------------------
@@ -401,8 +432,32 @@ class TextureTranslator:
         groups = group_blocks(blocks)
         log.debug("贴图 %s：OCR %d 块 → %d 组", p.name, len(blocks), len(groups))
 
-        # ---- 3. 翻译 ----
+        # ---- 2b. 重叠组重读 ----
+        # 组内块一旦互相重叠，就**不能**用拼接的文本去翻译：重叠区的文字
+        # 会数两遍。实测 'NEW' + 'V GAME' 拼出 'NEW V GAME'，
+        # 凭空多一个 'V' —— 这个文本送进翻译层，译文必然是错的。
+        #
+        # 改为对整组的包围盒**重读一次**。代价是每组一次额外 OCR
+        # （实测约 0.2 秒），但重叠组很少见，而错译是永久留在产物里的。
+        # 重读得到的框不用（几何一律以原 OCR 为准），只用它的文字。
         texts = [g.source for g in groups]
+        for gi, g in enumerate(groups):
+            if not g.has_overlap:
+                continue
+            reread = self._reread_group(raw, g)
+            if reread:
+                log.debug(
+                    "贴图 %s：第 %d 组存在重叠块，重读 %r → %r",
+                    p.name, gi, texts[gi], reread,
+                )
+                texts[gi] = reread
+            else:
+                log.debug(
+                    "贴图 %s：第 %d 组重叠块重读失败，保留拼接文本 %r",
+                    p.name, gi, texts[gi],
+                )
+
+        # ---- 3. 翻译 ----
         translations = self._translate_texts(
             texts, lang, existing or {}, glossary or [], context_lines or [], p, dry_run
         )
@@ -457,8 +512,13 @@ class TextureTranslator:
                     )
                 continue
 
+            # 重叠组只能整体画一次：组内各块的框互相交叠，
+            # 逐块画会互相覆盖，产物就是"中文 + 残留外文"的花字。
+            draw_box = tuple(g.box) if g.has_overlap else None  # type: ignore[arg-type]
             for b, piece in allocate_translation(g, translated):
-                outcome = self._draw_block(canvas, b, piece, styles.get(b.id), font_path)
+                outcome = self._draw_block(
+                    canvas, b, piece, styles.get(b.id), font_path, draw_box=draw_box
+                )
                 result.outcomes.append(outcome)
 
         result.image = canvas
@@ -668,8 +728,16 @@ class TextureTranslator:
         text: str,
         style: TextBlockStyle | None,
         font_path: str,
+        *,
+        draw_box: tuple[int, int, int, int] | None = None,
     ) -> BlockOutcome:
-        """画一块并贴回。任何异常都收敛成 outcome，不打断整图。"""
+        """画一块并贴回。任何异常都收敛成 outcome，不打断整图。
+
+        ``draw_box`` 省略时用 ``block.box``。**重叠组**会显式传入整组的
+        包围盒：那时组内各块的框互相交叠，逐块画必然互相覆盖，只能
+        当成一个整体画一次。注意 ``outcome.box`` 始终是**该块自己**的
+        框（审校页要在原图上标出每块的位置），只有绘制几何用 ``draw_box``。
+        """
         out = BlockOutcome(
             block_id=block.id,
             source=block.source,
@@ -687,7 +755,7 @@ class TextureTranslator:
         if style is None:
             style = TextBlockStyle(text_color=(255, 255, 255))
 
-        x1, y1, x2, y2 = block.box
+        x1, y1, x2, y2 = draw_box or block.box
         bw, bh = max(1, x2 - x1), max(1, y2 - y1)
         pad_x = max(2, int(bw * PAD_X_RATIO))
         pad_y = max(1, int(bh * PAD_Y_RATIO))
@@ -713,12 +781,18 @@ class TextureTranslator:
         if br.too_small:
             out.warnings.append(f"字号过小（{br.font_size}px）难以辨认")
 
-        quad = block.quad if block.quad and len(block.quad) == 4 else [
-            (x1 + pad_x, y1 + pad_y),
-            (x2 - pad_x, y1 + pad_y),
-            (x2 - pad_x, y2 - pad_y),
-            (x1 + pad_x, y2 - pad_y),
-        ]
+        # 只有"块的四边形正好等于绘制框"时才能拿它做透视贴回；
+        # 重叠组用整组包围盒，块自己的四边形跟它不匹配，得走矩形分支。
+        quad = (
+            block.quad
+            if (draw_box is None and block.quad and len(block.quad) == 4)
+            else [
+                (x1 + pad_x, y1 + pad_y),
+                (x2 - pad_x, y1 + pad_y),
+                (x2 - pad_x, y2 - pad_y),
+                (x1 + pad_x, y2 - pad_y),
+            ]
+        )
         try:
             if not paste_quad(canvas, br.rgba, list(quad)):
                 out.status = EntryStatus.FAILED

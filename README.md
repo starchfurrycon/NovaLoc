@@ -284,7 +284,7 @@ novaloc run <id> --stage apply
 ```powershell
 pip install -e ".[dev]"
 
-# 全量测试（22 个套件 / 90 个 pytest 项，约 2.5 分钟）
+# 全量测试（24 个套件 / 106 个 pytest 项，约 7 分钟）
 pytest tests -q
 
 # 单个套件也能直接当脚本跑，输出带实测数字的分节报告
