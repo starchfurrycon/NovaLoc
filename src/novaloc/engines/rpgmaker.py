@@ -38,6 +38,12 @@ from ..models import (
     TextUnit,
 )
 from .base import ApplyResult, EngineAdapter, EngineInfo
+from .rpgmv_crypt import (
+    IMAGE_SUFFIXES,
+    encrypt,
+    find_encryption_key,
+    is_encrypted_image_name,
+)
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +157,15 @@ class RpgMakerAdapter(EngineAdapter):
             return path.relative_to(base).as_posix()
         except ValueError:
             return path.name
+
+    def _encryption_keys(self, game_dir: Path) -> bytes | None:
+        """取本游戏的资源加密 key（供解密贴图与回写时重新加密用）。
+
+        返回 ``None`` 表示"不加密"或"读不到 key"两种情况 ——
+        对调用方来说处理方式相同：按明文 PNG 处理。区别在于
+        `extract_images` 会为此发一条告警，不让用户以为贴图都处理了。
+        """
+        return find_encryption_key(game_dir)
 
     # ------------------------------------------------------------------
 
@@ -491,10 +506,30 @@ class RpgMakerAdapter(EngineAdapter):
         # 含文字概率高的子目录
         TEXT_DIRS = ("system", "titles1", "titles2", "pictures", "battlebacks1", "battlebacks2")
         candidates: list[Path] = []
+        # ⚠️ **必须同时收加密资源**（`.rpgmvp` / `.png_`）。
+        # RPG Maker MV/MZ 默认开启资源加密，真实游戏里绝大多数贴图都是
+        # 加密的。实测：
+        #   * Elf Lifia（MV）  ：明文 png 12 张，加密 `.rpgmvp` **783** 张
+        #   * Beyond the Portal（MZ）：明文 95 张，加密 `.png_` **1453** 张
+        # 早先这里只 glob `*.png`，于是在那台 574 MB 的 MZ 游戏上
+        # `images_scan` 报"**0 张候选贴图**" —— 贴图汉化等于没做。
         for sub in TEXT_DIRS:
             d = img / sub
-            if d.is_dir():
-                candidates.extend(sorted(d.rglob("*.png")))
+            if not d.is_dir():
+                continue
+            for pat in ("*.png", *[f"*{s}" for s in IMAGE_SUFFIXES]):
+                candidates.extend(sorted(d.rglob(pat)))
+
+        # 加密资源需要 key；没有 key 就明确告警而不是静默漏掉
+        enc_count = sum(1 for p in candidates if is_encrypted_image_name(p))
+        if enc_count:
+            if self._encryption_keys(game_dir) is None:
+                report.errors.append(
+                    f"发现 {enc_count} 个加密贴图，但读不到 System.json 里的 "
+                    "encryptionKey，这些贴图会被跳过（其余照常处理）"
+                )
+            else:
+                log.info("发现 %d 个加密贴图，已找到解密 key", enc_count)
 
         report.files_scanned = len(candidates)
         for p in candidates:
@@ -705,13 +740,24 @@ class RpgMakerAdapter(EngineAdapter):
         # 贴图：把重绘结果覆盖到 out 目录
         if rebuilt_images:
             n = 0
+            keys = self._encryption_keys(out_dir)
             for rel, src in rebuilt_images.items():
                 dest = out_dir / rel
                 try:
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    import shutil as _sh
+                    # ---- 加密资源必须**重新加密**才能被游戏读取 ----
+                    # RPG Maker MV/MZ 默认开启资源加密，真实游戏里
+                    # 99% 的贴图是 `.rpgmvp` / `.png_`。引擎只认带头
+                    # 的格式，把纯 PNG 直接拷进去 = 图全裂。
+                    # 解密在读取侧做（见 `images.service.imread_bgr`），
+                    # 所以这里必须补上逆操作。
+                    if is_encrypted_image_name(rel) and keys is not None:
+                        plain = Path(src).read_bytes()
+                        dest.write_bytes(encrypt(plain, keys))
+                    else:
+                        import shutil as _sh
 
-                    _sh.copy2(src, dest)
+                        _sh.copy2(src, dest)
                     n += 1
                 except Exception as exc:  # noqa: BLE001
                     res.warnings.append(f"贴图回写失败 {rel}：{exc}")
