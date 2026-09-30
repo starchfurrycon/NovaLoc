@@ -13,10 +13,13 @@ from dataclasses import dataclass, field
 
 from ..lang import (
     count_cjk,
+    count_foreign_script,
     extract_placeholders,
+    foreign_script_ratio,
     has_hangul,
     has_kana,
     has_latin,
+    longest_foreign_run,
     normalize_for_compare,
     strip_placeholders,
 )
@@ -92,6 +95,43 @@ def clean_translation(text: str) -> str:
         if len(q) == 1 and len(t) >= 2 and t[0] == q and t[-1] == q or len(q) == 2 and len(t) >= 2 and t[0] == q[0] and t[-1] == q[1]:
             t = t[1:-1].strip()
     return t
+
+
+def check_foreign_script(target: str, *, max_ratio: float = 0.25) -> list[str]:
+    """译文里混进了"绝不该出现"的文字系统吗？
+
+    目标语言是中文，合法字母只有 **汉字 / 拉丁 / 数字**。
+    其余任何文字都说明**模型跑偏了**。真实记录（BeyondPortal）：
+
+    * 说话人名 `'Suky'` → `'<right>苏 กี้</right>'`（**泰文**，
+      模型按发音硬凑了一个泰文拼写）
+    * 台词 → `'我现在就想让你 دخول我!!!'`（**阿拉伯文**）
+    * 台词 → `'...ജവീ...'`（**马拉雅拉姆文**）
+
+    这些译文**通过了原先所有检查** —— 非空、长度合理、
+    占位符完好、也含汉字。玩家看到的是夹杂阿拉伯/泰文的乱码句。
+
+    ## 阈值怎么定的（都拿真实数据校准过）
+
+    * **至少 2 个**：单个外来字符多半是**正常写法** ——
+      希腊字母 `π`/`β` 在数值和术语里很常见，玩家也认得。
+      模型跑偏时是**成串**出现的。
+      实测 `'伤害 3π'` 的比值**恰好等于** 0.25，
+      真正救下它的是这一条（只有一个外来字符），不是比例条件。
+    * **比例 > 25%**：分母是"玩家可见字符"（见 `lang.visible_text`）。
+      实测校准：`'我现在就想让你 دخول我!!!'` 是 26.7%（挡住），
+       `'<right>苏 กี้</right>'` 是 75%（挡住）。
+
+    两个条件**必须同时满足**，避免"长句里夹一个希腊字母"被误杀。
+    """
+    n = count_foreign_script(target)
+    if n < 2:
+        return []
+    ratio = foreign_script_ratio(target)
+    if ratio > max_ratio:
+        run = longest_foreign_run(target)
+        return [f"foreign_script:{run}({n}字符/{ratio:.0%})"]
+    return []
 
 
 def check_placeholders(source: str, target: str) -> list[str]:
@@ -235,15 +275,17 @@ def guard(
     warnings += check_placeholders(source, target)
     warnings += check_length(source, target, max_chars, length_ratio)
     warnings += check_language_residue(source, target, target_lang)
+    warnings += check_foreign_script(target)
     if check_repeat:
         warnings += check_repetition(source, target)
 
     if not allow_untranslated and looks_untranslated(source, target):
         warnings.append("looks_untranslated")
 
-    # 致命错误分三类：
+    # 致命错误分四类：
     #  * 占位符崩掉 —— 写回去游戏会崩或丢变量；
     #  * 复读 —— 不可修复，写回去是一屏重复文字；
+    #  * 混进别的文字系统 —— 玩家看到的是一句夹杂阿拉伯/泰文的乱码；
     #  * 空译文。
     # 其余（过长、像是没翻）只警告，交给用户在审校界面判断。
     fatal = (
@@ -254,6 +296,7 @@ def guard(
                     "placeholder_missing",
                     "placeholder_extra",
                     "repetition",
+                    "foreign_script",
                 )
             )
             for w in warnings

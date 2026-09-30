@@ -18,7 +18,15 @@ from ..lang import normalize_for_compare
 from ..models import EntryStatus, TranslationEntry
 
 # 这些告警意味着译文不可信，不进记忆库
-_BAD_WARNINGS = ("placeholder", "prompt_leak", "empty_translation", "looks_untranslated")
+_BAD_WARNINGS = (
+    "placeholder",
+    "prompt_leak",
+    "empty_translation",
+    "looks_untranslated",
+    # 混进别的文字系统（阿拉伯/泰/马拉雅拉姆…）—— 也是硬错误，
+    # 不能当"已有译文"复用，否则错答案会被缓存并反复喂回来。
+    "foreign_script",
+)
 
 
 @dataclass

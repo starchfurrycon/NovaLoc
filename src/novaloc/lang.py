@@ -25,6 +25,43 @@ _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 # 任何字母
 _ANY_LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
 
+#: 「绝不该出现在中译里」的字母。
+#:
+#: 目标语言是中文，合法字母只有 **汉字 / 拉丁 / 数字**。
+#: 下面的区段全部是"模型跑偏跑到别的文字系统去了"。
+#:
+#: 注意**故意不含** CJK 与拉丁区段 —— 那两类是合法的；
+#: 也**不含** 韩文/假名：那属于"源语言是日韩"的情况，
+#: 另有 `looks_untranslated` / `guess_language` 去管。
+_FOREIGN_SCRIPT_RE = re.compile(
+    "["
+    "\u0370-\u03ff"  # 希腊
+    "\u0400-\u052f"  # 西里尔
+    "\u0530-\u058f"  # 亚美尼亚
+    "\u0590-\u05ff"  # 希伯来
+    "\u0600-\u06ff"  # 阿拉伯
+    "\u0700-\u074f"  # 叙利亚
+    "\u0750-\u077f"  # 阿拉伯补充
+    "\u0780-\u07bf"  # 塔纳
+    "\u0900-\u097f"  # 天城
+    "\u0980-\u09ff"  # 孟加拉
+    "\u0a00-\u0a7f"  # 古木基
+    "\u0a80-\u0aff"  # 古吉拉特
+    "\u0b00-\u0b7f"  # 奥里亚
+    "\u0b80-\u0bff"  # 泰米尔
+    "\u0c00-\u0c7f"  # 泰卢固
+    "\u0c80-\u0cff"  # 卡纳达
+    "\u0d00-\u0d7f"  # 马拉雅拉姆
+    "\u0d80-\u0dff"  # 僧伽罗
+    "\u0e00-\u0e7f"  # 泰
+    "\u0e80-\u0eff"  # 老挝
+    "\u0f00-\u0fff"  # 藏
+    "\u1000-\u109f"  # 缅甸
+    "\u10a0-\u10ff"  # 格鲁吉亚
+    "\u1200-\u137f"  # 埃塞俄比亚
+    "]"
+)
+
 # 常见控制码/转义序列（RPG Maker、Ren'Py、Unity 富文本……）
 _CONTROL_PATTERNS = [
     r"\\[VvNnPpCcIiSs]\[\d+\]",         # \V[1] \N[1] 等 RPG Maker
@@ -95,6 +132,78 @@ def has_latin(text: str) -> bool:
 
 def has_cyrillic(text: str) -> bool:
     return bool(_CYRILLIC_RE.search(text))
+
+
+#: 富文本/HTML 风格的标签：`<right>`、`</right>`、`<color=#fff>`、`<br>`
+_VISIBLE_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>|\[/?[a-zA-Z]+(?:=[^\]]*)?\]")
+
+
+def visible_text(text: str) -> str:
+    """去掉**不显示给玩家看**的部分：富文本标签、RPG Maker 转义。
+
+    比例类判据必须拿"玩家真正看到的字"当分母。
+    实测教训：`'<right>苏 กี้</right>'` 里的 `<right>`/`</right>`
+    一共 12 个字母，把外来比例的**分母撑大了 2.4 倍**，
+    于是比值从"明显异常"掉到 8.3%，判据放过去了。
+    而这些标签在游戏里**一个字符都不显示**。
+    """
+    t = _VISIBLE_TAG_RE.sub("", text or "")
+    t = re.sub(r"\\[VvNnPpCcIiSs]\[[^\]]*\]", "", t)
+    return t
+
+
+def count_foreign_script(text: str) -> int:
+    """数出"绝不该出现在中译里"的外来字符个数（**含组合记号**）。
+
+    中译目标语言是中文，所以合法字母只有三类：
+    **汉字**、**拉丁**（专有名词/缩写保留）、**数字**。
+    其余任何字母（阿拉伯、泰、天城、希伯来、希腊、亚美尼亚、
+    马拉雅拉姆、埃塞俄比亚、格鲁吉亚……）都是**模型跑偏**。
+
+    真实记录（BeyondPortal）：
+
+    * 说话人名 `'Suky'` → `'<right>苏 กี้</right>'`
+    * 台词 → `'我现在就想让你 دخول我!!!'`（**阿拉伯文**）
+    * 台词 → `'...ജവീ...'`（**马拉雅拉姆文**）
+
+    ## 为什么不能只数"字母"
+
+    泰文/天城文/阿拉伯文的**元音与声调是组合记号**，
+    Python 不把它们算作 letter。实测 `'กี้'` 用 `str.isalpha()`
+    逐字符数只得到 **1 个**（`ก`），`ี` 和 `้` 都被漏掉 ——
+    于是 `'<right>苏 กี้</right>'` 的外来比例只有 8.3%，判据放过去了。
+
+    所以这里数的是**原始字符**（用区段匹配），不是 letter。
+    """
+    return len(_FOREIGN_SCRIPT_RE.findall(text or ""))
+
+
+def longest_foreign_run(text: str) -> str:
+    """最长的一段连续外来文字（用来报告"混进了什么"）。"""
+    best = ""
+    cur = ""
+    for ch in visible_text(text):
+        if _FOREIGN_SCRIPT_RE.match(ch):
+            cur += ch
+            if len(cur) > len(best):
+                best = cur
+        else:
+            cur = ""
+    return best
+
+
+def foreign_script_ratio(text: str) -> float:
+    """外来字符占**玩家可见字符**的比例（``0.0`` 表示干净）。
+
+    分母是 `visible_text()` 之后的非空白字符：
+    既排除了不显示的富文本标签，也把组合记号算进来
+    （细节见 `count_foreign_script` 的说明）。
+    """
+    stripped = visible_text(text)
+    visible = [ch for ch in stripped if not ch.isspace()]
+    if not visible:
+        return 0.0
+    return count_foreign_script(stripped) / len(visible)
 
 
 def guess_language(text: str) -> str:
