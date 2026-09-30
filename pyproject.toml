@@ -31,7 +31,19 @@ dependencies = [
   "fonttools[woff]>=4.53",
   "pillow>=10.3",
   "numpy>=1.26",
-  "opencv-python-headless>=4.10",
+  # 只用 OpenCV 的无 GUI 功能（图像读写/缩放/几何变换/修补）。
+  #
+  # **刻意不声明 opencv-python-headless**：`rapidocr` 依赖
+  # `opencv-python`（带 GUI 的那个），而两者提供**同一个 `cv2` 包名**
+  # 与同名文件，pip 不会报冲突，只是后装的那个覆盖前一个。实测两者会
+  # 同时存在，`cv2.imshow` 也存在 —— 我们声明的 headless 实际上被
+  # 完全覆盖，纯粹是噪音（还让 `pip list` 看起来像个坏环境）。
+  #
+  # 代码里没有一处用到 GUI 函数（已核实无 imshow/waitKey/namedWindow），
+  # 所以带 GUI 的发行版完全可以满足需求。这里是让声明与事实一致。
+  # 想彻底去掉 GUI 依赖的话：卸掉两者后单独装 opencv-python-headless
+  # （此时不要再装 rapidocr 的 opencv 依赖），见 README 的说明。
+  "opencv-python>=4.10",
   # 注意：onnxruntime **不在这里**。基础依赖里放 onnxruntime 会和
   # onnxruntime-directml 冲突（两者提供同一个 `onnxruntime` 包名），
   # 用户装完会发现 DirectML provider 消失、退回 CPU 慢 84 倍。

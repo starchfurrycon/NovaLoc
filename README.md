@@ -102,6 +102,36 @@ AssetBundle，甚至编译进 `Assembly-CSharp.dll`。
 NovaLoc 在扫描 Unity 工程时会明确告诉你检测到了多少个未处理的
 序列化资源，并给出这个建议 —— 而不是假装全都翻好了。
 
+#### Unity 的字体这道坎（必须知道）
+
+Unity 的界面文字几乎都走 **TextMeshPro**，而 TMP 渲染用的是
+**预先烘焙好的图集**（`m_AtlasTextures` 指向一张贴图，字形是那张贴图上的
+位图块）。这意味着：
+
+> **只替换 TTF 字体文件对已经烘焙好的 TMP 资源没有任何影响。**
+> 游戏根本不会去读那个 TTF。
+
+要真正让中文出现，必须**重新烘焙图集**，而那需要解析
+`TMP_FontAsset` 的序列化格式、按原有字号重新光栅化字形、
+重算 `m_GlyphTable` / `m_CharacterTable` / `m_FaceInfo`，
+并且必须用 Unity 自身的排版度量才能和游戏完全一致。
+**这是一个独立的大工程，本版本没有实现。**
+
+所以 NovaLoc 在 Unity 上做的是"把能做的做到位 + 把做不到的说清楚"：
+
+1. 把补好的字体复制到 `*_Data/StreamingAssets/_novaloc_fonts/`
+   （`StreamingAssets` 会被原样打进构建，是运行时最可能被读到的位置）；
+2. 检测工程里有没有 TMP 字体资源，有就明确告诉你**需要重新烘焙**，
+   并给出用 Unity 编辑器 Font Asset Creator 的具体步骤；
+3. 绝不假装已经修好 —— **虚假的成功比明确的失败更浪费时间。**
+
+有一个真实存在的例外：如果游戏用的是**动态（Dynamic）** TMP 字体资源
+（`m_AtlasPopulationMode` 为 `Dynamic`），它运行时会按需把字形加进图集，
+此时替换 `StreamingAssets` 里的字体**是有效的**。NovaLoc 会提示你先试这一条。
+
+RPG Maker 与 Ren'Py 没有这个问题 —— 它们直接读字体文件，
+所以这两个引擎上的"不出现口口口"是**完全被保证的**。
+
 ---
 
 ## 安装
@@ -115,25 +145,55 @@ NovaLoc 在扫描 Unity 工程时会明确告诉你检测到了多少个未处�
 
 ### 步骤
 
+**推荐：用一键脚本**（自动建虚拟环境、装依赖、跑自检）
+
 ```powershell
-git clone <本仓库地址> novaloc
+git clone https://github.com/starchfurrycon/NovaLoc.git novaloc
+cd novaloc
+.\scripts\setup.ps1
+```
+
+**手动安装：**
+
+```powershell
+git clone https://github.com/starchfurrycon/NovaLoc.git novaloc
 cd novaloc
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 用 DirectML 版 onnxruntime（不要装 onnxruntime 和它两个都装）
-pip install -e ".[dml,web]"
+# dml = DirectML GPU 加速（快 84 倍）；ocr = PP-OCRv6 文字识别
+# **两个都不能省**：只装 dml 的话能翻译文本，但贴图文字识别不了。
+pip install -e ".[dml,ocr]"
+
+novaloc doctor      # 检查环境，会告诉你缺什么
 ```
 
-首次运行会引导你：
+> 关于 `onnxruntime`：本项目**不在基础依赖里**声明它，因为它和
+> `onnxruntime-directml` 提供同一个包名，一起装会让 DirectML
+> 静默消失、速度退回 CPU（慢 84 倍）。所以必须用 `dml` / `gpu` / `cpu`
+> 三个 extra **三选一**显式指定。
+>
+> 关于 `opencv`：`rapidocr` 会带入 `opencv-python`（带 GUI 的那个）。
+> 代码里没有用到任何 GUI 函数，所以功能上没问题；如果你在无桌面环境
+> 部署、想把 GUI 依赖也去掉，可以卸掉 `opencv-python` 后单独装
+> `opencv-python-headless`（注意不要再让 rapidocr 把 GUI 版装回来）。
 
-1. **下载 OCR 模型**（PP-OCRv6，约 140 MB）
-2. **安装 Ollama** 并拉取翻译模型
-3. **准备中文字体**（工具会自动查找系统已装字体，也可以指定）
+### 还需要准备的两样
+
+上面只装了 **NovaLoc 自己**。要完整跑通还需要：
+
+1. **Ollama + 翻译模型**（本地推理运行时）
+   ```powershell
+   novaloc ollama status     # 看是否已装/已启动
+   novaloc ollama pull       # 拉取推荐模型（约 4 GB）
+   ```
+2. **OCR 模型**（PP-OCRv6，约 140 MB）—— 首次运行识别贴图时自动下载，
+   也可以提前下好；`novaloc doctor` 会告诉你缺哪个、该放哪里。
+   > 模型缺失时自检会**明确报不可用**，不会假装就绪然后联网下载。
 
 ```powershell
-novaloc doctor      # 检查环境，会告诉你缺什么
+novaloc doctor      # 这一步应显示"一切就绪"
 ```
 
 ---
@@ -224,7 +284,7 @@ novaloc run <id> --stage apply
 ```powershell
 pip install -e ".[dev]"
 
-# 全量测试（20 个套件 / 57 个 pytest 项，约 3 分钟）
+# 全量测试（21 个套件 / 81 个 pytest 项，约 2.5 分钟）
 pytest tests -q
 
 # 单个套件也能直接当脚本跑，输出带实测数字的分节报告

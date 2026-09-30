@@ -133,14 +133,23 @@ if (-not (Test-Path $venvPython)) {
     }
 
     # 版本下限检查：pyproject.toml 要求 >= 3.11
-    $verText = & $basePython -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+    #
+    # **刻意不写双引号**：PowerShell 5.1 把参数传给原生 exe 时会**吃掉双引号**，
+    # `-c 'print("%d.%d" % ...)'` 到 Python 手里变成 `print(%d.%d % ...)`，
+    # 报 `SyntaxError: invalid syntax`。上层只看到
+    # `python.exe : File "<string>", line 1`，完全看不出是引号被吞了。
+    # 改用 sys.version_info 的整数判断，源码里一个双引号都不需要。
+    $verRaw = & $basePython -c 'import sys; print(sys.version_info[0], sys.version_info[1])'
     if ($LASTEXITCODE -ne 0) {
         Stop-WithError "无法执行 Python：$basePython"
     }
-    $verText = $verText.Trim()
-    $parts = $verText.Split('.')
-    $major = [int]$parts[0]
-    $minor = [int]$parts[1]
+    $verParts = @($verRaw.Trim() -split '\s+' | Where-Object { $_ -ne '' })
+    if ($verParts.Count -lt 2) {
+        Stop-WithError "无法解析 Python 版本：$($verRaw -join ' ')"
+    }
+    $major = [int]$verParts[0]
+    $minor = [int]$verParts[1]
+    $verText = "$major.$minor"
     if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 11)) {
         Stop-WithError "Python 版本过低：需要 3.11+，当前是 $verText`n（pyproject.toml 里 requires-python = \">=3.11\"）"
     }
@@ -153,7 +162,10 @@ if (-not (Test-Path $venvPython)) {
     }
     Write-Ok '虚拟环境已创建'
 } else {
-    $verText = (& $venvPython -c 'import sys; print("%d.%d" % sys.version_info[:2])').Trim()
+    # 同上的引号问题：用整数拼接，不要 %d 格式化
+    $verRaw = & $venvPython -c 'import sys; print(sys.version_info[0], sys.version_info[1])'
+    $verParts = @($verRaw -split '\s+' | Where-Object { $_ -ne '' })
+    $verText = if ($verParts.Count -ge 2) { "$($verParts[0]).$($verParts[1])" } else { '未知' }
     Write-Ok "复用已有虚拟环境（Python $verText）"
 }
 
@@ -253,7 +265,11 @@ if (-not $chosen) {
     Write-Ok "按参数指定使用：$chosen"
 }
 
-$extras = "[$chosen]"
+$extras = "[$chosen,ocr]"
+
+Write-Info "将安装 extra：$extras"
+Write-Info '  · 推理后端（按显卡选择）'
+Write-Info '  · ocr —— PP-OCRv6 文字识别（**贴图汉化必需**，缺了它只能翻文本）'
 
 # ---------------------------------------------------------------------------
 # 4. 升级 pip 并安装
@@ -292,6 +308,7 @@ if ($installCode -ne 0) {
   2. 首次装 onnxruntime-directml 时同时装了别的变体：
        先卸载三个，再只装一个（见上面的修复命令）。
   3. Python 版本不对：需要 3.11+。
+  4. 想只装文本翻译、不要贴图汉化：把 extra 改成 "[$chosen]" 再装。
 "@
 }
 Write-Ok '安装完成'
