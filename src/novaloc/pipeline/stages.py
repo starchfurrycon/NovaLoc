@@ -33,6 +33,7 @@ from ..engines import EngineAdapter, get_adapter
 from ..engines.base import ApplyResult
 from ..fonts.service import FontService, PatchResult
 from ..images.service import TextureResult, TextureTranslator
+from ..lang import count_foreign_script  # noqa: F401  (保留给贴图/报告使用)
 from ..models import (
     EntryStatus,
     ImageAsset,
@@ -43,6 +44,7 @@ from ..models import (
     TranslationEntry,
 )
 from ..translate.glossary import engine_label_target, merge_engine_labels
+from ..translate.guards import check_foreign_script
 
 log = logging.getLogger(__name__)
 
@@ -431,13 +433,39 @@ class Pipeline:
             merge_engine_labels(glossary)
 
             todo: list[TextUnit] = []
+            drift_retried = 0
             for u in units:
                 if not u.source.strip():
                     continue
                 prev = existing.get(u.uid)
                 if only_pending and prev is not None and prev.is_done and prev.target.strip():
+                    # ---- 「已完成」也要能被推翻：旧坏值必须有机会重译 ----
+                    #
+                    # `only_pending` 原先只看"状态=已翻译 且译文非空"，
+                    # 于是**守卫上线之前**写下的坏译文永远不会被重新校验：
+                    # 改了代码、重跑了，坏数据照样留着。
+                    # 实测留下 12 条夹着泰文/阿拉伯文/西里尔的乱码句。
+                    #
+                    # 这里对"含外来文字系统"的条目**强制重译**，
+                    # 但**限制次数**（最多 2 次）：模型可能反复给出同样的错答案，
+                    # 不限次数就会每次重跑都白烧时间。
+                    if check_foreign_script(prev.target):
+                        tries = int((prev.meta or {}).get("drift_retry", 0))
+                        if tries < 2:
+                            prev.meta = {**(prev.meta or {}), "drift_retry": tries + 1}
+                            drift_retried += 1
+                            todo.append(u)
+                            continue
                     continue
                 todo.append(u)
+
+            if drift_retried:
+                self.bus.log(
+                    f"{drift_retried} 条旧译文里混着别的文字系统，"
+                    "已强制重译（最多重试 2 次）",
+                    stage="translate",
+                    severity=Severity.WARN,
+                )
 
             if not todo:
                 return StageResult(
@@ -667,6 +695,38 @@ class Pipeline:
 
         return translated, source
 
+    @staticmethod
+    def _chars_from_patch_error(error: str | None) -> set[str]:
+        """从 `patch_font` 的报错里取回"补不上的字符"。
+
+        `patch_font` 的 error 是**给人看的**字符串，格式是
+
+            「字符集里有 N 个字符没有任何候选字体能提供，无法生成完整字体：XXXX」
+
+        但补丁流程需要的是"**是哪几个字**"，才能把它们从「顺带覆盖」
+        那一侧剔掉后重试。
+
+        ## 从**右端**切，不要按标点判断
+
+        第一版写成"冒号后、去掉空白和 ASCII"，
+        结果把前缀里的 `font`、`is` 之类的字母也当成"字符"留下了，
+        而真正要剔的是**末尾那一串**。
+        更糟的是有些外来文字（阿拉伯、天城）**也是 `isalpha()` 为真**，
+        按"是不是字母"去筛根本分不出来。
+
+        可靠的做法是认**结构**：格式固定是"……完整字体："+一串字符，
+        且那一串在**最末尾**，中间没有标点。所以：
+        取最后一个全角/半角冒号之后的全部内容，再只去掉空白。
+        """
+        if not error:
+            return set()
+        text = str(error).rstrip()
+        idx = max(text.rfind("："), text.rfind(":"))
+        if idx < 0:
+            return set()
+        tail = text[idx + 1 :].strip()
+        return {c for c in tail if not c.isspace()}
+
     def stage_fonts(self, *, force: bool = False) -> StageResult:
         def go() -> StageResult:
             ad = self._adapter()
@@ -680,6 +740,11 @@ class Pipeline:
                 )
 
             charset = fs.build_charset(translated, source)
+            # 「必需字符」= 译文 + UI 安全字符。这些**一定**会被写回游戏，
+            # 缺一个就是口口口，所以要求 100% 覆盖。
+            # 源文侧（含 OCR 噪声、别的文字系统的残渣）是「顺带覆盖」：
+            # 补不上只警告。详见 `stage_fonts` 里重试那一段的说明。
+            critical_charset = fs.build_charset(translated)
             cs = ProjectCharset(
                 text_chars=sorted(set("".join(translated))),
                 ui_chars=sorted(set("".join(source)) - set("".join(translated))),
@@ -758,6 +823,43 @@ class Pipeline:
                     stage="fonts",
                 )
                 pr: PatchResult = fs.patch_font(fp, charset, out_path=out_path)
+                # ---- 补不上时：只把「顺带」那一侧的字符剔掉重试 ----
+                #
+                # 真实事故（BeyondPortal，MZ）：字符集里有 21 个**永远补不上**的
+                # 字符（阿拉伯/泰/马拉雅拉姆，来自 OCR 噪声与译文跑偏），
+                # 于是 patch_font 整体失败、out_path 为空。
+                # 后果**比看起来严重**：`apply` 没有字体可回写，
+                # 就把原字体**原样拷**了过去 —— 而原字体中文覆盖只有 3.4%。
+                # 玩家进游戏满屏口口口，而流水线报"成功"。
+                #
+                # 修法是把"必需"和"顺带"分开：把补不上的字符剔掉，
+                # 只要**译文侧**真的 100% 覆盖，就照常产出字体。
+                # 宁可让某个未翻译的原文串缺字形（那是"原文没翻"的问题，
+                # 另有质检项去管），也不能因为一个噪声字符让**全部中文**
+                # 都变成口口口。
+                dropped_for_retry: list[str] = []
+                if not pr.ok:
+                    uncovorable = self._chars_from_patch_error(pr.error)
+                    # 只剔"只在源文侧"的字符；译文侧**不许剔** ——
+                    # 剔译文里的字符等于自己骗自己，缺了就是口口口。
+                    removable = uncovorable & (set(charset) - set(critical_charset))
+                    if removable:
+                        dropped_for_retry = sorted(removable)
+                        # 注意**不改 `charset` 本身**：它是每轮 audit 的基准，
+                        # 改了会让后面字体的 `audit.ok` 判断与产物不一致
+                        # （早先版本在这里写回 `charset = reduced`，
+                        # 于是下游"已全覆盖、跳过"的判断用的是**缩小后**的
+                        # 字符集，和实际写进字体的字符集对不上）。
+                        reduced = "".join(c for c in charset if c not in removable)
+                        self.bus.log(
+                            f"{len(removable)} 个字符只出现在**未翻译的原文**里"
+                            f"（{''.join(dropped_for_retry[:24])}），"
+                            "没有任何字体能提供。已从「顺带覆盖」里剔除后重试 —— "
+                            "它们不属于中文译文，不影响汉化完整性。",
+                            stage="fonts",
+                            severity=Severity.WARN,
+                        )
+                        pr = fs.patch_font(fp, reduced, out_path=out_path)
                 # 记录**实际用的策略**，不要把 action 写死成 "merge"。
                 # 早先这里硬编码 "merge"，于是 replace / fallback_only
                 # 策略产出的字体虽然 ok=True、out_path 也有值，却因为
@@ -787,6 +889,10 @@ class Pipeline:
                     "coverage_before": pr.audit_before.coverage if pr.audit_before else 0.0,
                     "coverage_after": pr.audit_after.coverage if pr.audit_after else 0.0,
                     "warnings": list(pr.warnings),
+                    # 记下"剔掉了哪些只有原文才用的字符"。
+                    # 不记的话，日后看到"字体覆盖率不是 100%"就无从判断
+                    # 到底是真的缺中文字形，还是剔掉了几个噪声字符。
+                    "dropped_source_only_chars": dropped_for_retry,
                 }
                 patches.append(entry)
                 for w in pr.warnings:
@@ -1063,6 +1169,42 @@ class Pipeline:
 
         return self._run("qa", go)
 
+    def _invalidate_entries(self, uids: set[str]) -> int:
+        """把指定条目**标记为未完成**（清空译文），让下一轮重译它们。
+
+        ## 为什么必须有这个动作
+
+        `stage_translate` 的 `only_pending` 只看"状态=已翻译 且译文非空"。
+        于是一条**在守卫上线之前**写下的坏译文会永远被跳过 ——
+        改了代码、重跑了，那几句还是乱的，而且没有任何报错。
+
+        只"拒绝回写"是不够的：工作区里的坏数据还在，
+        下一次跑流水线仍然会跳过它。所以这里把它清干净。
+
+        返回实际改动的条数。
+        """
+        if not uids:
+            return 0
+        entries = self.ws.load_entries()
+        changed = 0
+        for e in entries:
+            if e.uid not in uids:
+                continue
+            if not e.target and e.status is EntryStatus.FAILED:
+                continue  # 已经是这个状态，不必重复写
+            e.target = ""
+            e.status = EntryStatus.FAILED
+            e.warnings = [*(e.warnings or []), "invalidated:foreign_script"]
+            e.updated_at = time.time()
+            changed += 1
+        if changed:
+            self.ws.save_entries(entries)
+            self.bus.log(
+                f"已把 {changed} 条作废（译文清空），下一轮翻译会重译它们",
+                stage="apply",
+            )
+        return changed
+
     def stage_apply(self) -> StageResult:
         def go() -> StageResult:
             ad = self._adapter()
@@ -1072,6 +1214,7 @@ class Pipeline:
             # 只有真正译出来**且占位符完好**的才回写；原文一律不动。
             translations: dict[str, str] = {}
             risky: list[str] = []
+            drifted: list[str] = []
             for u in units:
                 e = entries.get(u.uid)
                 if e is None or not e.target.strip():
@@ -1079,7 +1222,37 @@ class Pipeline:
                 if not e.placeholder_ok:
                     risky.append(u.uid)
                     continue
+                # ---- 第二道闸门：混进别的文字系统的一律不回写 ----
+                #
+                # 这是**独立于翻译阶段**的一道检查，不是冗余。
+                # 真实教训：翻译阶段加好守卫之后，`entries.jsonl` 里
+                # 仍然留着**守卫上线之前**写下的坏译文 ——
+                # 因为 `stage_translate` 的 `only_pending` 会跳过
+                # "状态=已翻译且译文非空"的条目，那些旧坏值永远不会被重新校验。
+                # 于是"修好了代码、重跑了、坏数据还在"。
+                #
+                # 回写阶段是**最后一道**能拦住它的地方，所以这里必须再查一次。
+                if check_foreign_script(e.target):
+                    drifted.append(u.uid)
+                    continue
                 translations[u.uid] = e.target
+
+            if drifted:
+                self.bus.log(
+                    f"{len(drifted)} 条译文里混进了别的文字系统"
+                    f"（阿拉伯/泰/天城…），已**拒绝回写**："
+                    "这些是模型不翻译、改成按发音硬凑的乱码。"
+                    "已在翻译记忆里作废，下次重跑会自动重译它们。",
+                    stage="apply",
+                    severity=Severity.WARN,
+                )
+                # 顺手把工作区里这些条目标成"未完成"（清空译文），
+                # 这样**下一次跑 translate 就会自动重译它们** ——
+                # 不必手工删 entries.jsonl，也不必整轮重翻。
+                # 早先只"拒绝回写"而不管记忆，于是坏条目一直躺在
+                # entries.jsonl 里、每轮都被 `only_pending` 跳过，
+                # 表现就是"修好了、重跑了、那几句还是乱的"。
+                self._invalidate_entries(set(drifted))
 
             if risky:
                 self.bus.log(
