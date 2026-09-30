@@ -44,7 +44,14 @@ PULL_TIMEOUT_S = 1800.0
 
 
 def _windows_extra_paths() -> list[Path]:
-    """Windows 上 Ollama 安装器实际会落到的位置。"""
+    """Windows 上 Ollama 安装器实际会落到的位置。
+
+    除了官方安装器与 winget 的位置，还要考虑**便携版**：用户常把它解到
+    ``D:\\Ollama``、``D:\\Tools\\ollama`` 或数据根目录下。这类位置无法穷举，
+    所以先列常见固定位置，再按下面 ``_scan_portable_roots()`` 扫有限深度 ——
+    用户装字体的目的就是让工具找到它，找不到会报"未安装 Ollama"，
+    而用户明明装了。
+    """
     cands: list[Path] = []
 
     local = _getenv_any("LOCALAPPDATA", "LocalAppData")
@@ -62,7 +69,75 @@ def _windows_extra_paths() -> list[Path]:
         cands.append(Path(home) / "Ollama" / "ollama.exe")
         cands.append(Path(home) / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe")
 
+    cands.extend(_scan_portable_roots())
     return cands
+
+
+def _scan_portable_roots(max_depth: int = 3) -> list[Path]:
+    """在候选根目录下按有限深度找 ``ollama*.exe``。
+
+    刻意限制深度与目录数：这里会在 ``doctor`` 等命令里同步执行，
+    扫整个盘符会让"检查环境"变成几秒钟的卡顿。根目录只取
+    数据根目录、各盘符根、以及盘符下的少量常见目录名。
+    """
+    roots: list[Path] = []
+    # 数据根目录（NovaLoc 常把便携工具放在自己旁边）
+    try:
+        from ..core.paths import data_root
+
+        dr = data_root()
+        roots.append(dr)
+        if dr.parent != dr:
+            roots.append(dr.parent)
+    except Exception:  # noqa: BLE001 - 取不到就不扫，不该因此报错
+        pass
+
+    names = ("Ollama", "ollama", "Tools", "tools", "Programs", "Apps")
+    for letter in "CDEFGH":
+        base = Path(f"{letter}:\\")
+        try:
+            if not base.is_dir():
+                continue
+        except OSError:
+            continue
+        roots.append(base)
+        roots.extend(base / n for n in names)
+
+    found: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        try:
+            if not r.is_dir():
+                continue
+            key = str(r).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+        except OSError:
+            continue
+        for exe in _exe_names():
+            # rglob 在 depth 受限时仍可能很慢，所以先直接查一层
+            direct = r / exe
+            try:
+                if direct.is_file():
+                    found.append(direct)
+                    continue
+            except OSError:
+                pass
+            try:
+                for hit in r.glob(f"{'*/' * max_depth}{exe}"):
+                    if hit.is_file():
+                        found.append(hit)
+                        break
+            except OSError:
+                continue
+        if found:
+            break
+    return found
+
+
+def _exe_names() -> tuple[str, ...]:
+    return ("ollama.exe", "ollama-windows-amd64.exe")
 
 
 def _getenv_any(*names: str) -> str:
@@ -179,9 +254,51 @@ def model_sizes_gb(base_url: str = DEFAULT_BASE_URL) -> dict[str, float]:
 
 
 def models_root() -> Path | None:
-    """当前 ``OLLAMA_MODELS`` 指向哪里；没设置返回 ``None``。"""
+    """当前 ``OLLAMA_MODELS`` 指向哪里；查不到返回 ``None``。
+
+    只看**进程环境**是不够的：用户通常用 ``setx OLLAMA_MODELS ...`` 或
+    系统属性面板设置，那写的是**用户/系统级**环境变量，而已经打开的进程
+    （包括本工具）看不到它 —— Ollama 服务是之后启动的，所以它能看到。
+
+    后果很具体：``doctor`` 会打印"未设置 OLLAMA_MODELS，默认在 C 盘"，
+    而用户明明已经把 7 GB 模型放在 D 盘了。这种自检谎报比不报更糟，
+    因为它会让人去 C 盘找问题。
+
+    所以按 进程 → 用户级 → 系统级 依次查。
+    """
     v = os.environ.get("OLLAMA_MODELS")
+    if not v:
+        v = _persistent_env("OLLAMA_MODELS")
     return Path(v).expanduser() if v else None
+
+
+def _persistent_env(name: str) -> str | None:
+    """读**持久化**的用户级/系统级环境变量（Windows）。
+
+    非 Windows 上返回 ``None``（那边一般通过 shell 配置导出，
+    进程环境里已经有了）。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import winreg  # noqa: PLC0415 - 仅 Windows 需要
+    except ImportError:
+        return None
+    for root, sub in (
+        (winreg.HKEY_CURRENT_USER, r"Environment"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    ):
+        try:
+            with winreg.OpenKey(root, sub) as key:
+                val, _ = winreg.QueryValueEx(key, name)
+            if val:
+                return str(val)
+        except OSError:
+            continue
+    return None
 
 
 # --------------------------------------------------------------------------

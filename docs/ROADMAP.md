@@ -382,7 +382,7 @@ API 也已经有 `GET /api/projects/{pid}/images/{uid}/annotated`。
 | # | 问题 | 影响 | 状态 |
 |---|---|---|---|
 | 1 | ~~`images/service.py::_pick_font()` 用硬编码路径列表找中文字体；`FontSpec.local_path` 属性不存在，所以目录查找分支实际不生效~~ | **已修**：改走 `FontService`（系统字体索引 → 缓存 → 可再分发下载）。顺带发现 `_find_system_font()` 每次要 rglob 并逐个解析整个字体目录（实测 0.3~1.5 秒/次），而 `_pick_font` 会按十几个家族名各找一次 —— 每张贴图白花十几秒。已加进程级索引缓存（首次 2.2 秒，之后 0.000 秒） | ✅ 已完成 |
-| 2 | `pipeline/stage_apply` 只把 `action == "merge"` 的字体补丁传给适配器 | `replace` / `fallback_only` 策略的产物不会通过这条路径回写，需要手工放置 | 🔜 待修 |
+| 2 | ~~`pipeline/stage_apply` 只把 `action == "merge"` 的字体补丁传给适配器~~ | **已修**。这里有两个叠加的错：`stage_fonts` 把 `action` 硬编码成 `"merge"`（与 `cfg.font.strategy` 无关），`stage_apply` 又按 `action == "merge"` 过滤 —— 于是 `replace` / `fallback_only` 的产物虽然 `ok=True`、`out_path` 也有值，却**永远不会回写**，文件躺在工作区里而游戏毫无变化，且不报错。现在 `stage_fonts` 记录真实的 `pr.merge.method`，`stage_apply` 改用 `font_patch_records()` 按"注入成功且有产物"判断（只排除 `none`）。`tests/test_pipeline_e2e.py` 第 7a 节直接喂四种 action 守住它 | ✅ 已完成 |
 | 3 | `engines/unity.py` 与 `engines/loose.py` **没有覆写 `wire_fonts()`** | 字体文件放进了输出目录，但引擎不会去用它（需要用户手工处理，或等第 2.3 节） | 🔜 待修（依赖 2.1） |
 | 4 | ~~`translate` 包没有 `__init__.py`~~ | 已修：`src/novaloc/translate/__init__.py` 已加入。它刻意**不在 `__init__` 里即时导入子模块**（避免循环依赖与"一 import 就注册 provider"的副作用），改用 `__getattr__` 做懒加载 | ✅ 已完成 |
 | 5 | ~~配置有两套格式：`<data_root>/config.json` 与 `<config_dir>/config.toml`~~ | **已修**：统一到 `<data_root>/config.json`。`Config.load/save` 是唯一实现，API 与 CLI 都委托给它；旧 TOML 只在 JSON 缺失时作只读回退并**自动迁移**，老用户不丢配置 | ✅ 已完成 |

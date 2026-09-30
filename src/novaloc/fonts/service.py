@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import time
@@ -124,17 +125,30 @@ _SYSTEM_FONT_INDEX: dict[str, list[dict[str, Any]]] = {}
 def _system_font_index(*, refresh: bool = False) -> list[dict[str, Any]]:
     """扫描系统字体目录并缓存。返回 ``[{path, family, cmap}, ...]``。
 
-    缓存键用各目录 mtime 拼成：用户装了新字体会让目录 mtime 变化，
-    自动失效重扫；否则一次进程内只扫一遍。
+    缓存键由**每个字体文件的 (名字, mtime, 大小)** 摘要而成，
+    不是目录自身的 mtime —— NTFS 上往目录里复制新文件**不会**改变
+    该目录的 mtime（目录 mtime 只在目录项本身被改动时更新，
+    而"新建文件"在 Windows 上并不稳定地触发它）。
+    用目录 mtime 做键会让"用户刚装了字体但进程还没重启"时
+    永远看不到新字体，而用户装字体的**唯一**目的就是让工具找到它。
+
+    摘要计算只 stat，不读文件内容，所以比重新解析整个字体目录便宜得多。
     """
     from .coverage import system_font_dirs
 
     use = system_font_dirs()
-    try:
-        stamp = "|".join(f"{d}:{int(d.stat().st_mtime)}" for d in use)
-    except OSError:
-        stamp = "|".join(str(d) for d in use)
-    key = f"{stamp}|{len(use)}"
+    parts: list[str] = []
+    for d in use:
+        try:
+            ents = sorted(
+                (p.name, int(p.stat().st_mtime), p.stat().st_size)
+                for p in d.iterdir()
+                if p.is_file()
+            )
+            parts.append(f"{d}:" + ";".join(f"{n}@{m}#{s}" for n, m, s in ents))
+        except OSError:
+            parts.append(str(d))
+    key = hashlib.sha1("|".join(parts).encode("utf-8", "replace")).hexdigest()
     if not refresh and key in _SYSTEM_FONT_INDEX:
         return _SYSTEM_FONT_INDEX[key]
 

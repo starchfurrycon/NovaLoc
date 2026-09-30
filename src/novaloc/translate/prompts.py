@@ -184,14 +184,26 @@ def build_batch_user_prompt(
     if extra_context:
         parts.append(f"背景信息：{extra_context}")
 
+    # 输出格式放在**待翻译内容之前**。实测把格式要求只写在最后时，
+    # translategemma:4b 会只回第一个对象就停（`{"i": 0, "t": "生命值"}`），
+    # 后面 5 条全丢；把格式与示例提前、并在内容后面再重复一次"共 N 条"，
+    # 成功率高得多。这是提示词顺序问题，不是模型能力问题。
+    n = len(masked_texts)
+    parts.append(
+        f"输出格式（严格遵守）：一个 JSON 数组，共 {n} 个对象，"
+        f'按编号升序，每项形如 {{"i": 编号, "t": "译文"}}。\n'
+        f'示例：[{{"i": 0, "t": "第一句译文"}}, {{"i": 1, "t": "第二句译文"}}]\n'
+        f"要求：以 [ 开头、以 ] 结尾；{n} 个对象一个都不能少、不能合并；"
+        f"不要输出数组以外的任何文字、注释或解释。"
+    )
+
     parts.append("待翻译内容（编号 → 原文，⟦n⟧ 是必须原样保留的占位符）：")
     for i, text in enumerate(masked_texts):
         # 不用引号包裹，避免模型把引号当成内容的一部分
         parts.append(f"{i} → {text}")
 
     parts.append(
-        f"\n请返回 {len(masked_texts)} 个对象的 JSON 数组，"
-        f'每项形如 {{"i": 编号, "t": "中文译文"}}，编号必须一项不漏。'
+        f"\n现在输出这 {n} 个对象的 JSON 数组（编号 0 到 {n - 1}，一个不漏）："
     )
     return "\n".join(parts)
 

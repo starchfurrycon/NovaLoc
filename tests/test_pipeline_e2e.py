@@ -237,6 +237,54 @@ def main() -> int:
     # 7. 回写：坏译文必须被拒绝
     # ---------------------------------------------------------------
     print("\n[7] 回写")
+
+    # 7a. 回归：字体补丁**不能**按 "action == merge" 过滤。
+    # 早先 stage_fonts 把 action 硬编码成 "merge"，而 stage_apply 又只认
+    # "merge" —— 于是 replace / fallback_only 策略的产物虽然 ok=True、
+    # out_path 也有值，却永远不会被回写：文件躺在工作区里，游戏里毫无变化，
+    # 而且**不报错**。这种静默丢弃只能靠针对性断言守住。
+    print("  [7a] 字体补丁的 action 过滤（静默丢弃产物的回归）")
+    from novaloc.pipeline.stages import font_patch_records  # noqa: PLC0415
+
+    real_patches = ws.read_json("fonts/patches.json", []) or []
+    print(f"       本项目的补丁 action: {[p.get('action') for p in real_patches]}")
+    check("真实补丁记录了实际策略（不是一律 merge）",
+          all(p.get("action") in ("merge", "merge_multi", "replace", "fallback_only", "none")
+              for p in real_patches),
+          str([p.get("action") for p in real_patches]))
+    check("真实补丁带上了 strategy 字段",
+          all("strategy" in p for p in real_patches),
+          str(real_patches[:1]))
+
+    # 直接喂四种 action，断言哪些会被回写。
+    # replace / fallback_only 是**必须**回写的两种 —— 它们正是策略配置项
+    # 存在的意义（原字体不能改时整份替换）。
+    fake_patches = [
+        {"font_id": "a.ttf", "ok": True, "action": "merge",
+         "out_path": str(ws.p("fonts", "a.ttf"))},
+        {"font_id": "b.ttf", "ok": True, "action": "replace",
+         "out_path": str(ws.p("fonts", "b.ttf"))},
+        {"font_id": "c.ttf", "ok": True, "action": "fallback_only",
+         "out_path": str(ws.p("fonts", "c.ttf"))},
+        {"font_id": "d.ttf", "ok": True, "action": "none",
+         "out_path": str(ws.p("fonts", "d.ttf"))},
+        {"font_id": "e.ttf", "ok": False, "action": "merge",
+         "out_path": str(ws.p("fonts", "e.ttf"))},
+        {"font_id": "f.ttf", "ok": True, "action": "merge", "out_path": ""},
+    ]
+    ws.write_json("fonts/patches.json", fake_patches)
+    got = {r["font_id"] for r in font_patch_records(ws)}
+    print(f"       被判定为可回写: {sorted(got)}")
+    check("merge 策略会回写", "a.ttf" in got)
+    check("replace 策略会回写（曾经被静默丢弃）", "b.ttf" in got, str(sorted(got)))
+    check("fallback_only 策略会回写（曾经被静默丢弃）",
+          "c.ttf" in got, str(sorted(got)))
+    check("action=none 不回写", "d.ttf" not in got)
+    check("ok=False 不回写", "e.ttf" not in got)
+    check("out_path 为空不回写", "f.ttf" not in got)
+    # 还原成真实补丁，免得影响后面的回写步骤
+    ws.write_json("fonts/patches.json", real_patches)
+
     r = pipe.stage_apply()
     print(f"    apply: {r.message}  {r.stats}")
     check("回写完成", r.ok, r.error)

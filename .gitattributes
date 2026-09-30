@@ -1,0 +1,32 @@
+# 统一按 LF 存储，检出时也保持 LF。
+#
+# 为什么必须显式声明：本项目的开发环境是 Windows，而 Python 的
+# `pathlib.Path.write_text()` 默认会把 `\n` 转换成 `\r\n`。窗口一开，
+# 一次"改两行"的提交就会显示成"整个文件重写"——
+# 实测 placeholders.py 因此从 417 行变 805 个 CRLF、16 KB 变 34 KB，
+# diff 里 1222 行改动几乎全是行尾噪音，真实改动被完全掩盖。
+#
+# 声明 `eol=lf` 后，即使工作区被写成了 CRLF，git 也会在提交时归一化，
+# 从而让 diff 只反映真实改动。
+* text=auto eol=lf
+
+# 二进制资源不要做任何换行/文本处理
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.ttc binary
+*.woff binary
+*.woff2 binary
+*.onnx binary
+*.zip binary
+*.7z binary
+*.gz binary
+*.ico binary
+*.pyc binary
+
+# 字体模型等大文件走 LFS 暂不考虑（当前仓库不含字体文件，见 README）

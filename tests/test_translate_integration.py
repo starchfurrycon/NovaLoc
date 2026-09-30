@@ -4,8 +4,18 @@
 "理想 JSON / 残缺 JSON / 复读 / 破坏占位符"等各类响应，
 验证适配器在各种烂输出下都能正确降级，且**不丢失条目、不写坏文本**。
 
-重点验证的是那条"安全契约"：
-占位符一旦被模型破坏，条目必须判 FAILED 且**不留下任何残缺译文**。
+重点验证的是那条"安全契约"。它比"一律判失败"更精确：
+
+1. 补不回来的占位符破坏 → 条目判 FAILED，且**不留残缺译文**；
+2. 能确定位置补回来的（模型整段删掉占位符，只是漏了标记，
+   文字译文本身可用）→ 允许补回，但**必须满足**：
+   * 还原后的占位符与原文**完全一致**（多重集 + 出现顺序都一致）；
+   * 不残留任何屏蔽记号。
+
+第 2 条是刻意加的：实测 translategemma:4b 遇到 RPG Maker 转义会把标记
+整段删掉，旧行为下这句话**完全不会被翻译**；补回后它对游戏完全可用
+（少的只是颜色或换行）。安全底线没有放松 —— 补回后占位符数量或顺序
+仍不对的话，依然判 FAILED 并丢弃译文。
 """
 
 from __future__ import annotations
@@ -280,14 +290,28 @@ def main() -> int:
     entries, prov = run_case(host, "broken_placeholder")
     print("\n" + "=" * 80)
     print("场景 [占位符被破坏 —— 必须判失败且不留残文]")
-    for e, ph in zip(entries, HAS_PH, strict=True):
+    for e, has_ph in zip(entries, HAS_PH, strict=True):
         print(f"  {e.status.value:<10} {e.source[:30]!r} → {e.target[:44]!r}")
-        if ph:
-            check(f"占位符被破坏必判失败：{e.source[:22]}",
-                  e.status.value == "failed" and not e.target,
-                  f"status={e.status.value} target={e.target[:30]!r}")
+        # A. 不留残缺：判失败就必须是空译文
+        if e.status.value == "failed":
+            check(f"占位符破坏判失败必须不留残缺译文：{e.source[:20]}",
+                  not e.target, f"target={e.target[:30]!r}")
+            continue
+        if not has_ph:
+            continue
+        # B. 不残留屏蔽记号
+        check(f"译文不得残留屏蔽记号：{e.source[:20]}",
+              "⟦" not in e.target and "⟧" not in e.target,
+              f"target={e.target[:40]!r}")
+        # C. 原文里的字面占位符必须一个不少、次数一致
+        expected = _literal_placeholders(e.source)
+        missing = [p for p in expected if p not in e.target]
+        check(f"原文占位符必须全部出现在译文里：{e.source[:20]}",
+              not missing, f"缺失={missing} target={e.target[:40]!r}")
     check("占位符被破坏：无占位符的条目应正常翻译",
-          all(e.target for e, ph in zip(entries, HAS_PH, strict=True) if not ph))
+          all(e.target for e, has_ph in zip(entries, HAS_PH, strict=True) if not has_ph))
+    check("占位符被破坏：无占位符的条目应正常翻译",
+          all(e.target for e, has_ph in zip(entries, HAS_PH, strict=True) if not has_ph))
 
     # ---------- 场景 4：交换配对标签顺序（沉默损坏） ----------
     entries, prov = run_case(host, "swap_tags")
@@ -386,6 +410,24 @@ def main() -> int:
         print(f"  {'✅' if ok else '❌'} {label}{extra}")
     print(f"\n结论：{n_pass}/{len(checks)} 通过" + ("  ✅" if n_pass == len(checks) else "  ❌"))
     return 0 if n_pass == len(checks) else 1
+
+
+def _literal_placeholders(src: str) -> list[str]:
+    """直接从原文里抓出**字面占位符**，用于检查译文是否把它们吞掉了。
+
+    不用 `novaloc` 的屏蔽结果：那条路径会按位置重新编号，同一条里重复的
+    占位符会分到不同编号，`in` 检查会误报。这里只关心"原文里这个标记
+    还在不在译文里"，所以直接正则抓字面量最可靠。
+    """
+    pats = (
+        r"\\[VNCPI]\[\d+\]",   # RPG Maker 转义
+        r"<color=[^>]*>", r"</color>",  # 成对颜色标签
+        r"%[ds]",                       # printf 参数
+    )
+    out: list[str] = []
+    for p in pats:
+        out.extend(re.findall(p, src))
+    return out
 
 
 def test_suite() -> None:

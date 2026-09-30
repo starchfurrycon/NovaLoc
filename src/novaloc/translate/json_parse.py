@@ -316,7 +316,12 @@ def parse_json_loose(text: str) -> ParseResult:
     return res
 
 
-def to_translation_map(value: Any, *, expect_indices: list[int] | None = None) -> dict[int, str]:
+def to_translation_map(
+    value: Any,
+    *,
+    expect_indices: list[int] | None = None,
+    sources: list[str] | None = None,
+) -> dict[int, str]:
     """把解析结果规整成 ``{编号: 译文}``。
 
     支持多种形状：
@@ -324,6 +329,15 @@ def to_translation_map(value: Any, *, expect_indices: list[int] | None = None) -
     * ``{"translations": [...]}`` / ``{"result": [...]}``
     * ``{"0": "...", "1": "..."}``
     * ``["译文0", "译文1"]``   —— 裸数组（按顺序，仅在无索引时使用）
+    * ``{"原文": "译文", ...}`` —— **以原文为键的对象**
+
+    最后一种不是我们要求的格式，但**实测 `translategemma:4b` 就是会这么回**：
+    要求"返回 6 个对象的 JSON 数组"时它只回 ``{"i": 0, "t": "生命值"}``，
+    而要求"每行 `编号<TAB>原文`"时它回
+    ``{"HP": "生命值", "MP": "魔法值", ...}`` —— 完整且正确。
+
+    所以这一层必须认原文键，否则一个 4B 专用翻译模型会被判成"翻译失败"。
+    传 ``sources`` 后按"原文 → 编号"反查；查不到的键直接丢弃。
     """
     out: dict[int, str] = {}
 
@@ -360,20 +374,56 @@ def to_translation_map(value: Any, *, expect_indices: list[int] | None = None) -
                     out[idx] = text
 
     elif isinstance(value, dict):
+        src_index = _build_source_index(sources)
         for k, v in value.items():
-            idx = _coerce_int(k)
-            if idx is None:
-                continue
             text = _coerce_str(v)
             if text is None and isinstance(v, dict):
                 text = _coerce_str(v.get("t", v.get("text", v.get("translation"))))
-            if text is not None:
+            if text is None:
+                continue
+            idx = _coerce_int(k)
+            if idx is None:
+                # 数字键失败 → 当成"原文作键"反查
+                idx = _match_source(str(k), src_index)
+            if idx is not None:
                 out[idx] = text
 
     elif isinstance(value, str):
         out[0] = value
 
     return out
+
+
+def _build_source_index(sources: list[str] | None) -> dict[str, list[int]]:
+    """把 ``sources`` 做成 ``{原文: [编号...]}``。
+
+    值是**列表**：同一批次里两条原文完全相同时（游戏里很常见），
+    它们理应拿到同一份译文，所以一个键要能映射到多个编号，
+    而不是后者覆盖前者。
+    """
+    idx: dict[str, list[int]] = {}
+    if not sources:
+        return idx
+    for i, s in enumerate(sources):
+        if not s:
+            continue
+        idx.setdefault(s, []).append(i)
+    return idx
+
+
+def _match_source(key: str, src_index: dict[str, list[int]]) -> int | None:
+    """按原文反查编号：先精确匹配，再规范化匹配（空白折叠）。"""
+    if not src_index:
+        return None
+    if key in src_index:
+        return src_index[key][0]
+    norm = " ".join(key.split())
+    if not norm:
+        return None
+    for src, idxs in src_index.items():
+        if " ".join(src.split()) == norm:
+            return idxs[0]
+    return None
 
 
 def _coerce_int(v: Any) -> int | None:
@@ -407,7 +457,16 @@ def _coerce_str(v: Any) -> str | None:
     return None
 
 
-def parse_translations(text: str, *, expect_indices: list[int] | None = None) -> tuple[dict[int, str], ParseResult]:
-    """一步到位：解析 + 规整。返回 ``(编号→译文, 解析结果)``。"""
+def parse_translations(
+    text: str,
+    *,
+    expect_indices: list[int] | None = None,
+    sources: list[str] | None = None,
+) -> tuple[dict[int, str], ParseResult]:
+    """一步到位：解析 + 规整。返回 ``(编号→译文, 解析结果)``。
+
+    ``sources`` 传本批次**屏蔽后的原文**（顺序即编号顺序），
+    用于识别"模型以原文为键"的返回形态（见 :func:`to_translation_map`）。
+    """
     res = parse_json_loose(text)
-    return to_translation_map(res.value, expect_indices=expect_indices), res
+    return to_translation_map(res.value, expect_indices=expect_indices, sources=sources), res

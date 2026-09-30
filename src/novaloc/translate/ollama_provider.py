@@ -65,6 +65,8 @@ class OllamaTranslationProvider:
             "single_fallbacks": 0,
             "recovered_json": 0,
             "placeholder_fatal": 0,
+            "placeholder_repaired": 0,
+            "cross_item_leak": 0,
             "items": 0,
         }
 
@@ -205,7 +207,10 @@ class OllamaTranslationProvider:
         )
         raw = self._chat(user, system=prompts.SYSTEM_PROMPT)
         expect = list(range(len(batch_items)))
-        mapping, res = parse_translations(raw, expect_indices=expect)
+        # 传 masked 作为 sources：模型有时不按"对象数组"回，而是回
+        # "原文作键的对象"（实测 translategemma:4b 就是这样），
+        # 解析层靠这个反查编号。
+        mapping, res = parse_translations(raw, expect_indices=expect, sources=list(masked))
         if not res.ok:
             raise ProviderError(
                 f"JSON 解析失败（{'; '.join(res.notes)[:160]}）：{raw[:180]!r}"
@@ -217,6 +222,18 @@ class OllamaTranslationProvider:
         missing = [i for i in expect if i not in mapping]
         if missing:
             log.debug("批次漏了 %d 条：%s", len(missing), missing[:10])
+            # 只补漏的那些，**不**重发整批：重发整批既慢又可能再次漏。
+            # 逐条调用实测可靠（单条成功率远高于批量），所以用可靠性换速度，
+            # 且只对真正缺的条目付出这个代价。
+            self.stats["single_fallbacks"] += 1
+            for li in missing:
+                try:
+                    got = self._call_single(batch_items[li], masked[li])
+                except (ProviderError, OllamaError, ModelMissing, OllamaNotRunning) as exc:
+                    log.debug("补漏第 %d 条失败：%s", li, exc)
+                    continue
+                if got:
+                    mapping[li] = got
         return mapping
 
     def _call_single(self, item: TranslateItem, masked: str) -> str:
@@ -336,7 +353,35 @@ class OllamaTranslationProvider:
                         masked_source=masked_all[local_i],
                     )
                     if ph_check.fatal:
-                        # 占位符被破坏 —— 这是硬错误，绝不能写回游戏
+                        # 占位符被破坏。先试**补回**再决定是否放弃：
+                        # 实测 translategemma:4b 会把 `\C[6]`、`\N[2]`、`\n`
+                        # 这类转义整段删掉只译文字。原本直接判失败，
+                        # 结果是"这句没翻译"，而它其实完全可用（少的只是
+                        # 颜色或换行）。补回只调整记号位置，"数量与内容是否
+                        # 齐全"仍由 verify_restored 复查。
+                        repaired = ph.repair_dropped_masks(
+                            masked_all[local_i], raw_masked, slots_all[local_i]
+                        )
+                        if repaired is not None:
+                            restored2, check2 = ph.verify_restored(
+                                item.unit.source,
+                                repaired,
+                                slots_all[local_i],
+                                masked_source=masked_all[local_i],
+                            )
+                            if not check2.fatal:
+                                self.stats["placeholder_repaired"] = (
+                                    self.stats.get("placeholder_repaired", 0) + 1
+                                )
+                                log.debug(
+                                    "补回占位符：%s → %s",
+                                    ph_check.describe(),
+                                    repaired,
+                                )
+                                restored, ph_check = restored2, check2
+                                raw_masked = repaired
+                    if ph_check.fatal:
+                        # 补不回来 —— 硬错误，绝不能写回游戏
                         self.stats["placeholder_fatal"] += 1
                         entry.status = EntryStatus.FAILED
                         entry.target = ""

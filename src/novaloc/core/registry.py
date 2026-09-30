@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -22,6 +23,8 @@ from ..models import (
     TextUnit,
     TranslationEntry,
 )
+
+_log = logging.getLogger(__name__)
 
 
 class ProviderError(RuntimeError):
@@ -138,6 +141,25 @@ def list_registered(kind: str) -> list[str]:
     return sorted(_REGISTRY.get(kind, {}))
 
 
+def _bootstrap_providers() -> None:
+    """触发翻译层 provider 的注册（幂等，失败不致命）。
+
+    延迟导入 ``novaloc.translate`` 是为了避免 core → translate → core 的
+    循环导入：``translate`` 的模块顶层会 ``from ..core.registry import register``，
+    如果在 registry 模块的顶层导入它，就会在 registry 还没定义完
+    ``register`` 时被反过来引用。
+    """
+    try:
+        from ..translate import register_providers  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 - 注册失败不该让 core 不可用
+        _log.warning("无法导入 translate.register_providers：%s", exc)
+        return
+    try:
+        register_providers()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("翻译 provider 注册失败：%s", exc)
+
+
 class Providers:
     """按名称解析并缓存适配器实例。"""
 
@@ -145,6 +167,13 @@ class Providers:
         self.ctx = ctx
         self._instances: dict[tuple[str, str], Any] = {}
         self._lock = threading.Lock()
+        # 翻译层的 provider 靠 ``@register`` 装饰器自注册，而装饰器只在
+        # 模块被 import 时执行。之前没有任何地方 import 它们，于是注册表
+        # 是空的：`novaloc run` 直接报
+        # "translate 适配器 'ollama' 未注册。已注册：（空）"，
+        # 而用户的 Ollama 明明好好跑着。放在这里是因为所有入口
+        # （CLI / API / 流水线）都会构造 Providers。
+        _bootstrap_providers()
 
     def names(self, kind: str) -> list[str]:
         return sorted(_REGISTRY.get(kind, {}))

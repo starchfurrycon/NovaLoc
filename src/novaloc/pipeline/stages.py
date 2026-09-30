@@ -92,6 +92,8 @@ class PipelineError(RuntimeError):
 class Pipeline:
     """一个项目的汉化流水线。"""
 
+    # 见文件末尾的 font_patch_records() —— 提成模块级函数是为了能单独测。
+
     def __init__(
         self,
         ws: Workspace,
@@ -513,9 +515,22 @@ class Pipeline:
                     stage="fonts",
                 )
                 pr: PatchResult = fs.patch_font(fp, charset, out_path=out_path)
+                # 记录**实际用的策略**，不要把 action 写死成 "merge"。
+                # 早先这里硬编码 "merge"，于是 replace / fallback_only
+                # 策略产出的字体虽然 ok=True、out_path 也有值，却因为
+                # `stage_apply` 按 `action == "merge"` 过滤而被**丢弃** ——
+                # 产物落在工作区里，却永远回写不到游戏。
+                # pr.merge.method 才是真实发生的事：
+                # merge_multi / replace / fallback_only / merge。
+                action = str(
+                    getattr(pr.merge, "method", "")
+                    or getattr(self.ctx.config.font, "strategy", "")
+                    or "merge"
+                )
                 entry = {
                     "font_id": gf.font_id,
-                    "action": "merge" if pr.ok else "none",
+                    "action": action if pr.ok else "none",
+                    "strategy": getattr(self.ctx.config.font, "strategy", ""),
                     "out_path": str(pr.out_path) if pr.out_path else "",
                     "ok": pr.ok,
                     "error": pr.error,
@@ -803,9 +818,8 @@ class Pipeline:
                 )
 
             font_patches: dict[str, Path] = {}
-            for p in self.ws.read_json("fonts/patches.json", []) or []:
-                if p.get("ok") and p.get("out_path") and p.get("action") == "merge":
-                    font_patches[p["font_id"]] = Path(p["out_path"])
+            for patch in font_patch_records(self.ws):
+                font_patches[patch["font_id"]] = patch["out_path"]
 
             rebuilt: dict[str, Path] = {}
             rebuilt_root = self.ws.p("images", "rebuilt")
@@ -900,10 +914,45 @@ class Pipeline:
         }
 
 
+def font_patch_records(ws: Workspace) -> list[dict[str, Any]]:
+    """挑出**可以回写**的字体补丁，返回 ``[{font_id, out_path, action}]``。
+
+    判据是"注入成功且有产物"，**不是**某个具体的 action 字符串。
+
+    为什么值得单独写成函数：``stage_fonts`` 曾经把 ``action`` 硬编码成
+    ``"merge"``，而 ``stage_apply`` 又按 ``action == "merge"`` 过滤 ——
+    于是 ``replace`` 与 ``fallback_only`` 两种策略的产物虽然
+    ``ok=True``、``out_path`` 也有值，却**永远不会被回写**：
+    文件躺在工作区里，游戏里没有任何变化，而且不报错。
+    这种"静默丢弃产物"的 bug 只能靠针对性测试守住，
+    所以把判据提出来，让它可被单独断言。
+
+    ``action == "none"`` 有两种含义，两种都不该回写：
+    原字体已全覆盖（无需替换）、或注入失败。
+    """
+    out: list[dict[str, Any]] = []
+    for p in ws.read_json("fonts/patches.json", []) or []:
+        if not isinstance(p, dict):
+            continue
+        if not p.get("ok") or not p.get("out_path"):
+            continue
+        if p.get("action") in ("none", "", None):
+            continue
+        out.append(
+            {
+                "font_id": p.get("font_id") or Path(str(p["out_path"])).name,
+                "out_path": Path(str(p["out_path"])),
+                "action": str(p.get("action")),
+            }
+        )
+    return out
+
+
 __all__ = [
     "Pipeline",
     "PipelineError",
     "STAGES",
     "STAGE_LABELS",
     "StageResult",
+    "font_patch_records",
 ]
