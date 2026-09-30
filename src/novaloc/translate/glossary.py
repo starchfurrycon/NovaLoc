@@ -262,3 +262,177 @@ def suggest_terms(texts: list[str], *, min_count: int = 3, limit: int = 200) -> 
     ]
     out.sort(key=lambda s: -s.count)
     return out[:limit]
+
+
+# ----------------------------------------------------------------------
+# 引擎内建标签：**确定性覆盖**，不交给模型猜
+# ----------------------------------------------------------------------
+#
+# ## 为什么单独做一张表
+#
+# `_BUILTIN_TERMS` 是**提示词注入**用的（把命中条目塞进提示词，让模型
+# 自觉遵守）。实测那条路对本项目的小模型**整体是负收益**，所以默认不启用
+# （结论见 `stage_translate` 的注释）。
+#
+# 但有一类词不能靠"让模型遵守"：**引擎内建的 UI 标签**。
+# 真实事故：RPG Maker MV 的 `System.json` → `terms.basic` 是
+#
+#     ["Level","Lv","HP","HP","MP","MP","TP","TP"]
+#
+# 模型把 `HP`/`MP`/`TP` **全译成了"生命值"**。玩家看到三个同名字段。
+# 同类事故：`僧侶` 和 `魔術師` 都被译成"法师"，两个职业变成同一个。
+#
+# 这些是**单条、无上下文**的缩写（在 JSON 里就是独立的 `"HP"` 字符串），
+# 模型只能猜，而每种猜法都"像那么回事" —— 漏译、占位符、源文差异
+# 三类检查全抓不到，写回游戏就是既成事实。
+#
+# ## 为什么是"覆盖"而不是"更强的注入"
+#
+# 提示词注入对 4B 模型**不保证**遵守（实测有漏译和串词）。而这类标签是
+# **有限且固定**的引擎标识符，不是用户的领域知识 —— 一共就 8 个
+# `terms.basic` 位置加几十个常见职业名，用表确定性地译，比"求模型听话"
+# 可靠得多。
+#
+# ## 安全边界（很重要）
+#
+# 只在 `source` 归一化后**精确等于**标签时覆盖，**绝不做子串替换**。
+# `System.json` 里的这些值本身就是整条文本，所以精确匹配足够；
+# 而子串替换会把 `Restores 50 HP.` 弄成"恢复50 生命值。"这种中英夹杂。
+#
+# 用户术语表依然优先（见 `merge_engine_labels`）。
+
+
+@dataclass(frozen=True)
+class EngineLabel:
+    """一个引擎内建标签及其确定性译法。"""
+
+    key: str
+    """归一化后的匹配键（小写、去空白与首尾标点、全角转半角）。"""
+
+    target: str
+    """确定性译法。"""
+
+    note: str
+    """为什么这个译法是准的（写给日后维护的人看）。"""
+
+
+#: 归一化时要剥掉的边缘字符（标点、空白、全角空格）
+_LABEL_TRIM = " \t\r\n\u3000.:：。、,，;；!！?？'\"“”‘’()（）[]【】"
+
+
+def _normalize_label(text: str) -> str:
+    """把标签归一化成一个匹配键。
+
+    处理真实数据里的三种不统一：
+
+    * 大小写（`Hp` / `hp`）
+    * 全角写法（`ＨＰ` —— 日文数据里常见）
+    * 首尾标点与空白（`"HP"`、`HP.`、`HP:`、`(MP)`）
+    """
+    t = text.strip()
+    # 全角 ASCII（Ｕ＋ＦＦ０１..ＦＦ５Ｅ）转半角
+    t = "".join(
+        chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c for c in t
+    )
+    t = t.strip(_LABEL_TRIM)
+    return t.strip().lower()
+
+
+#: 引擎标签表。
+#:
+#: `note` 里写清依据 —— 这些译法是要**直接写进游戏**的，
+#: 日后有人想改必须知道当初为什么这么定。
+_ENGINE_LABELS: tuple[EngineLabel, ...] = (
+    # --- RPG Maker MV/MZ `System.json` → `terms.basic` ---
+    #
+    # 标准译法取自 RPG Maker 中文版/社区通用译法。关键是三者**互不相同**：
+    # 用"生命值/魔法值/技巧值"而不是"生命值/魔法值/特殊值"，
+    # 因为 TP 在 MV/MZ 里是"积攒后放技能"的资源，中文版叫"技巧值"。
+    EngineLabel("hp", "生命值", "RPG Maker 标准译法；与 MP/TP 区分"),
+    EngineLabel("mp", "魔法值", "RPG Maker 标准译法；与 HP/TP 区分"),
+    EngineLabel("tp", "技巧值", "RPG Maker MV/MZ 标准译法；与 HP/MP 区分"),
+    EngineLabel("exp", "经验值", "RPG Maker 标准译法"),
+    EngineLabel("xp", "经验值", "EXP 的另一种写法，同一事物"),
+    EngineLabel("sp", "技能值", "常见的技能点资源"),
+    # --- terms.basic 的其余两项（Level / Lv）---
+    #
+    # `Lv` 是 `Level` 的缩写写法，两者在 `terms.basic` 里各占两个位置
+    # （索引 0/1）。中文习惯：全称用"等级"，缩写用"等级"或"Lv"。
+    # 这里都译"等级" —— 因为中文里"等级"本身就短，不需要再缩。
+    EngineLabel("level", "等级", "RPG Maker 标准译法"),
+    EngineLabel("lv", "等级", "Level 的缩写；中文里直接写「等级」即可"),
+    # --- 货币单位 ---
+    # `g` 和 `gold` 是同一个东西（RPG Maker `currencyUnit` 默认 "G"），
+    # 译法相同是**正确**的，不算碰撞。
+    EngineLabel("g", "金币", "RPG Maker `currencyUnit` 默认值就是 G"),
+    EngineLabel("gold", "金币", "通用译法"),
+    # --- 常见职业名（日文原文，真实数据里出现过） ---
+    #
+    # 事故：`僧侶` 和 `魔術師` 都被译成"法师"。这两个是**不同职业**
+    # （那个游戏里职业决定技能池），撞成同词玩家分不清。
+    EngineLabel("僧侶", "僧侣", "与「魔術師」区分；日式奇幻标准职业"),
+    EngineLabel("魔術師", "魔术师", "与「僧侶」区分；字面直译"),
+    EngineLabel("戦士", "战士", "日式奇幻标准职业"),
+    EngineLabel("勇者", "勇者", "日式奇幻标准职业；本身已是汉字"),
+    EngineLabel("魔法使い", "魔法师", "与「僧侶」区分"),
+    EngineLabel("盗賊", "盗贼", "日式奇幻标准职业"),
+    EngineLabel("狩人", "猎人", "日式奇幻标准职业"),
+    EngineLabel("騎士", "骑士", "日式奇幻标准职业"),
+    EngineLabel("格闘家", "格斗家", "日式奇幻标准职业"),
+)
+
+
+def engine_labels() -> list[EngineLabel]:
+    """返回引擎标签表。"""
+    return list(_ENGINE_LABELS)
+
+
+_ENGINE_LABEL_INDEX: dict[str, str] = {lbl.key: lbl.target for lbl in _ENGINE_LABELS}
+
+
+def engine_label_target(source: str | None) -> str | None:
+    """如果 ``source`` **整条就是**一个引擎标签，返回它的确定性译法。
+
+    否则返回 ``None``（表示"交给模型翻译"）。
+
+    ⚠️ **只做精确匹配，绝不做子串替换。** 这是本函数最重要的性质：
+
+    >>> engine_label_target("MP")
+    '魔法值'
+    >>> engine_label_target("Restores 50 HP.")
+    >>> # None —— 句子交给模型，覆盖会把中文句子搞成中英夹杂
+
+    `None` 表示"不接管"，不是"出错"。
+    """
+    if not source:
+        return None
+    return _ENGINE_LABEL_INDEX.get(_normalize_label(source))
+
+
+def merge_engine_labels(user_entries: list[GlossaryEntry]) -> None:
+    """**就地**把用户的术语表接进引擎标签索引（用户赢）。
+
+    术语表是用户的领域知识 —— 他的游戏里 `MP` 可能真的叫"气"。
+    内置标签只提供默认值，不能锁死。
+
+    之所以是"就地改索引"而不是"返回一张新表"：引擎标签是**覆盖**语义
+    （要拿去盖掉模型输出），而不是"注入提示词"，
+    所以用户条目需要进的是同一张查找表。
+    """
+    for e in user_entries:
+        key = _normalize_label(e.source)
+        if key and e.target.strip():
+            _ENGINE_LABEL_INDEX[key] = e.target.strip()
+
+
+__all__ = [
+    "EngineLabel",
+    "Glossary",
+    "GlossarySuggestion",
+    "builtin_entries",
+    "engine_label_target",
+    "engine_labels",
+    "merge_builtin",
+    "merge_engine_labels",
+    "suggest_terms",
+]

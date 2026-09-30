@@ -42,6 +42,7 @@ from ..models import (
     TextUnit,
     TranslationEntry,
 )
+from ..translate.glossary import engine_label_target, merge_engine_labels
 
 log = logging.getLogger(__name__)
 
@@ -396,6 +397,9 @@ class Pipeline:
             # 所以内置表只作为**用户可查可抄的起点**（glossary.builtin_entries()），
             # 由用户按自己游戏的情况决定是否启用，而不是默认注入。
             glossary = self.ws.load_glossary()
+            # 用户的术语表也要接进"引擎标签覆盖表"（用户赢）。
+            # 术语表是用户的领域知识 —— 他的游戏里 `MP` 可能真的叫"气"。
+            merge_engine_labels(glossary)
 
             todo: list[TextUnit] = []
             for u in units:
@@ -435,6 +439,7 @@ class Pipeline:
                 self.ws.save_entries(list(merged_now.values()))
 
             entries = self._translate_units(todo, glossary, on_progress=_checkpoint)
+            n_overridden = self._apply_engine_labels(entries)
             # 已有条目要合并保留：用户手工改过的译文不能被流水线覆盖
             merged = {**existing, **{e.uid: e for e in entries}}
             self.ws.save_entries(list(merged.values()))
@@ -446,6 +451,11 @@ class Pipeline:
                     f"{len(failed)} 条翻译失败，可在文本审校页重试",
                     stage="translate",
                     severity=Severity.WARN,
+                )
+            if n_overridden:
+                self.bus.log(
+                    f"{n_overridden} 条引擎 UI 短标签已按标准译法确定（未交给模型猜）",
+                    stage="translate",
                 )
             self.bus.log(f"翻译完成 {done}/{len(entries)} 条", stage="translate")
             return StageResult(
@@ -463,6 +473,51 @@ class Pipeline:
             )
 
         return self._run("translate", go)
+
+    @staticmethod
+    def _apply_engine_labels(entries: list[TranslationEntry]) -> int:
+        """把"整条就是引擎 UI 标签"的条目改成**确定性标准译法**。
+
+        返回被改动的条数。
+
+        ## 为什么需要这一步
+
+        真实事故：RPG Maker MV 的 `System.json` → `terms.basic` 是
+        `["Level","Lv","HP","HP","MP","MP","TP","TP"]`，模型把
+        `HP`/`MP`/`TP` **全译成了"生命值"**。玩家看到三个同名字段。
+        同类：`僧侶` 和 `魔術師` 都被译成"法师"，两个职业变成同一个。
+
+        这些是**单条、无上下文**的缩写，模型只能猜，而每种猜法都
+        "像那么回事" —— 漏译/占位符/源文差异三类检查全抓不到。
+
+        ## 为什么不是"把内置术语表注入提示词"
+
+        那是**已实测否决**的方案（结论见上面 `glossary` 那段注释）：
+        整批质量会下降。这类标签是**有限且固定**的引擎标识符，
+        用查表确定性处理比"求 4B 模型听话"可靠得多。
+
+        ## 安全边界
+
+        只在 `source` **整条等于**标签时覆盖（`engine_label_target`
+        内部做归一化后精确匹配）。**绝不做子串替换** ——
+        否则 `Restores 50 HP.` 会变成"恢复50 生命值。"。
+
+        已经失败的条目和空译文不动：那些交给审校页，不要用覆盖
+        把"失败"伪装成"成功"。
+        """
+        n = 0
+        for e in entries:
+            if not e.target.strip() or e.status == EntryStatus.FAILED:
+                continue
+            want = engine_label_target(e.source)
+            if want is None or want == e.target.strip():
+                continue
+            e.target = want
+            # 留痕：用户日后在审校页能看出这条是**规则**定的，不是模型译的
+            if "engine_label" not in e.warnings:
+                e.warnings.append(f"engine_label: 按标准译法定为「{want}」")
+            n += 1
+        return n
 
     def _translate_units(
         self,
@@ -688,7 +743,14 @@ class Pipeline:
                 )
                 entry = {
                     "font_id": gf.font_id,
-                    "action": action if pr.ok else "none",
+                    # ⚠️ 失败时**不能**写 "none"。
+                    # 早先这里是 `action if pr.ok else "none"`，于是
+                    # "补丁失败"和"这个字体不需要补丁"在产物里**长得一模一样**
+                    # （都是 action="none"），只能靠 ok/error 区分 ——
+                    # 任何只看 action 的下游（质检、回写、用户读 patches.json）
+                    # 都会把失败当成"无需处理"，**静默**放行一个缺字的游戏。
+                    # 写一个显式的 "failed"（配合 ok=False + error）让状态可分辨。
+                    "action": action if pr.ok else "failed",
                     "strategy": getattr(self.ctx.config.font, "strategy", ""),
                     "out_path": str(pr.out_path) if pr.out_path else "",
                     "ok": pr.ok,
@@ -1165,8 +1227,10 @@ def font_patch_records(ws: Workspace) -> list[dict[str, Any]]:
     这种"静默丢弃产物"的 bug 只能靠针对性测试守住，
     所以把判据提出来，让它可被单独断言。
 
-    ``action == "none"`` 有两种含义，两种都不该回写：
-    原字体已全覆盖（无需替换）、或注入失败。
+    ``action == "none"`` 只有一种含义：原字体已全覆盖，无需替换。
+    （补丁**失败**现在写 ``action == "failed"``，不再和 "none" 同形；
+    不过下面仍然先用 ``ok`` 过滤，所以老产物里
+    ``ok=False`` + ``action="none"`` 的组合也不会被误回写。）
     """
     out: list[dict[str, Any]] = []
     for p in ws.read_json("fonts/patches.json", []) or []:

@@ -180,36 +180,99 @@ def run_qa(ws: Workspace, ctx: Context) -> dict[str, Any]:
             Severity.WARN, "fonts", "还没有做过字体规划（可能尚未翻译）",
         ))
     else:
-        coverage = ws.load_font_coverage()
-        for fc in coverage:
+        # ⚠️ `analysis.jsonl` 记的是**补丁之前**的游戏原字体。
+        # `save_font_coverage()` 在 stage_fonts 里是**做补丁前**调用的，
+        # 补丁结果单独写在 `patches.json`（含 coverage_after）。
+        #
+        # 早先这里只读 analysis.jsonl，于是**补丁明明成功、覆盖已到 100%**，
+        # 质检还是报"缺少 27 个字符、会显示口口口"，然后中止整个流程。
+        # 用户会同时看到"字体已补全 100%"和"会显示口口口"两条互相矛盾的信息
+        # —— 一个永远失败的质检等于没有质检。
+        #
+        # 所以先按 font_id 把补丁结果查出来，**补丁之后的真实覆盖**才算数。
+        patches = ws.read_json("fonts/patches.json", []) or []
+        patch_by_id: dict[str, dict[str, Any]] = {}
+        for p in patches:
+            fid = p.get("font_id")
+            if fid:
+                patch_by_id[str(fid)] = p
+
+        reported: set[str] = set()
+
+        def _mark_once(font_id: str) -> bool:
+            """同一个字体只报一次；返回 True 表示可以报。"""
+            if font_id in reported:
+                return False
+            reported.add(font_id)
+            return True
+
+        for fc in ws.load_font_coverage():
+            p = patch_by_id.get(fc.font_id)
+
+            # 判定"这个字体到底有没有被补丁处理过"。
+            # ⚠️ **不能只看 action**：老版本的 `stage_fonts` 在补丁失败时
+            # 写的是 `"action": "none"`（和"无需补丁"同形），所以
+            # **`ok is False` 永远算补丁失败**，不管 action 是什么。
+            is_failure = p is not None and p.get("ok") is False
+            handled_ok = (
+                p is not None
+                and p.get("ok") is True
+                and p.get("action") not in (None, "none", "")
+            )
+
+            # (a) 有补丁记录且**失败了** —— 原字体缺字依然存在，必须报。
+            if is_failure:
+                font_ok = False
+                if _mark_once(fc.font_id):
+                    issues.append(_issue(
+                        Severity.ERROR, "fonts",
+                        f"字体 {p.get('font_id')} 补丁失败："
+                        f"{p.get('error') or '未知原因'}",
+                        font_id=p.get("font_id"),
+                    ))
+                continue
+
+            # (b) 有补丁记录且成功了 —— 以**补丁之后**的覆盖率为准。
+            if handled_ok:
+                after = float(p.get("coverage_after") or 0.0)
+                if after < 0.999:
+                    font_ok = False
+                    n_missing_total += len(fc.missing)
+                    if _mark_once(fc.font_id):
+                        issues.append(_issue(
+                            Severity.ERROR, "fonts",
+                            f"字体 {p.get('font_id')} 补丁后覆盖率仅 {after:.1%}，"
+                            "仍有缺字风险（游戏内可能出现口口口）"
+                            + (f"：{fc.missing[:40]}" if fc.missing else ""),
+                            font_id=p.get("font_id"),
+                        ))
+                # after >= 0.999：补丁已解决，**不再报缺字**
+                continue
+
+            # (c) 没有补丁记录（还没跑 fonts 阶段，或该字体无需补丁）
+            #     —— 退回按原字体分析判，不能当成"没问题"。
             if fc.missing:
                 n_missing_total += len(fc.missing)
                 font_ok = False
-                issues.append(_issue(
-                    Severity.ERROR, "fonts",
-                    f"字体 {fc.family or fc.path} 缺少 {len(fc.missing)} 个字符，"
-                    f"游戏内会显示为口口口：{fc.missing[:40]}",
-                    font_id=fc.font_id,
-                ))
-        # 补丁结果
-        patches = ws.read_json("fonts/patches.json", []) or []
+                if _mark_once(fc.font_id):
+                    issues.append(_issue(
+                        Severity.ERROR, "fonts",
+                        f"字体 {fc.family or fc.path} 缺少 {len(fc.missing)} 个字符，"
+                        f"游戏内会显示为口口口：{fc.missing[:40]}",
+                        font_id=fc.font_id,
+                    ))
+
+        # 补丁记录本身的完整性（没有对应 FontCoverage 的条目也要看）。
+        # 同样用 `ok is False` 判失败，不依赖 action 的取值。
         for p in patches:
-            if p.get("action") != "none" and not p.get("ok"):
+            if p.get("ok") is False:
                 font_ok = False
-                issues.append(_issue(
-                    Severity.ERROR, "fonts",
-                    f"字体 {p.get('font_id')} 补丁失败：{p.get('error') or '未知原因'}",
-                    font_id=p.get("font_id"),
-                ))
-            after = p.get("coverage_after") or 0.0
-            if p.get("ok") and p.get("action") != "none" and after < 0.999:
-                font_ok = False
-                issues.append(_issue(
-                    Severity.ERROR, "fonts",
-                    f"字体 {p.get('font_id')} 补丁后覆盖率仅 {after:.1%}，"
-                    "仍有缺字风险（游戏内可能出现口口口）",
-                    font_id=p.get("font_id"),
-                ))
+                if _mark_once(f"patch:{p.get('font_id')}"):
+                    issues.append(_issue(
+                        Severity.ERROR, "fonts",
+                        f"字体 {p.get('font_id')} 补丁失败：{p.get('error') or '未知原因'}",
+                        font_id=p.get("font_id"),
+                    ))
 
     # ---- 4. 贴图 ----
     img_records = ws.read_json("images/localize.json", []) or []
