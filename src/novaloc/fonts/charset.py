@@ -108,6 +108,27 @@ class CharsetPlan:
     still_missing: list[str] = field(default_factory=list)
     base_family: str = ""
 
+    optional_missing: list[str] = field(default_factory=list)
+    """**可放弃**的字符里没被覆盖的部分（不导致失败）。
+
+    这些字符是工具**猜**游戏界面可能会渲染的（见 `UI_SAFE_CHARS`），
+    不是任何一条真实文本里的字符。它们缺了只是"少几个装饰符号"，
+    而不是"玩家看到口口口"。
+
+    为什么必须和 `still_missing` 分开 —— 真实事故：
+
+    某些符号（`※ ‥ ′ ″ ‰`）**本机任何一个 CJK 字体都没有**。
+    它们出现在 `UI_SAFE_CHARS` 里，于是一整轮字体适配直接
+    **硬失败**：
+
+        ❌ ok=False 错误=字符集里有 4 个字符没有任何候选字体能提供，
+           无法生成完整字体：ინშ️
+
+    而这 4 个字符在真实游戏文本里出现 **0 次**（数过：
+    981 个场景、65570 条文本里一次都没有）。
+    也就是说，**一句都用不到的装饰符号把整个流程拦死了**。
+    """
+
     @property
     def coverage(self) -> float:
         total = len(set(self.required))
@@ -138,6 +159,11 @@ class CharsetPlan:
             lines.append(f"  ❌ 仍缺 {len(self.still_missing)} 字：{''.join(self.still_missing[:80])}")
         else:
             lines.append("  ✅ 可以完整覆盖，不会出现口口口")
+        if self.optional_missing:
+            lines.append(
+                f"  ⚠️ 另有 {len(self.optional_missing)} 个**猜测用**的装饰符号本机字体没有"
+                f"（不影响任何真实文本）：{''.join(self.optional_missing[:40])}"
+            )
         return "\n".join(lines)
 
 
@@ -153,10 +179,23 @@ def build_required_charset(
     *,
     include_ui_safe: bool = True,
 ) -> str:
-    """汇总项目真正需要渲染的全部字符。
+    """汇总项目真正需要渲染的全部字符。"""
+    return "".join(sorted(build_charset_tiers(translated_texts, source_texts, extra,
+                                              include_ui_safe=include_ui_safe)[0]))
 
-    默认把**原文**也算进去 —— 因为游戏里总有没被翻译的串（人名、型号、代码），
-    它们仍然要用这个字体渲染出来。
+
+def build_charset_tiers(
+    translated_texts: list[str] | None = None,
+    source_texts: list[str] | None = None,
+    extra: str = "",
+    *,
+    include_ui_safe: bool = True,
+) -> tuple[str, str]:
+    """返回 ``(全部字符, 其中真实文本需要的字符)``。
+
+    第二个值是**硬失败**判据用的：只有它缺字才算"玩家会看到口口口"。
+    第一个值与第二个值之差就是工具**猜**的那些装饰符号
+    （见 `UI_SAFE_CHARS`）—— 能补就补，补不上只记警告。
 
     ⚠️ **换行/制表/零宽字符在这里就被剔掉**（见 :func:`is_ignorable`）。
     以前这里不过滤，而下游 `merge.py` 会把译文里的 ``\\n`` 当成
@@ -168,14 +207,20 @@ def build_required_charset(
     对外产物，会落盘到 `fonts/charset.json` 供审校与报告用，
     里面不该出现"永远不可能有字形"的字符。
     """
-    parts: list[str] = []
+    # 真实文本需要的字符（硬失败判据）
+    text_parts: list[str] = []
     for group in (translated_texts or [], source_texts or []):
-        parts.extend(group)
+        text_parts.extend(group)
+    text_parts.append(extra)
+    strict = {c for c in "".join(text_parts) if not is_ignorable(c)}
+
+    # 猜的字符（可放弃）
+    guessed: set[str] = set()
     if include_ui_safe:
-        parts.append(UI_SAFE_CHARS)
-    parts.append(extra)
-    chars = {c for c in "".join(parts) if not is_ignorable(c)}
-    return "".join(sorted(chars))
+        guessed = {c for c in UI_SAFE_CHARS if not is_ignorable(c)}
+
+    allv = strict | guessed
+    return "".join(sorted(allv)), "".join(sorted(strict))
 
 
 def plan_charset(
@@ -186,14 +231,32 @@ def plan_charset(
     base_face_index: int = 0,
     prioritize: list[str] | None = None,
     max_sources: int = 4,
+    optional: str = "",
 ) -> CharsetPlan:
     """贪心集合覆盖：挑最少的字体把 ``required`` 全部覆盖。
 
     ``prioritize`` 是字体文件名的优先顺序（靠前的先被考虑），
     用来保证"风格最匹配的字体"优先承担中文字形。
+
+    ## ``optional``：**可放弃**的字符
+
+    这些字符是工具**猜**界面会渲染的（见 `UI_SAFE_CHARS`），
+    不是任何真实文本里的字符。它们**参与规划**（能补就补），
+    但补不上时**不算失败** —— 只记进 :attr:`CharsetPlan.optional_missing`。
+
+    为什么必须分开（真实事故）：`※ ‥ ′ ″ ‰` 这几个符号
+    **本机任何一个 CJK 字体都没有**，而它们在 `UI_SAFE_CHARS` 里，
+    于是整轮字体适配硬失败 —— 尽管它们在真实游戏文本里
+    出现 **0 次**（981 个场景、65570 条文本数过）。
+    一句都用不到的装饰符号把整个流程拦死，这是判据用错了地方：
+    "硬失败"应当只针对**真的会被渲染**的字符。
     """
     plan = CharsetPlan(required=required)
     remaining = {c for c in set(required) if not _is_ignorable(c)}
+    # 可放弃的字符并进同一个待覆盖集合 —— 它们一样值得去补，
+    # 只是最后结算时分开记账。
+    optional_set = {c for c in set(optional) if not _is_ignorable(c)}
+    remaining |= optional_set
 
     if base_font is not None and base_font.exists():
         info = load_font_info(base_font, base_face_index)
@@ -242,7 +305,9 @@ def plan_charset(
         )
         remaining -= takes
 
-    plan.still_missing = sorted(remaining)
+    # 分开结算：真的需要的缺了才是失败，猜的缺了只是警告。
+    plan.still_missing = sorted(c for c in remaining if c not in optional_set)
+    plan.optional_missing = sorted(c for c in remaining if c in optional_set)
     return plan
 
 
@@ -266,10 +331,15 @@ def _is_ignorable(ch: str) -> bool:
 
 
 def assert_plannable(plan: CharsetPlan) -> None:
-    """缺字就**硬失败**。
+    """**真实文本**里的字缺了就硬失败。
 
     这是"保证不出现口口口"契约的最后一关：
     宁可整个流程停下来报错，也不要写回一个会显示方框的字体。
+
+    ⚠️ 只管 :attr:`CharsetPlan.still_missing`（真实文本需要的字符）。
+    :attr:`CharsetPlan.optional_missing`（工具猜的装饰符号）**不导致失败** ——
+    那些字符在游戏里可能一次都不出现，为它们中止整个流程
+    是判据用错了地方。
     """
     if plan.ok:
         return

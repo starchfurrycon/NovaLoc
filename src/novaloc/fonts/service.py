@@ -48,6 +48,7 @@ from .charset import (
     CharsetCoverageError,
     CharsetPlan,
     assert_plannable,
+    build_charset_tiers,
     build_required_charset,
     default_supplement_candidates,
     plan_charset,
@@ -269,6 +270,27 @@ class FontService:
             include_ui_safe=ui_safe,
         )
 
+    def build_charset_tiers(
+        self,
+        translated_texts: list[str] | None = None,
+        source_texts: list[str] | None = None,
+        extra: str = "",
+        *,
+        include_ui_safe: bool | None = None,
+    ) -> tuple[str, str]:
+        """返回 ``(全部字符, 真实文本需要的字符)``。
+
+        第二个值是**硬失败**判据：只有它缺字才算玩家会看到口口口。
+        两者之差是工具猜的装饰符号（`UI_SAFE_CHARS`），补不上只记警告。
+        """
+        ui_safe = True if include_ui_safe is None else include_ui_safe
+        return build_charset_tiers(
+            translated_texts=translated_texts,
+            source_texts=source_texts,
+            extra=extra,
+            include_ui_safe=ui_safe,
+        )
+
     # ------------------------------------------------------------------
     # 字体获取
     # ------------------------------------------------------------------
@@ -469,6 +491,7 @@ class FontService:
         strategy: str | None = None,
         verify: bool = True,
         allow_download: bool | None = None,
+        optional: str = "",
     ) -> PatchResult:
         """把中文字形注入游戏原字体，产出可直接替换的字体文件。
 
@@ -477,6 +500,10 @@ class FontService:
           因为游戏原有字体往往和 UI 设计是一套的。
         * ``replace`` —— 整体换成中文字体，适合原字体本身简陋或损坏的情况。
         * ``fallback_only`` —— 只产出中文字体，由引擎侧配置回退。
+
+        ``optional``：**可放弃**的字符（工具猜界面会渲染的装饰符号）。
+        它们能补就补，补不上只记警告，**不导致失败** ——
+        详见 :func:`novaloc.fonts.charset.plan_charset`。
         """
         t0 = time.time()
         res = PatchResult()
@@ -539,6 +566,7 @@ class FontService:
             required, base_font, cands,
             base_face_index=base_face_index,
             max_sources=max_sources,
+            optional=optional,
         )
         res.plan = plan
         log.info("字符集规划：\n%s", plan.summary())
@@ -546,6 +574,15 @@ class FontService:
         if plan.still_missing:
             res.warnings.append(
                 f"仍有 {len(plan.still_missing)} 个字符无字体覆盖：{''.join(plan.still_missing[:60])}"
+            )
+        if plan.optional_missing:
+            # 只警告，不失败：这些是工具**猜**界面会渲染的装饰符号，
+            # 不是任何真实文本里的字符。为它们中止整个字体阶段
+            # 是判据用错了地方（真实事故：`※ ‥ ′ ″` 让整轮硬失败，
+            # 而它们在 65570 条文本里出现 0 次）。
+            res.warnings.append(
+                f"{len(plan.optional_missing)} 个**猜测用**的装饰符号本机字体没有"
+                f"（不影响任何真实文本）：{''.join(plan.optional_missing[:40])}"
             )
 
         # ---- 合并 / 替换 ----
@@ -660,10 +697,15 @@ class FontService:
     # ------------------------------------------------------------------
 
     def ensure_charset_plannable(self, required: str, base_font: Path | None = None,
-                                 candidates: list[Path] | None = None) -> CharsetPlan:
-        """规划并**在无法覆盖时抛错**，用于流程早期拦下问题。"""
+                                 candidates: list[Path] | None = None,
+                                 *, optional: str = "") -> CharsetPlan:
+        """规划并**在无法覆盖时抛错**，用于流程早期拦下问题。
+
+        只有 ``required``（真实文本需要的字符）缺了才抛错；
+        ``optional`` 缺了只记进 ``plan.optional_missing``。
+        """
         cands = candidates if candidates is not None else self.supplement_candidates(base_font)
-        plan = plan_charset(required, base_font, cands)
+        plan = plan_charset(required, base_font, cands, optional=optional)
         assert_plannable(plan)
         return plan
 

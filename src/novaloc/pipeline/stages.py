@@ -31,7 +31,7 @@ from ..core.registry import Context, TranslateItem
 from ..core.workspace import Workspace
 from ..engines import EngineAdapter, get_adapter
 from ..engines.base import ApplyResult
-from ..fonts.service import FontService, PatchResult
+from ..fonts.service import FontService
 from ..images.service import TextureResult, TextureTranslator
 from ..lang import count_foreign_script  # noqa: F401  (保留给贴图/报告使用)
 from ..models import (
@@ -808,7 +808,13 @@ class Pipeline:
                     error="还没有任何译文，字体无法规划（字体补丁依赖译文用到的字符）",
                 )
 
-            charset = fs.build_charset(translated, source)
+            # ★ 字符集分两层：
+            #   charset      —— 全部（真实文本 + 工具猜的装饰符号），用于审计与补丁
+            #   strict_chars —— 真实文本需要的，**只有它缺字才算失败**
+            # `UI_SAFE_CHARS` 里有几个符号（`※ ‥ ′ ″`）本机任何 CJK 字体都没有，
+            # 而它们在真实文本里出现 0 次；把它们算进硬失败判据会让
+            # 整轮字体适配因几个用不到的装饰符号而中止。
+            charset, strict_chars = fs.build_charset_tiers(translated, source)
             cs = ProjectCharset(
                 text_chars=sorted(set("".join(translated))),
                 ui_chars=sorted(set("".join(source)) - set("".join(translated))),
@@ -816,7 +822,11 @@ class Pipeline:
                 total=len(set(charset)),
             )
             self.ws.save_charset(cs)
-            self.bus.log(f"项目字符集共 {cs.total} 个字符", stage="fonts")
+            self.bus.log(
+                f"项目字符集共 {cs.total} 个字符"
+                f"（其中真实文本需要 {len(set(strict_chars))} 个）",
+                stage="fonts",
+            )
 
             # 审计游戏自带字体
             game_fonts = ad.discover_fonts(self.ws.effective_source)
@@ -886,7 +896,24 @@ class Pipeline:
                     f"（当前覆盖 {audit.coverage:.1%}）…",
                     stage="fonts",
                 )
-                pr: PatchResult = fs.patch_font(fp, charset, out_path=out_path)
+                # ★ 分两层交给规划器：
+                #   required = 真实文本需要的字符  ⇒ 缺了就硬失败
+                #   optional = 工具猜的装饰符号    ⇒ 缺了只记警告
+                #
+                # 这一步**不需要**靠"这个字符影响多少条"去猜它重不重要 ——
+                # 我们**知道**它是不是真实文本里的字符（`build_charset_tiers`
+                # 就是这么算出来的）。实测那几个补不上的符号
+                # （`※ ‥ ′ ″ ‰`，来自 `UI_SAFE_CHARS`）在 65570 条文本里
+                # 出现 **0 次**，用"影响条目数 ≤ 3"去判它们"可以剔"
+                # 虽然结论对，但判据是启发式的、可能误伤稀有真字。
+                pr = fs.patch_font(
+                    fp,
+                    charset,
+                    out_path=out_path,
+                    optional="".join(
+                        c for c in charset if c not in set(strict_chars)
+                    ),
+                )
                 # ---- 补不上时：只把「顺带」那一侧的字符剔掉重试 ----
                 #
                 # 真实事故（BeyondPortal，MZ）：字符集里有 21 个**永远补不上**的
@@ -942,7 +969,14 @@ class Pipeline:
                         # 注意**不改 `charset` 本身**：它是每轮 audit 的基准，
                         # 改了会让后面字体的 `audit.ok` 判断与产物不一致。
                         reduced = "".join(c for c in reduced if c not in removable)
-                        pr = fs.patch_font(fp, reduced, out_path=out_path)
+                        pr = fs.patch_font(
+                            fp,
+                            reduced,
+                            out_path=out_path,
+                            optional="".join(
+                                c for c in reduced if c not in set(strict_chars)
+                            ),
+                        )
                         if pr.ok:
                             break
                     if dropped_for_retry:

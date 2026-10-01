@@ -27,6 +27,7 @@ from .charset import (
     CharsetPlan,
     SourcePick,
     assert_plannable,
+    build_charset_tiers,
     build_required_charset,
     plan_charset,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "CharsetPlan",
     "SourcePick",
     "assert_plannable",
+    "build_charset_tiers",
     "build_required_charset",
     "plan_charset",
     # 合并
