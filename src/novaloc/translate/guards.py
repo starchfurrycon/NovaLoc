@@ -26,6 +26,7 @@ from ..lang import (
     strip_placeholders,
     visible_text,
 )
+from .placeholders import percent_vars
 
 # 模型偶尔会把提示词要求也照抄进译文。
 #
@@ -357,6 +358,52 @@ def check_language_residue(source: str, target: str, target_lang: str) -> list[s
     return warnings
 
 
+def check_percent_vars(source: str, target: str) -> list[str]:
+    r"""RPG Maker 的 `%1` `%2` 消息替换变量必须**一个不少**。
+
+    ## 为什么单独查这个（而不是靠掩码）
+
+    直觉做法是把 `%1` 屏蔽成 `⟦0⟧`"保护"起来。**实测这是反的**：
+    屏蔽之后模型更容易把它当噪音清掉。
+
+    拿 14 条**真实丢过变量**的源文做 A/B：
+
+    | 做法 | `%n` 保住 |
+    |---|---|
+    | 屏蔽成 `⟦0⟧`（+ 三版提示词强调） | **0～2 / 14** |
+    | **不屏蔽**，让模型看到 `%1` | **约 7 / 14** |
+
+    试过 6 种记号长相、3 版提示词，屏蔽路径最好只到 2/14。
+    原因：`⟦0⟧` 是没有语义的装饰符，而 `%1` 在训练数据里是
+    有含义的格式串 —— **把语义换成装饰，模型就把它当噪音清掉了**。
+
+    所以改成"**让模型看得见，出站再查**"：
+    不屏蔽，翻完之后在这里比对数量。查数量不需要把记号藏起来。
+
+    ## 判据为什么是"数量"而不是"位置"
+
+    位置的正确性无法自动判定：`'%1 attacks!'` 译成 `'%1 攻击！'`
+    与 `'攻击！%1'` 都不算错，中文语序本来就活。
+    而**数量少一个**是确定无疑的损坏 —— 玩家会看到一句
+    "谁干了什么"都说不清的话。宁可报失败，也不写一句坏话进游戏。
+    """
+    sv, tv = percent_vars(source), percent_vars(target)
+    if not sv:
+        return []
+    if len(tv) == len(sv):
+        # 数量对得上就不再苛求位置；但**完全不出现**也不行（数量能对上
+        # 却内容不同，例如 `%1` 变成 `%2`，那会把行动者显示成目标）。
+        if sorted(sv) != sorted(tv):
+            return [
+                f"percent_var_changed:变量内容变了 {sorted(sv)} → {sorted(tv)}"
+            ]
+        return []
+    return [
+        f"percent_var_missing:丢失消息变量 {sorted(set(sv) - set(tv))}"
+        f"（源 {len(sv)} 个 → 译 {len(tv)} 个）"
+    ]
+
+
 def guard(
     source: str,
     raw_target: str,
@@ -379,6 +426,7 @@ def guard(
         return GuardResult(text="", warnings=["empty_translation"], fatal=True)
 
     warnings += check_placeholders(source, target)
+    warnings += check_percent_vars(source, target)
     warnings += check_length(source, target, max_chars, length_ratio)
     warnings += check_language_residue(source, target, target_lang)
     warnings += check_foreign_script(target, source=source)
@@ -401,6 +449,8 @@ def guard(
                     "placeholder_count",
                     "placeholder_missing",
                     "placeholder_extra",
+                    "percent_var_missing",
+                    "percent_var_changed",
                     "repetition",
                     "foreign_script",
                 )

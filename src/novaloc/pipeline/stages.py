@@ -44,7 +44,7 @@ from ..models import (
     TranslationEntry,
 )
 from ..translate.glossary import engine_label_target, merge_engine_labels
-from ..translate.guards import check_foreign_script
+from ..translate.guards import check_foreign_script, check_percent_vars
 
 log = logging.getLogger(__name__)
 
@@ -1279,19 +1279,43 @@ class Pipeline:
         `novaloc revalidate <项目>` 直接调它。
 
         返回作废的条数。
+
+        ## 为什么这里要查"所有"守卫，而不只是文字系统
+
+        这个方法最初只为 `foreign_script` 而写，但那条教训是**通用的**：
+        **每条新上线的判据都有一批"判据上线之前写下的坏数据"在后面躺着。**
+
+        实测代价：`%n` 消息变量的判据上线后，真实游戏里
+        **189 / 357 条**译文其实是坏的（丢了行动者名字），
+        而 `only_pending` 会把它们全部当成"已完成"跳过 ——
+        如果不在这里重查，修好的规则**对已有工作区一点用都没有**。
         """
         entries = self.ws.load_entries()
-        bad = {
-            e.uid
-            for e in entries
-            if e.target.strip() and check_foreign_script(e.target, source=e.source)
-        }
+        bad: set[str] = set()
+        n_foreign = 0
+        n_pct = 0
+        for e in entries:
+            if not e.target.strip():
+                continue
+            if check_foreign_script(e.target, source=e.source):
+                bad.add(e.uid)
+                n_foreign += 1
+                continue
+            if check_percent_vars(e.source, e.target):
+                bad.add(e.uid)
+                n_pct += 1
         if not bad:
             return 0
         n = self._invalidate_entries(bad)
         if n:
+            why = []
+            if n_foreign:
+                why.append(f"{n_foreign} 条混进了别的文字系统")
+            if n_pct:
+                why.append(f"{n_pct} 条丢了 %1/%2 消息变量")
             self.bus.log(
-                f"重查发现 {n} 条译文混进了别的文字系统，已作废（下一轮翻译会重译）",
+                f"重查发现 {n} 条已有译文不合格（{'；'.join(why)}），"
+                "已作废（下一轮翻译会重译）",
                 stage="translate",
                 severity=Severity.WARN,
             )

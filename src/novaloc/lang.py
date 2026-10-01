@@ -93,6 +93,24 @@ _PLACEHOLDER_PATTERNS: list[tuple[str, str]] = [
     ("rich_text_tag", r"</?[a-zA-Z][^>]*>"),
     ("bracket_tag", r"\[/?[a-zA-Z]+(?:=[^\]]*)?\]"),
     ("printf", r"%(?:\d+\$)?[-+#0]*[\d*]*(?:\.\d+)?[hlL]?[diouxXeEfFgGcrs%]"),
+    # ★ RPG Maker MV/MZ 的**消息替换变量** `%1` `%2`。
+    #
+    # 与 `translate/placeholders.py` **必须同步** —— 只在一侧加会重现
+    # "守卫认、屏蔽器不认"（或反之）的老问题，那道
+    # `tests/test_placeholder_consistency.py` 就是为此存在的。
+    #
+    # 上面那条 `printf` 要求**转换字符**（`%s` `%d`），抓不到裸数字；
+    # 而 RPG Maker 写的正是裸数字。实测漏掉的后果：
+    # `'%1 attacks!'` → `'攻击！'`，游戏里**行动者名字消失**。
+    #
+    # 实测规模：真实游戏 357 条含 `%n` 的条目里，**189 条（53%）**
+    # 的译文丢了变量（`1→0` 74 条、`2→1` 96 条、`3→1` 13 条…）。
+    #
+    # ⚠️ 但**掩码器不再屏蔽 `%n`**（见 `placeholders._PERCENT_VAR_RE`）：
+    # 实测把它换成 `⟦0⟧` 之后模型更容易丢掉它（0～2/14 vs 不屏蔽约 7/14），
+    # 因为 `⟦0⟧` 是无语义的装饰符，而 `%1` 在训练数据里是有含义的格式串。
+    # 改成"让模型看得见、出站查数量"（`guards.check_percent_vars`）。
+    ("rpgmaker_message_var", r"%\d+"),
     ("brace_index", r"\{\d+(?::[^{}]*)?\}"),
     ("template_var", r"\$\{[^}]*\}"),
     ("html_entity", r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);"),

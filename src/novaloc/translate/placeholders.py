@@ -210,6 +210,36 @@ PLACEHOLDER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"%\d*(?:\.\d+)?[sdfxXeEgGoc]"),
     re.compile(r"%[-+0#]+[^A-Za-z0-9\s]?\d*(?:\.\d+)?[sdfxXeEgGoc]"),
     re.compile(r"%l{1,2}[sdfxXeEgGoc]"),
+    # ★ RPG Maker MV/MZ 的**消息替换变量**：`%1` `%2` `%3`
+    #
+    # ## 事故：这两个字符不在掩码表里，于是**两个模型都会丢掉它**
+    #
+    # `Database → 用语` 里的战斗消息就在用这个语法：
+    #
+    #     '%1 attacks!'    →  translategemma 出 '攻击！'      ← `%1` 没了
+    #     '%1 casts %2!'   →  translategemma 出 '%1 施法！'   ← `%2` 没了
+    #     '¡%1 usa %2!'    →  HY-MT1.5 出 '有人使用了%2！'    ← `%1` 没了
+    #
+    # 游戏运行时会把 `%1` 替换成**行动者名字**、`%2` 替换成**目标名字**。
+    # 所以丢掉它不是"少了个符号"，而是玩家看到
+    #
+    #     '攻击！'            ← 谁攻击谁？名字全没了
+    #
+    # ## 为什么原来的 printf 规则抓不到
+    #
+    # 上面那条 `%\d*(?:\.\d+)?[sdfxXeEgGoc]` 要求**转换字符**
+    # （`%s` `%d` `%1$s`）。而 RPG Maker 写的是**裸数字** `%1` ——
+    # 没有转换字符，于是**一条都不匹配**，`%1` 被当成可翻译明文送给模型。
+    #
+    # 实测：`mask('%1 attacks!')` 返回槽位 `[]`（**零个**），
+    # 所以占位符校验根本不知道它有东西要保 —— 丢了也不报。
+    #
+    # ## 为什么 `%` 后面只允许数字
+    #
+    # 不能写成 `%\d+` 之外更宽的形式。`'100% complete'` 这类文本里
+    # `%` 后面跟空格，若允许任意字符就会被误屏蔽、把句子切碎
+    # （上面那段注释记的就是这个坑）。只认**紧跟数字**的形态。
+    re.compile(r"%\d+"),
     # Python / C# 命名与位置格式化
     re.compile(r"\{[A-Za-z_][A-Za-z0-9_.]*\}"),
     re.compile(r"\{\d+(?::[^}]*)?\}"),
@@ -229,6 +259,47 @@ PLACEHOLDER_PATTERNS: tuple[re.Pattern[str], ...] = (
 _NEVER_MASK = {
     "%", "%%", "{}", "[]", "<>", "\\",
 }
+
+#: 形如 `%1` `%2` 的 **RPG Maker 消息替换变量**。
+#:
+#: ## 事故：**屏蔽它们反而让模型更容易丢掉它们**
+#:
+#: 这两个记号的正确性极重要 —— 游戏运行时把 `%1` 换成**行动者名字**、
+#: `%2` 换成**目标名字**。丢了它，玩家看到的是
+#:
+#:     '%1 attacks!'  →  '攻击！'        ← 谁攻击？名字没了
+#:
+#: 最直觉的做法是"把它屏蔽成 `⟦0⟧` 保护起来"。**实测这是错的**，
+#: 而且错得很彻底。拿 14 条**真实丢过变量**的源文做 A/B：
+#:
+#: | 做法 | `%n` 保住 |
+#: |---|---|
+#: | 屏蔽成 `⟦0⟧`（+ 各种提示词强调） | **0～2 / 14** |
+#: | **不屏蔽**，让模型直接看到 `%1` | **约 7 / 14** |
+#:
+#: 试过 6 种记号长相（`⟦0⟧` `{{0}}` `<ph0/>` `${0}` `[[0]]` `<0>`），
+#: **没有一种**能稳住句首的那个；又试了 3 版提示词
+#: （只说"必须保留" / 说清"这是名字" / 加了反面例子），
+#: 屏蔽路径最好也只到 2/14。
+#:
+#: 原因不难理解：`⟦0⟧` 对模型是个**没有语义的装饰符**，
+#: 而 `%1` 在训练数据里是**有含义的格式串**（printf 家族），
+#: 模型知道它承载数据。把语义换成装饰，模型就把它当噪音清掉了。
+#:
+#: **结论：对这类变量，"可见"比"被保护"更重要。**
+#: 所以从掩码表里排除，改由 :func:`check_percent_vars` 在**出站**做校验 ——
+#: 校验不需要把记号藏起来，只需要比对数量。
+_PERCENT_VAR_RE = re.compile(r"%\d+")
+
+
+def is_percent_var(text: str) -> bool:
+    """是不是 RPG Maker 的消息替换变量（`%1` `%2` …）。"""
+    return bool(_PERCENT_VAR_RE.fullmatch(text or ""))
+
+
+def percent_vars(text: str) -> list[str]:
+    """按出现顺序取出文本里的 `%n` 变量。"""
+    return _PERCENT_VAR_RE.findall(text or "")
 
 
 def _placeholder_spans(text: str) -> list[tuple[int, int, str]]:
@@ -250,6 +321,11 @@ def _placeholder_spans(text: str) -> list[tuple[int, int, str]]:
         for m in pat.finditer(text):
             val = m.group(0)
             if val in _NEVER_MASK or "\x00" in val:
+                continue
+            # `%n` **故意不屏蔽** —— 见 `_PERCENT_VAR_RE` 上方的实测记录。
+            # 屏蔽会把它变成没有语义的装饰符，模型反而更容易丢掉它
+            # （实测 0～2/14，而不屏蔽约 7/14）。
+            if is_percent_var(val):
                 continue
             spans.append((m.start(), m.end(), val))
 
