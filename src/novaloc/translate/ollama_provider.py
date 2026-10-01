@@ -212,6 +212,15 @@ class OllamaTranslationProvider:
     # 批量切分
     # ------------------------------------------------------------------
 
+    def _hints_of(self, item: TranslateItem) -> list[str]:
+        """取这条目在提示词里收到的规则文本（供 hint 回声判据比对）。
+
+        ▲ 必须与实际发给模型的 hint **同源**（都来自 ``prompts.KIND_HINT``），
+          否则提示词一改，判据就悄悄失效了。
+        """
+        hint = prompts.KIND_HINT.get(item.unit.kind, "")
+        return [hint] if hint else []
+
     def _make_batches(self, items: list[TranslateItem]) -> list[list[int]]:
         """把条目切成批次。
 
@@ -528,6 +537,8 @@ class OllamaTranslationProvider:
         batches = self._make_batches(uniq_items)
         ratio = self.cfg.translate.max_chars_ratio
         use_mask = self.cfg.translate.mask_placeholders
+        # 换行也屏蔽（多行条目的完整性问题，见 placeholders.mask 的 newlines 参数）
+        mask_nl = self.cfg.translate.mask_newlines
 
         for bi, batch in enumerate(batches):
             self.stats["batches"] += 1
@@ -536,7 +547,7 @@ class OllamaTranslationProvider:
 
             # ---- 1. 屏蔽占位符 ----
             if use_mask:
-                masked_all, slots_all = ph.mask_batch(sources)
+                masked_all, slots_all = ph.mask_batch(sources, newlines=mask_nl)
             else:
                 masked_all = list(sources)
                 slots_all = [[] for _ in sources]
@@ -737,6 +748,7 @@ class OllamaTranslationProvider:
                     max_chars=item.unit.max_chars,
                     length_ratio=ratio,
                     target_lang=target_lang,
+                    hints=self._hints_of(item),
                 )
                 # ★ 判死的条目**不留译文**。
                 #
@@ -823,8 +835,17 @@ class OllamaTranslationProvider:
                 batch_items[local_i].unit.source,
                 restored2,
                 max_chars=batch_items[local_i].unit.max_chars,
-                length_ratio=self.cfg.translate.max_output_chars_factor,
+                # ▲ 这里原来是 `self.cfg.translate.max_output_chars_factor` ——
+                #   配置里**根本没有这个字段**（只有 `max_chars_ratio`），
+                #   所以一旦走到"记号重试"这条路就 `AttributeError`，
+                #   整批的补救全部作废。
+                #
+                #   极隐蔽：正常路径不经过这里，单元测试与历史实测都没碰到，
+                #   直到换了模型（HY-MT 更容易让首轮解析失败 ⇒ 更常走重试）
+                #   才暴露出来。
+                length_ratio=self.cfg.translate.max_chars_ratio,
                 target_lang=target_lang,
+                hints=self._hints_of(batch_items[local_i]),
             )
             if res2.fatal:
                 continue
@@ -925,7 +946,9 @@ class OllamaTranslationProvider:
             return []
         use_mask = self.cfg.translate.mask_placeholders
         if use_mask:
-            masked_all, slots_all = ph.mask_batch(sources)
+            masked_all, slots_all = ph.mask_batch(
+                sources, newlines=self.cfg.translate.mask_newlines
+            )
             pairs = [(i, masked_all[i], targets[i]) for i in range(len(sources))]
         else:
             slots_all = [[] for _ in sources]

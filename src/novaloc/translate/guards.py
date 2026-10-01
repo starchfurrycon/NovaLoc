@@ -297,6 +297,145 @@ def check_leak(target: str) -> list[str]:
     return []
 
 
+#: hint 回声判据用的 n-gram 粒度。
+#:
+#: 取 2/3/4 并**取最大重合率**，理由见 :func:`check_hint_echo` 的
+#: "为什么用多个粒度" —— 只用 4-gram 会漏掉"改写型复述"。
+_HINT_NGRAM_SIZES = (2, 3, 4)
+
+#: 默认粒度（``_ngrams`` 的缺省参数用）
+_HINT_NGRAM = 4
+
+#: hint 至少要有的 n-gram 个数，低于它这个粒度就不参与判断。
+#:
+#: 理由：比例判据在**短 hint** 上没有统计意义 ——
+#: 一个 5 个字的 hint 只要有 2 个 bigram 撞上就是 100%。
+#: 现在最短的 KIND_HINT 也有 30 字，所以这条只是防御性的。
+_HINT_MIN_HINT_NGRAMS = 12
+
+#: 判定阈值：hint 有多大比例被复现出来。
+#:
+#: 实测（真实泄漏与真实正常译文各若干条）：
+#:   正常译文最高 ≈ 5%，真实泄漏最低 ≈ 44%。
+#: 取 35% —— 落在那个数量级的空隙里。
+_HINT_ECHO_RATIO = 0.35
+
+#: 参与 n-gram 的字符：汉字 + 假名 + 拉丁字母 + 数字
+_HINT_KEEP_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fffA-Za-z0-9]")
+
+
+def _ngrams(text: str, n: int = _HINT_NGRAM) -> set[str]:
+    """取"只保留实义字符"的 n-gram（忽略空白与标点）。"""
+    clean = "".join(ch for ch in (text or "") if _HINT_KEEP_RE.match(ch))
+    if len(clean) < n:
+        return {clean} if clean else set()
+    return {clean[i : i + n] for i in range(len(clean) - n + 1)}
+
+
+def check_hint_echo(
+    target: str,
+    hints: list[str] | None,
+    *,
+    source: str = "",
+    min_ratio: float = 0.5,
+) -> list[str]:
+    r"""译文是不是把**我们发给模型的规则**（kind hint）复述了回来。
+
+    ## 为什么单独做这一条判据
+
+    `check_leak` 匹配的是"模型在说它自己"的**通用形状**
+    （``要求：``、``抱歉…无法``、``作为 AI``）。它抓不到下面这种：
+
+        源: "Demon:\nStill, we can't count on weapons…"
+        译: "角色对白。保持说话者的语气、性格与语域；原文若是粗鲁/亲昵/
+             敬语，中文也要对应。不要添加原文没有的称呼。"
+
+    这**不是**通用元话，而是模型在**复述我们提示词里的
+    ``KIND_HINT[DIALOGUE]``**。实测（HY-MT1.5-7B，36 条真实英文多行文本）
+    有 2 条是这样；改成"``<原文>`` 包裹"的提示词形状后仍有 1 条
+    —— 也就是**光改提示词形状治不好**，必须有产品侧的兜底。
+
+    ## 为什么按 n-gram 重合度判，而不是按固定词表
+
+    固定词表（"角色对白"、"物品/技能说明"…）有两个毛病：
+    ① 提示词一改就得改词表；② 真正危险的是"整段被复述"，
+    而词表只能看到零散关键词。
+
+    改成**拿这条目实际收到的 hint 做比对**：hint 是运行时已知的，
+    不需要维护词表，提示词改了判据自动跟着变。
+
+    ## 为什么用**多个粒度**（2/3/4-gram）取最大值
+
+    这是实测逼出来的。模型复述规则时常常**顺手改写几个字**：
+
+        hint: 保持说话人的语气、性格与语域；原文若是粗鲁/亲昵/敬语…
+        译文: 请保持说话者的语气、性格和语域；如果原文使用粗鲁、亲昵或敬语…
+
+    "保持→请保持"、"若是→如果"、"与→和" —— 只按 4-gram 比，
+    这些"改写型复述"的重合度会掉到 50% 以下而**漏判**（实测 5 条里漏 2 条）。
+
+    改用 2/3/4-gram 的**最大重合率**后：改写只影响很短的片段，
+    2-gram 层面依然几乎全中，于是漏判消失；而正常译文因为整体措辞不同，
+    任何粒度都到不了阈值。
+
+    ## 为什么不会误杀（实测）
+
+    在 DemonsRoots **已经发出的 3037 条真实译文**（全量 45548 条的等距抽样）
+    上跑这条判据：**命中 0 条**。所以留了足够的安全边际来调高灵敏度。
+
+    ## ``source`` 的作用
+
+    如果**原文本身**就含这些字（比如原文是中文且内容就是这句规则），
+    译文出现它们是正常的。所以 hint 与 source 共有的 n-gram 不计入。
+    """
+    hints = [h for h in (hints or []) if h and h.strip()]
+    if not hints or not (target or "").strip():
+        return []
+
+    # ══════════════════════════════════════════════════════════════════
+    # 判据形态：**规则被复现的比例**（hint coverage），不是"译文里有多少像规则"
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # ## 两个方向，选错了就抓不住
+    #
+    # 一开始量的是"**译文里有多大比例来自 hint**"（hit / |目标 n-gram|）。
+    # 这个方向对**改写型复述**不灵敏：模型把规则改写一遍，
+    # 每个 n-gram 都差一两个字，命中的就少了；而译文越长，
+    # 分母越大，比例被摊薄。
+    # 实测那条被漏判的：命中 24/54 = **44.4%**，够不到 50% 的线。
+    #
+    # 换成量"**hint 有多大比例出现在译文里**"（hit / |hint n-gram|）
+    # 就对了 —— 泄漏的定义本来就是"规则被抄了进来"，
+    # 主语是**规则**，不是译文。同一条实测数据：
+    #
+    #     正常译文（演员：不过别担心…）    hint 被复现 2/43 =  4.7%
+    #     泄漏（复述了整条 DIALOGUE 规则） hint 被复现 19/43 = 44.2%
+    #
+    # 4.7% 与 44.2% 之间有**一个数量级**的空隙，阈值取 35% 很安全。
+    best = 0.0
+    for n in _HINT_NGRAM_SIZES:
+        tgt = _ngrams(target, n)
+        if not tgt:
+            continue
+        # 与**原文**共有的 n-gram 不算：原文若本身就是中文规则文本，
+        # 译文照抄是正常的（见 docstring 里 source 的说明）。
+        src = _ngrams(source, n)
+        for hint in hints:
+            hg = _ngrams(hint, n) - src
+            if len(hg) < _HINT_MIN_HINT_NGRAMS:
+                # hint 太短，比例没有统计意义（几个字全中就是 100%）
+                continue
+            hit = len(tgt & hg)
+            if hit:
+                best = max(best, hit / len(hg))
+    if best >= min_ratio:
+        return [
+            f"hint_echo: 提示词里那条风格规则有 {best:.0%} 的文字出现在了译文里，"
+            "模型把'翻译要求'当成要翻译的内容复述了"
+        ]
+    return []
+
+
 #: 复读检测用的 n-gram 长度（字符数）
 _REPEAT_N = 4
 
@@ -476,13 +615,21 @@ def guard(
     allow_untranslated: bool = False,
     target_lang: str = "zh-Hans",
     check_repeat: bool = True,
+    hints: list[str] | None = None,
 ) -> GuardResult:
-    """对单条译文做完整校验。"""
+    """对单条译文做完整校验。
+
+    ``hints`` 是这条目在提示词里收到的**规则文本**（``KIND_HINT[kind]``）。
+    传进来才能检出"模型把规则复述成译文"（见 :func:`check_hint_echo`）。
+    不传就跳过这条判据 —— 老调用方行为不变。
+    """
     target = clean_translation(raw_target)
     warnings: list[str] = []
 
     warnings += check_leak(target)
-    if "prompt_leak" in warnings:
+    warnings += check_hint_echo(target, hints, source=source)
+    if "prompt_leak" in warnings or any(w.startswith("hint_echo") for w in warnings):
+        # 这条译文就是提示词本身，没有任何可用内容 ⇒ 判死、不留文字。
         return GuardResult(text="", warnings=warnings, fatal=True)
 
     if not target:

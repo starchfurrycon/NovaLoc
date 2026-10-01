@@ -302,16 +302,22 @@ def percent_vars(text: str) -> list[str]:
     return _PERCENT_VAR_RE.findall(text or "")
 
 
-def _placeholder_spans(text: str) -> list[tuple[int, int, str]]:
+def _placeholder_spans(
+    text: str, *, newlines: bool = False
+) -> list[tuple[int, int, str]]:
     """算出所有需要保护的占位符区间（已去重、去重叠）。
 
     两个容易踩的坑，都在这里处理：
 
     1. **必须先把 ``_NEVER_MASK`` 里的候选剔除，再做重叠消解。**
-       否则 ``100% complete`` 这类文本里，被排除的候选会挡住真正该保护的匹配。
+       否则 ``100 complete`` 这类文本里，被排除的候选会挡住真正该保护的匹配。
     2. ``%%`` 是转义后的百分号，不是格式说明符，必须整体忽略；
        否则单个 ``%`` 规则会把它拆开。
-    r"""
+
+    ``newlines=True`` 时把**换行**也当成一个占位符保护起来。
+    这是 :func:`mask` 的 ``newlines`` 参数透传下来的，
+    完整理由见 :func:`mask`。
+    """
     # 先把 %% 挖掉，避免单 % 规则把转义百分号拆成两半
     guard = "\x00" * 2
     text = text.replace("%%", guard)
@@ -328,6 +334,14 @@ def _placeholder_spans(text: str) -> list[tuple[int, int, str]]:
             if is_percent_var(val):
                 continue
             spans.append((m.start(), m.end(), val))
+
+    if newlines:
+        # 换行自己也是一个"占位符"：值就是 "\n"。
+        # ▲ 连着的多个换行**逐个**屏蔽（空行是有意义的版面），
+        #   不要合并成一个。
+        for i, ch in enumerate(text):
+            if ch == "\n":
+                spans.append((i, i + 1, "\n"))
 
     # 重叠消解：保留"最靠前、且最长"的匹配
     spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
@@ -375,17 +389,54 @@ class PlaceholderSet:
         return bool(self.items)
 
 
-def mask(text: str, *, start_index: int = 0) -> MaskResult:
+def mask(text: str, *, start_index: int = 0, newlines: bool = False) -> MaskResult:
     """把文本里的占位符替换成 ``⟦i⟧`` 记号。
 
     ``start_index`` 允许多段文本共用一个屏蔽命名空间（批量翻译时有用）。
+
+    ## ``newlines=True``：把**换行**也屏蔽掉（默认关）
+
+    这是为了修一个**静默丢内容**的问题。RPG Maker 的对话有 **48%** 是
+    "一条台词被引擎按显示宽度切成多个 401 指令"，适配器把这种组**合成一条**
+    送翻译，译完再按行拆回各槽位。但实测：
+
+    | 模型 | 合并送：译文内容量 / 逐行翻的内容量 |
+    |---|---|
+    | `translategemma:4b` | 中位数 **0.55**，20 条里 **12 条 < 0.6** |
+    | `HY-MT1.5-7B` | 中位数 0.96，但 20 条里 5 条**空译文** |
+
+    裸调 Ollama 抓到了根因：提示词给的是编号 **0~3**（4 条），
+    `translategemma:4b` 却吐出了 **`"4"`** 这个键 ——
+
+    ```json
+    {"0": "…", "1": "…", "2": "…", "3": "…", "4": "更多文字在此。"}
+    ```
+
+    它**看着换行在切条**：把同一条目里的多个换行当成了多个条目。
+    后果是 ① 编号整体错位（A 条内容落进 B 条）② 一条 3 行的台词只翻出第 1 行，
+    而两种都**通顺、长度比也不越界**，检查全绿。
+
+    把换行换成 ``⟦n⟧`` 之后模型眼里每条只剩一行，没得切。实测：
+
+    | 模型 | 合并送（现状） | 合并送（屏蔽换行） |
+    |---|---|---|
+    | `translategemma:4b` | 中位数 0.56，13/20 缺陷 | **中位数 0.89，7/20** |
+    | `HY-MT1.5-7B` | 中位数 0.92，5 条空 | **中位数 1.00，0 条空** |
+
+    两个模型都变好，而且**更快**（少一次逐条降级）。
+
+    另外这带来一个附加好处：换行进了槽位表，于是"丢行"会被
+    :func:`verify_restored` 的占位符多重集校验抓住，**变成硬失败**，
+    而不是像以前那样静默漏译。代价是换行位置可能被模型挪动
+    （中文语序不同），但换行位置本来就已经放弃了 —— 两个模型都
+    不保留换行，``_split_across_slots`` 走的是"按源文各行长度比例切"。
     """
     if not text:
         return MaskResult(text=text, slots=[])
 
     # 注意：_placeholder_spans 内部会把 %% 临时替换掉，所以这里的偏移量
     # 是基于"%% 被换成等长哨兵"后的文本，长度不变，索引依然正确。
-    chosen = _placeholder_spans(text)
+    chosen = _placeholder_spans(text, newlines=newlines)
     if not chosen:
         return MaskResult(text=text, slots=[])
 
@@ -464,6 +515,30 @@ def _is_style_only_mark(mark: str) -> bool:
         return False
     # 带 `[...]` 的（含嵌套形式）都是内容类
     return False
+
+
+def _is_droppable_mark(mark: str) -> bool:
+    """这个槽位的值**允许**丢（丢了不判失败）。
+
+    ## 两类允许丢
+
+    1. **纯样式记号**（``\\{`` ``\\}`` ``\\|`` ``\\.`` ``\\!`` ``\\<`` ``\\>``
+       ``\\^`` ``\\\\``）：只影响排版观感。有一整组用例专门守这个
+       （``test_style_only_mark_loss_is_not_fatal``）。
+    2. **``%%``**：写回游戏时被引擎渲染成一个字面百分号。模型写成 `％`
+       或直接省掉都是可接受的；以前就没有为它判过错，这里不能突然收紧。
+
+    ## 「换行」为什么**不在**这一类
+
+    ``"\\n"`` 是 :func:`mask` 的 ``newlines=True`` 塞进槽位表的。
+    它**必须**算内容类 —— 丢一个换行就意味着模型少翻了一行，
+    这正是那个开关要抓的东西。所以这里显式返回 ``False``。
+    """
+    if mark == "\n":
+        return False
+    if mark == "%%":
+        return True
+    return _is_style_only_mark(mark)
 
 
 @dataclass
@@ -638,43 +713,131 @@ def verify_restored(
     ``masked_source`` 是屏蔽后的原文，**顺序校验必须靠它** ——
     ``original`` 里全是原始占位符、没有 ``⟦i⟧``，看不出索引顺序。
 
-    三层校验，缺一不可：
+    四层校验，缺一不可：
 
     1. **多重集**：数量与内容必须一致（``\\V[1]`` 出现两次就还原两次）。
     2. **剩余记号**：还原不掉的自造记号（``⟦9⟧``）也算失败。
     3. **出现顺序**：``⟦0⟧ ⟦1⟧`` 不能被写成 ``⟦1⟧ ⟦0⟧``。
        成对标签的顺序一旦交换，还原出的标记法是坏的，但文本看起来完全正常，
        属于最容易漏过的"沉默损坏"。
+    4. **记号个数**（第 4 层，见下面那段长注释）：模型必须把收到的每个
+       **内容类**记号都还回来。少一个就是它吞掉了内容。
     r"""
     restored = unmask(translated_raw, slots)
     left = remaining_masks(restored)
     check = compare_restored(original, restored)
-    if left:
-        check.extra.extend(f"⟦{i}⟧" for i in left)
-        check.ok = False
 
     if masked_source:
-        src_order = mask_indices(masked_source)
-        tgt_order = mask_indices(translated_raw)
-        # 只在"数量与内容都对得上"时才判顺序，否则交给上面的缺失/多余分支报错
-        if src_order and tgt_order and not check.missing and not check.extra:
-            if tgt_order != src_order:
+        # ★ 第四层：**记号个数**（这一层是实测补出来的，前面三层都漏）
+        #
+        # ## 漏在哪
+        #
+        # `compare_restored(original, restored)` 比的是"原文 vs 还原后"。
+        # 模型如果**把某个记号整个删了**，还原后两边都没有那个点位的东西，
+        # 于是"相等"、不报错。
+        #
+        # 顺序校验（下面那段）也漏：它要求 `src_order and tgt_order` 都非空。
+        # 只丢到"一个记号都不剩"时 `tgt_order == []`，
+        # 整个顺序分支被跳过 —— 恰好是最严重的情形（少翻一行）静默通过。
+        #
+        # 实测：源 `"第一行\n第二行"` 屏蔽成 `"第一行⟦0⟧第二行"`，
+        # 模型只回 `"只翻了第一行"`（记号全丢），四层校验**全绿**。
+        # 于是换行屏蔽带来的"丢行 → 硬失败"这个价值根本兑现不了。
+        #
+        # ## 为什么只对**内容类**记号报缺失
+        #
+        # 纯样式记号（``\\{`` ``\\}`` ``\\|`` ``\\.`` ``\\!`` ``\\<`` ``\\>``
+        # ``\\^`` ``\\\\``）以及 ``%%`` 历史上是**允许丢**的：
+        # 它们只影响排版观感，丢了不会让玩家看到错东西或让游戏出错。
+        # `tests/test_placeholder_consistency.py` 里有一整组用例专门守这个
+        # （``test_style_only_mark_loss_is_not_fatal``）——
+        # 第一版把缺失判据写成"所有记号都要求回来"，那 8 条用例立刻全红。
+        #
+        # 所以要按**槽位的值**过滤：只对内容类（含换行）要求必须回来。
+        src_idx = mask_indices(masked_source)
+        tgt_idx = mask_indices(translated_raw)
+        missing_idx = sorted(
+            i
+            for i in set(src_idx) - set(tgt_idx)
+            if i < len(slots) and not _is_droppable_mark(slots[i])
+        )
+        if missing_idx:
+            # ▲ 但"模型没写记号、而是把**原始占位符原样抄了回来**"是合法输出。
+            #
+            # 有一类模型直接输出 `\V[1]` 而不是 `⟦0⟧` —— 那其实"帮了忙"，
+            # `compare_restored(original, restored)` 已经比过、结论是相等。
+            # 测试里明确标了这种应当通过
+            # （`test_placeholders.py` 的"模型自己写回了原始占位符（数量正确）"）。
+            #
+            # 所以再加一道：**若该槽位的原值在还原后的文本里出现了，
+            # 且多重集校验本来就通过，就不算缺失** —— 模型只是换了种写法。
+            still_missing = [
+                i
+                for i in missing_idx
+                if not (check.ok and slots[i] and slots[i] in restored)
+            ]
+            if still_missing:
+                check.missing.extend(f"⟦{i}⟧" for i in still_missing)
+                check.ok = False
+
+        # ⑤「多余记号」也按**索引集合**判，而不是按"还原后还剩没剩 ⟦n⟧"。
+        #
+        # 这条是修一个自己撞出来的回归：有一类**合法**输出是模型
+        # **直接把原始占位符写回来**（`⟦0⟧` 位置写成 `\V[1]`）。
+        # 那其实"帮了忙"、多重集完全一致，测试里明确标了应当通过
+        # （`test_placeholders.py` 的"模型自己写回了原始占位符（数量正确）"）。
+        # 但按"还原后还剩 ⟦n⟧"判就会把它算成多余 —— 因为它压根没写记号。
+        # 按索引集合判就没有这个问题：越界索引才是真的"凭空多造"。
+        extra_idx = sorted(i for i in set(tgt_idx) - set(src_idx) if i >= len(slots))
+        if extra_idx:
+            check.extra.extend(f"⟦{i}⟧" for i in extra_idx)
+            check.ok = False
+        # 还原不掉的自造记号（`⟦9⟧` 这种）仍然要报。
+        #
+        # ▲ 但要排除"**本身就是原文里的字符**"的情形：模型把 `\V[1]`
+        #   原样抄回来时，那一行里当然会留下 `⟦0⟧` 字样的痕迹 ——
+        #   那是**正确**行为（多重集一致），不能算自造记号。
+        #   实测：不排除的话，`test_placeholders.py` 的
+        #   "模型自己写回了原始占位符（数量正确）"会从通过变致命。
+        for raw_idx in left:
+            token = f"⟦{raw_idx}⟧"
+            if token in (original or ""):
+                continue
+            if token not in check.extra:
+                check.extra.append(token)
+            check.ok = False
+
+        # 顺序校验：只在"数量与内容都对得上"时才判，
+        # 否则交给上面的缺失/多余分支报错
+        if src_idx and tgt_idx and not check.missing and not check.extra:
+            if tgt_idx != src_idx:
                 check.order_changed = [
                     i
-                    for i, (a, b) in enumerate(zip(src_order, tgt_order, strict=False))
+                    for i, (a, b) in enumerate(zip(src_idx, tgt_idx, strict=False))
                     if a != b
                 ]
                 check.ok = False
+    elif left:
+        # 没有 masked_source 时退回老行为
+        check.extra.extend(f"⟦{i}⟧" for i in left)
+        check.ok = False
 
-        # ---- 连续「内容记号」组不许被拆散 ----
-        #
-        # 只在多重集完整时判（缺/多记号另有分支报错，且拆散判定需要编号可比）。
-        if not check.missing and not check.extra:
-            check.runs_split = find_split_content_runs(
-                masked_source, translated_raw, slots
-            )
-            if check.runs_split:
-                check.ok = False
+    # ---- 连续「内容记号」组不许被拆散 ----
+    #
+    # ▲ 这一段**必须放在 `if masked_source` 外面**。
+    #   原来的代码把它缩进在 `elif left:` 分支里，于是只要调用方传了
+    #   `masked_source`（产品路径**全都传**），这个判据就**从来没跑过** ——
+    #   `tests/test_content_run_split.py` 的 3 条核心用例一直是红的。
+    #   它是"图标码组被拆开"的唯一拦截点，静默失效的后果是
+    #   `\I[96]` 跑到别的标签后面，玩家看到"防具类型"配武器图标。
+    #
+    # 只在多重集完整时判（缺/多记号另有分支报错，且拆散判定需要编号可比）。
+    if not check.missing and not check.extra:
+        check.runs_split = find_split_content_runs(
+            masked_source or original, translated_raw, slots
+        )
+        if check.runs_split:
+            check.ok = False
     return restored, check
 
 
@@ -1243,7 +1406,9 @@ def _find_anchor_pos(target: str, anchor: str) -> int | None:
     return pos + 1
 
 
-def mask_batch(texts: list[str]) -> tuple[list[str], list[list[str]]]:
+def mask_batch(
+    texts: list[str], *, newlines: bool = False
+) -> tuple[list[str], list[list[str]]]:
     """一次屏蔽一批文本，**每条各自从 ⟦0⟧ 开始编号**。
 
     为什么不用"全批共用一个索引空间"（看起来更严格）：
@@ -1257,7 +1422,7 @@ def mask_batch(texts: list[str]) -> tuple[list[str], list[list[str]]]:
     masked: list[str] = []
     all_slots: list[list[str]] = []
     for t in texts:
-        r = mask(t, start_index=0)
+        r = mask(t, start_index=0, newlines=newlines)
         masked.append(r.text)
         all_slots.append(r.slots)
     return masked, all_slots
