@@ -1,4 +1,4 @@
-﻿"""同批内按原文去重：不重复问模型同一句话。
+"""同批内按原文去重：不重复问模型同一句话。
 
 ## 为什么值得做（真实数据）
 
@@ -128,7 +128,7 @@ class _FakeProvider(OllamaTranslationProvider):
         self.batch_calls.append([it.unit.source for it in batch_items])
         return {i: self._fake_target(it.unit.source) for i, it in enumerate(batch_items)}
 
-    def _call_single(self, item, masked):  # noqa: ANN001, ARG002
+    def _call_single(self, item, masked, **kwargs):  # noqa: ANN001, ARG002
         return self._fake_target(item.unit.source)
 
 

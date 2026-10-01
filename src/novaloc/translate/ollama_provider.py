@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from ..core.registry import Context, ProviderError, TranslateItem, register
@@ -67,6 +68,83 @@ _SHORT_KINDS = {
     TextKind.MAP_NAME,
     TextKind.CHARACTER_NAME,
 }
+
+#: 判断"片段是否已被前文覆盖"时，归一化用的字符集：
+#: 只留中日文与字母数字 —— 标点/空格/引号样式的差异不算差异。
+_MERGE_STRIP = re.compile(r"[^0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff]+")
+
+
+def _best_segment(segs: list[str], slots: list[str] | None = None) -> str | None:
+    r"""从模型返回的多个片段里挑**一个最好**的，而不是把它们拼起来。
+
+    ## 为什么是"挑"而不是"拼" —— 真实数据（10/10 复现）
+
+    用产品**真实**的单条路径（`_call_single` + 真实提示词）对 10 条
+    ElfLifia 多行条目各请求一次，**10/10** 都返回多段 JSON。
+    逐条人工判定后，模型给的分段有**三种**语义，而它们长得很像：
+
+    | 形态 | 真实样本 | 正确做法 |
+    |---|---|---|
+    | 每段是**同一内容的完整替代译文** | `{"0":"造成4倍「防御」的伤害。随后所有「防御」效果消失。", "1":"造成4倍你的「防御」值造成的伤害。\n然后移除所有「防御」效果。"}` | 取**段 0** |
+    | 段 0 **不完整**，段 1 补全 | `{"0":"恢复 5 点生命值。", "1":"生命回复：每回合结束时回复…"}` | 取**段 0**（它已含源文全部信息） |
+    | 各段**完全相同** | `{"0":"获得 1 个『复制』。…", "1":"获得 1 个『复制』。…"}` | 取**段 0** |
+
+    三种形态的共同答案是**段 0**。
+
+    ## 为什么"拼接"是错的（我第一版就犯了这个错）
+
+    第一版按编号 `"\n".join`，结果在形态 1、3 上把同一句话接了两遍：
+
+        '造成 4 倍「防御」的伤害。随后所有「防御」效果消失。
+         造成 4 倍你的「防御」值造成的伤害。\n然后移除所有「防御」效果。'
+
+    这是**复读**——比丢内容更糟（译文长度翻倍，游戏里显示两遍）。
+    本项目 2026-09 已因复读事故修过一次，不能再犯。
+
+    而"用二元组覆盖率去重"也试过，**不可行**：真实样本里
+    "重复措辞"的覆盖率是 0.38~0.90，"真·互补内容"是 0.00~0.57 ——
+    **两个区间重叠**，任何阈值都会误杀一边。信号不足以分开它们，
+    所以选一个不依赖阈值的规则。
+
+    ## 选择规则（按优先级）
+
+    1. **丢的占位符最少**的段（含 `slots` 时）。占位符丢了这条译文
+       就没法正确回写，是最硬的约束，优先于一切。
+    2. 其中**含换行**的段 —— 换行是作者定的版面（见
+       `_split_across_slots` 的说明），带换行的段能直接对上引擎槽位。
+    3. 仍并列时取**编号最小**的段（段 0）。
+
+    ▲ 规则 3 不是随手加的：段 0 是模型对"整条文本"的主答案，
+    后续段才是它自己拆出来的补充/替代。实测 10 条里 **8 条**
+    各段都没丢占位符（占位符在源文里、模型直接吃掉了），
+    此时若按"最长"选，`Items.json:/2` 会把**补充说明段**
+    （`生命回复：每回合结束时…`）选成整条译文，
+    读起来像原文只有后半句。以"编号最小"兜底才对。
+
+    ▲ 判定换行时要**同时认**真换行与 `\n` 字面量：模型输出的是
+    JSON 字符串时，换行是 `"\\n"` 两个字符（实测
+    `Items.json:/19` 就是这样）。只看真换行会漏掉这类段。
+
+    Args:
+        segs: 模型按编号顺序给出的片段。
+        slots: 本条目的占位符表（用于规则 1）；给了才启用规则 1。
+
+    Returns:
+        选中的单个片段；全为空时返回 ``None``。
+    """
+    cand = [s.strip() for s in segs if s and s.strip()]
+    if not cand:
+        return None
+    if len(cand) == 1:
+        return cand[0]
+    if slots:
+        missing = [sum(1 for m in slots if m not in s) for s in cand]
+        fewest = min(missing)
+        cand = [s for s, m in zip(cand, missing, strict=True) if m == fewest]
+    with_nl = [s for s in cand if "\n" in s or "\\n" in s]
+    pool = with_nl or cand
+    # 并列时取**编号最小**的（`pool` 保持了原始顺序）
+    return pool[0]
 
 
 @register("translate", "ollama")
@@ -399,7 +477,14 @@ class OllamaTranslationProvider:
             self.stats["single_fallbacks"] += 1
             for li in missing:
                 try:
-                    got = self._call_single(batch_items[li], masked[li])
+                    # 这个兜底路径没有 `slots_all`（它是 `_call_batch` 内部的
+                    # 返回值），从掩码文本本身抠出记号 —— 段选择只关心
+                    # "哪些记号该在"，`⟦n⟧` 就是全部信息。
+                    got = self._call_single(
+                        batch_items[li],
+                        masked[li],
+                        slots=ph.remaining_masks(masked[li]),
+                    )
                 except _RETRYABLE as exc:
                     log.debug("补漏第 %d 条失败：%s", li, exc)
                     continue
@@ -416,12 +501,21 @@ class OllamaTranslationProvider:
         return mapping
 
     def _call_single(
-        self, item: TranslateItem, masked: str, *, marker_warning: str = ""
+        self,
+        item: TranslateItem,
+        masked: str,
+        *,
+        marker_warning: str = "",
+        slots: list[str] | None = None,
     ) -> str:
         """单条翻译。
 
         ``marker_warning`` 会**追加到用户提示词末尾**，用于"上一次把
         掩码记号弄丢了，重来一次"的定向重试 —— 见 `_retry_lost_markers`。
+
+        ``slots`` 是这条的占位符表（原样记号）。多段返回时用它挑段：
+        占位符丢得最少的段优先 —— 多行条目的段落边界就在占位符处，
+        丢了占位符的段没法正确回写（见 :func:`_best_segment`）。
         """
         user = prompts.build_single_user_prompt(
             masked,
@@ -458,12 +552,36 @@ class OllamaTranslationProvider:
         #
         # ## 正确处理
         #
-        # 按**编号顺序**把各段接起来（编号是模型自己给的顺序信息，
-        # 用它比用字典插入顺序可靠）。这个动作**不丢任何内容**，
-        # 比"只取第一段"和"整条拒收"都好。
+        # **挑一个最好的片段**，而不是拼起来 —— 真实数据实测
+        # 10/10 都是多段返回，而其中 2/3 的形态拼接会造成复读。
+        # 判定依据与实测样本见 :func:`_best_segment` 的说明。
         #
-        # ⚠️ 但**只在编号连续、且都从 0 开始时**才敢接 ——
-        # 编号有洞说明模型自己都没弄清段落边界，那种情况照旧拒收。
+        # ⚠️ **必须传 `slots`**：占位符丢得最少的段优先。多行条目的
+        #   段落边界就在占位符处，丢了占位符的段没法正确回写。
+        #
+        # ⚠️ 规则 1（占位符丢得最少）**优先于**"取段 0"：段 0 有时
+        #   不完整（`{"0": "恢复 5 点生命值。", "1": "生命回复：…"}`），
+        #   靠它筛。筛完仍并列才回落到段 0。
+        #
+        # ⚠️ 段选择**修不了**"换行占位符丢失"：实测 76 条里 5 条
+        #   （7%）模型把 `⟦n⟧` 换行记号吞了，此时选哪一段都会丢行，
+        #   guard 会判死 → **保留原文**。这是安全侧，但不是完整译文。
+        #   想再进一步需要"退回不屏蔽换行重译"的路径，见 ROADMAP。
+        # ⚠️ 键的类型：`parse_translations` 给的是 **`int`** 键
+        #   （`{0: …, 1: …}`）—— 实测确认过。写成 `mapping.get("0")`
+        #   会永远取到 `None`，把整个多段分支废掉。别改键类型。
+        #
+        # ⚠️ 这个分支**进不来**的两种真实情形（都会掉到下面的
+        #   "结果不是字符串"）：
+        #
+        #   1. **模型回吐提示词**。实测形态（ElfLifia 批 28）：
+        #      `{"0": "获得 1 个『额外抽牌』。\n『额外抽牌』：…」} ⟦0⟧ 保持
+        #      原文格式和数值。 调整句子结构…确保输出的"}`
+        #      —— 它把提示词里的规则一条条接在译文后面吐出来，
+        #      中间还夹着**未转义的换行**，于是 `parse_json_loose`
+        #      直接失败、`mapping` 为空。这不是"选段"能救的，
+        #      要靠护栏（hint_echo 已经在拦，见 `guards.py`）。
+        #   2. 模型只给纯文本（没有 JSON），由下面 `stripped` 那条接住。
         keys = sorted(mapping)
         joins = isinstance(mapping.get(0), str)
         if joins and len(keys) > 1:
@@ -476,9 +594,14 @@ class OllamaTranslationProvider:
                 raise ProviderError(
                     f"单条翻译返回了非字符串片段：{ {k: type(mapping[k]).__name__ for k in keys} }"
                 )
-            joined = "\n".join(mapping[k].strip() for k in keys)
-            log.debug("单条请求收到批格式多段响应，按编号拼接：%r", mapping)
-            return joined
+            picked = _best_segment([mapping[k] for k in keys], slots)
+            if picked is not None:
+                log.debug(
+                    "单条请求收到批格式 %d 段响应，按占位符完整度选段：%r",
+                    len(keys),
+                    {k: v[:30] for k, v in mapping.items()},
+                )
+                return picked
         parts = [
             v for v in mapping.values() if isinstance(v, str) and v.strip()
         ]
@@ -490,7 +613,21 @@ class OllamaTranslationProvider:
         stripped = raw.strip()
         if stripped and not stripped.startswith(("[", "{")):
             return stripped
-        raise ProviderError(f"单条翻译失败（结果不是字符串）：{raw[:200]!r}")
+        # ---- 报错要说**真正的**原因 ----
+        #
+        # 早先这里只有一句"结果不是字符串"，而它描述的其实是症状。
+        # 实测踩过的真实原因（ElfLifia 批 28）是**模型回吐提示词**：
+        # 它把规则一条条接在译文后面吐出来，中间还夹着裸换行，
+        # 于是 `parse_json_loose` 整个失败（`res.ok=False`）、
+        # `mapping` 为空。日志上看到的是"结果不是字符串"，
+        # 让人以为是选段逻辑坏了 —— 查错方向被带偏。
+        # 现在把解析层的诊断（`res.notes` / `res.method`）带出来。
+        why = "；".join(res.notes) if res.notes else "无法解析为 JSON"
+        raise ProviderError(
+            f"单条翻译失败（{why}）："
+            f"{'解析得到空映射' if not mapping else '解析结果不是字符串'}："
+            f"{raw[:200]!r}"
+        )
 
     @staticmethod
     def _context_hint(items: list[TranslateItem]) -> str:
@@ -558,7 +695,9 @@ class OllamaTranslationProvider:
             for attempt in range(3):
                 try:
                     if len(batch_items) == 1:
-                        got = self._call_single(batch_items[0], masked_all[0])
+                        got = self._call_single(
+                            batch_items[0], masked_all[0], slots=slots_all[0]
+                        )
                         raw_by_index = {0: got} if got else {}
                     else:
                         raw_by_index = self._call_batch(batch_items, masked_all)
@@ -583,7 +722,7 @@ class OllamaTranslationProvider:
                         single_err: str | None = None
                         for li, it in enumerate(batch_items):
                             try:
-                                got = self._call_single(it, masked_all[li])
+                                got = self._call_single(it, masked_all[li], slots=slots_all[li])
                                 if got:
                                     singles[li] = got
                             except _RETRYABLE as exc2:
@@ -611,7 +750,9 @@ class OllamaTranslationProvider:
                     if raw_by_index.get(li, "").strip():
                         continue
                     try:
-                        got = self._call_single(batch_items[li], masked_all[li])
+                        got = self._call_single(
+                            batch_items[li], masked_all[li], slots=slots_all[li]
+                        )
                     except _RETRYABLE as exc:
                         log.debug("补空第 %d 条失败：%s", li, exc)
                         continue
@@ -818,6 +959,7 @@ class OllamaTranslationProvider:
                     marker_warning=prompts.marker_retry_hint(
                         masked_all[local_i], slots_all[local_i]
                     ),
+                    slots=slots_all[local_i],
                 )
             except ProviderError:
                 continue

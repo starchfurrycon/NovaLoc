@@ -81,9 +81,10 @@ def test_call_single_rejects_unusable_shapes(monkeypatch: pytest.MonkeyPatch, ra
     )
 
 
-def test_call_single_joins_numbered_segments(monkeypatch: pytest.MonkeyPatch) -> None:
-    r"""★ 实测形态：模型把**原文里的换行**当成"两条独立文本"，
-    于是对单条请求回了**批格式**、带编号的答案。
+def test_call_single_picks_one_segment_not_a_concatenation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r"""★ 实测形态：模型对**单条**请求回了**批格式**、带编号的答案。
 
     ```
     源文  'A girl who grew up in the Kingdom of Bohelos. Not very athletic.\n
@@ -94,11 +95,24 @@ def test_call_single_joins_numbered_segments(monkeypatch: pytest.MonkeyPatch) ->
 
     `parse_translations` 摊成 `{0: ..., 1: ...}`。此时：
 
-    * 只取 `mapping[0]` ⇒ **静默丢掉第二行**；
+    * 只取 `mapping[0]` ⇒ 可能丢掉第二行；
     * 整条拒收 ⇒ 白丢一条本来完全可用的译文。
 
-    正确做法是**按编号顺序接起来** —— 编号是模型自己给的顺序信息，
-    比字典插入顺序可靠，而且**不丢任何内容**。
+    ## ▲ 这里**不能**断言"两段都接起来"
+
+    早先这个测试断言"按编号接起来、不丢任何内容"，并配了一段
+    "编号是模型自己给的顺序信息"的理由。**真实数据推翻了它**：
+    用产品真实路径对 ElfLifia 全部 76 条多行条目各请求一次，
+    **76/76** 都返回多段，而其中约 2/3 的第二段是**同一句话的
+    另一个措辞**而不是续写。拼接的后果是复读：
+
+        造成 4 倍「防御」的伤害。随后所有「防御」效果消失。
+        造成 4 倍你的「防御」值造成的伤害。\n然后移除所有「防御」效果。
+
+    同一句话显示两遍 —— 比丢内容更糟。
+
+    所以现在的做法是 `_best_segment`：**挑一段**，不拼。
+    详细样本与判定见 `tests/test_best_segment.py`。
     """
     prov = _make_provider(
         monkeypatch,
@@ -106,10 +120,25 @@ def test_call_single_joins_numbered_segments(monkeypatch: pytest.MonkeyPatch) ->
     )
     out = prov._call_single(_FakeItem("x"), "x")
     assert isinstance(out, str), f"必须返回 str，实际 {type(out).__name__}"
-    # 两段都要在，且按编号顺序
-    assert "来自博赫洛斯王国的女孩。" in out
-    assert "武器类型：剑" in out
-    assert out.index("来自") < out.index("武器类型")
+    # 必须是**某一段原文**，不能是两段拼起来
+    assert out in ("来自博赫洛斯王国的女孩。", "武器类型：剑"), f"拼接成了：{out!r}"
+
+
+def test_call_single_prefers_segment_with_intact_placeholders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r"""多段时选**占位符丢得最少**的那一段。
+
+    多行条目的段落边界就在换行占位符处：丢了占位符的段没法正确回写
+    （`verify_restored` 第 4 层会判死），所以这是最硬的约束。
+    """
+    prov = _make_provider(
+        monkeypatch,
+        '{"t": [{"i": 0, "t": "第一段把记号弄丢了"}, '
+        '{"i": 1, "t": "第二段保留了 ⟦0⟧ 记号"}]}',
+    )
+    out = prov._call_single(_FakeItem("x"), "x", slots=["⟦0⟧"])
+    assert out == "第二段保留了 ⟦0⟧ 记号", f"应选占位符完整的段，实际 {out!r}"
 
 
 def test_call_single_joins_single_fragment_array(monkeypatch: pytest.MonkeyPatch) -> None:

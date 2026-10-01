@@ -1534,6 +1534,30 @@ class Pipeline:
                     severity=Severity.WARN,
                 )
 
+            # ---- 闸门：有文本要翻、却一条都没得回写 ⇒ 不许"成功" ----
+            #
+            # ★ 真实踩过：手工删掉 `translations/entries.jsonl` 之后重跑
+            #   `translate fonts qa apply`，结果**只有 apply 真的跑了**
+            #   （translate 因为别的原因没产出文件），于是
+            #   `回写 0 条文本、1 张贴图、1 个字体` + `✅ 已写入 2 个文件`
+            #   + `🎉 全部完成`。**报告全绿，但游戏里一个字都没翻。**
+            #
+            #   这是本项目最危险的失效形态（"静默失效"），所以在这里
+            #   硬拦：`units` 里有该翻的文本、而 `translations` 是空的，
+            #   说明**上游没产出**，不是"这个游戏不需要翻"。
+            #   真实的"不需要翻"表现为 `units` 本身为空。
+            if units and not translations:
+                msg = (
+                    f"抽取到 {len(units)} 条文本，但没有任何一条可回写的译文"
+                    f"（读取到 {len(entries)} 条翻译记录）。"
+                    "这几乎总是**上游翻译阶段没有产出**（例如 "
+                    "`translations/entries.jsonl` 缺失或被清空），"
+                    "而不是这个游戏不需要翻译。已中止回写，"
+                    "避免出现'报告全绿、游戏里全是原文'的假成功。"
+                )
+                self.bus.log(msg, stage="apply", severity=Severity.ERROR)
+                raise RuntimeError(msg)
+
             font_patches: dict[str, Path] = {}
             for patch in font_patch_records(self.ws):
                 font_patches[patch["font_id"]] = patch["out_path"]

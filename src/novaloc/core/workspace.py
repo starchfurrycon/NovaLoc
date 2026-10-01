@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import shutil
 import threading
@@ -56,6 +57,8 @@ from ..models import (
 )
 from . import paths
 from .sanitize import sanitize_tree
+
+log = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -176,18 +179,45 @@ def _atomic_write(path: Path, data: str) -> None:
 
 
 def _read_jsonl(path: Path, model: type[T]) -> list[T]:
+    """读 jsonl，**跳过**坏行但把跳过的行**记下来**。
+
+    ## 为什么"跳过"是对的，"不吭声"是错的
+
+    单行坏了不该毁掉整个列表 —— 45k 条译文里坏一行就把整批丢掉，
+    用户会以为翻译全没了。所以跳过。
+
+    但**必须留下痕迹**：这些文件是用户可以手改的（`entries.jsonl`
+    就是给审校页和脚本改的）。改了之后写坏一行，静默跳过意味着
+    "用户改的译文凭空消失"，而报告里一切正常 —— 正是本项目反复
+    栽跟头的那一类（静默部分丢弃）。
+
+    所以这里返回列表，同时 `log.warning` 报出**行号与原因**。
+    """
     if not path.exists():
         return []
     out: list[T] = []
+    bad: list[tuple[int, str]] = []
     with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 out.append(model.model_validate_json(line))
-            except Exception:  # noqa: BLE001 - 单行坏了不该毁掉整个列表
-                continue
+            except Exception as exc:  # noqa: BLE001 - 单行坏了不该毁掉整个列表
+                bad.append((lineno, f"{type(exc).__name__}: {exc}"))
+    if bad:
+        detail = "；".join(f"第 {n} 行（{msg[:80]}）" for n, msg in bad[:3])
+        more = f"，另有 {len(bad) - 3} 行" if len(bad) > 3 else ""
+        log.warning(
+            "%s：跳过 %d 行无法解析的内容（%s%s）。已有 %d 条正常读入"
+            " —— 这些行不会出现在后续阶段，请检查文件是否被改坏。",
+            path.name,
+            len(bad),
+            detail,
+            more,
+            len(out),
+        )
     return out
 
 

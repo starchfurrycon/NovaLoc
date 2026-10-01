@@ -471,8 +471,17 @@ def unmask(text: str, slots: list[str]) -> str:
 
 
 def remaining_masks(text: str) -> list[str]:
-    """找出文本里还没被还原的屏蔽记号（模型可能自己编了几个出来）。"""
-    return _MASK_RE.findall(text or "")
+    """找出文本里还没被还原的屏蔽记号（模型可能自己编了几个出来）。
+
+    ▲ 返回的是**完整记号**（``"⟦0⟧"``）而不是光秃秃的下标（``"0"``）。
+
+    `_MASK_RE` 带一个捕获组，所以早先直接 `findall` 拿到的是**下标**。
+    调用方要么是 `.append(m.group(0))`、要么只数个数，所以一直没暴露。
+    但"剩下了哪些记号"这个信息如果只剩数字，就没法拿去和
+    `slots`（真正的内容）比对 —— 而按记号做段选择正需要这个
+    （见 `ollama_provider._best_segment`）。改成 `finditer` + `group(0)`。
+    """
+    return [m.group(0) for m in _MASK_RE.finditer(text or "")]
 
 
 # --------------------------------------------------------------------------

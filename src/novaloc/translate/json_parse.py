@@ -93,6 +93,62 @@ def _extract_balanced(text: str, open_ch: str = "[", close_ch: str = "]") -> str
     return None
 
 
+def _escape_raw_control_chars(text: str) -> str:
+    r"""把**字符串字面量内部**的裸换行/制表符转义成 ``\n`` ``\t``。
+
+    ## 为什么需要这一级
+
+    JSON 规范不允许字符串里出现裸控制字符，而模型**经常**吐出来。
+    实测（ElfLifia 批 28）模型回吐提示词时的形态：
+
+        {"0": "获得 1 个『额外抽牌』。\n『额外抽牌』：…」} ⟦0⟧"<裸换行>
+            <裸换行>    <裸换行>    …确保输出的"}
+
+    整段因此 `json.loads` 失败、`mapping` 为空，上层只能报
+    "结果不是字符串"。这一级的收益**不是**救回这条译文
+    （那内容是回吐的提示词，护栏应该拦掉），而是让解析能走完、
+    于是**护栏拿到文本、能给出真正的原因**（`hint_echo`），
+    而不是一个"解析不了"的笼统错误。
+
+    ## 只动字符串内部
+
+    逐字符扫描并跟踪"是否在字符串里"（含反斜杠转义），
+    结构性的换行（对象/数组之间）保持原样 —— 那些是合法空白。
+    """
+    out: list[str] = []
+    in_str = False
+    escaped = False
+    for ch in text:
+        if in_str:
+            if escaped:
+                escaped = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                escaped = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+    return "".join(out)
+
+
 def _loose_fix(text: str) -> str:
     """把模型常见的"近似 JSON"修补成可解析的 JSON。"""
     out = text
@@ -105,6 +161,9 @@ def _loose_fix(text: str) -> str:
     # 缺逗号： }{ 或 }" 之间
     out = re.sub(r"}\s*{", "}, {", out)
     out = re.sub(r'"\s*"', '", "', out) if out.count('"') % 2 else out
+    # ★ 裸控制字符：放在最后，因为它改的是字符串**内容**，
+    #   前面几步（尤其 `"\s*"` → `", "`）需要看到换行来判断结构。
+    out = _escape_raw_control_chars(out)
     return out
 
 
