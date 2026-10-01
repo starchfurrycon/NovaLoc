@@ -172,9 +172,16 @@ def main() -> int:
     # 假翻译器只会加"【中】"前缀，所以译文里出现的汉字就是这三个。
     # 断言"字符集必须完整包含译文用到的每一个字符" —— 这正是
     # "游戏内不出口口口"的定义，比列举某几个字更有意义。
+    #
+    # ★ 但**控制字符除外**：`\n`/`\r` 不是"要渲染的字形"，字体里也没
+    # 对应的字形，字符集有意剔除它们。不断言这一点的话，一旦有译文
+    # 含换行（例如 MV 把一段对白拆成多条 401 后合成的译文），
+    # 这条会假失败 —— 而它假失败的方式会让人以为字体出了问题。
     if cs is not None:
-        tx = "".join(e.target for e in ws.load_entries())
-        missing_tx = sorted(set(tx) - set("".join(cs.all_chars)))
+        tx = "".join(
+            e.target for e in ws.load_entries() if e.status != EntryStatus.FAILED
+        )
+        missing_tx = sorted(set(tx) - set("".join(cs.all_chars)) - set("\r\n\t"))
         check("字符集完整覆盖了所有译文字符", not missing_tx, "".join(missing_tx[:40]))
         check("译文里的汉字（【中】）确实在字符集里",
               {"【", "中", "】"} <= set("".join(cs.all_chars)),

@@ -78,6 +78,10 @@ def test_scenario_dialogue_is_extracted() -> None:
 
     这一条如果不写，整个文件会**静默**跳过而所有测试照样全绿 ——
     因为"少抽了一整个文件"不会让任何断言失败。
+
+    ★ 注意连续的 401 会被合成一条（同一段对白按显示宽度拆开），
+    所以这里两行在同一个 `TextUnit` 里，用 ``\\n`` 连接。
+    每一行都必须在，否则就是漏抽。
     """
     obj = _scenario(
         "Bohelos's throne room is just beyond here! We're charging in, girl!",
@@ -85,8 +89,31 @@ def test_scenario_dialogue_is_extracted() -> None:
     )
     units = _adapter()._extract_scenarios(obj, "Scenario.json")
     texts = [u.source for u in units]
-    assert "Bohelos's throne room is just beyond here! We're charging in, girl!" in texts
-    assert "Are you prepared? The battle's about to begin!" in texts
+    joined = "\n".join(texts)
+    assert "Bohelos's throne room is just beyond here! We're charging in, girl!" in joined
+    assert "Are you prepared? The battle's about to begin!" in joined
+    assert len(units) == 1, f"连续的 401 应当合成一条：{texts}"
+
+
+def test_separate_dialogue_blocks_stay_separate() -> None:
+    """★ 反向：被 `101`（显示文字）隔开的两段对白**不能**被合成。
+
+    `101` 是"开始一个新的消息框"，它天然是两段对白的分界。
+    合错了会让上一个角色的台词和下一个角色的接成一句。
+    """
+    obj = {
+        "1": [
+            {"code": 101, "indent": 0, "parameters": ["", 0, 0, 2, "Naho"]},
+            {"code": 401, "indent": 0, "parameters": ["First speaker here."]},
+            {"code": 101, "indent": 0, "parameters": ["", 0, 0, 2, "Mebius"]},
+            {"code": 401, "indent": 0, "parameters": ["Second speaker here."]},
+        ]
+    }
+    units = _adapter()._extract_scenarios(obj, "Scenario.json")
+    texts = [u.source for u in units]
+    assert "First speaker here." in texts, texts
+    assert "Second speaker here." in texts, texts
+    assert not any("\n" in t for t in texts), f"两段对白被合成了一条：{texts}"
 
 
 def test_scenario_multiple_scenes() -> None:
@@ -142,6 +169,49 @@ def test_scenario_scripts_are_not_extracted() -> None:
     }
     texts = {u.source for u in _adapter()._extract_scenarios(obj, "Scenario.json")}
     assert texts == {"The only real line."}, f"脚本被当成文案：{texts}"
+
+
+# ---------------------------------------------------------------------------
+# 三b、插件注释（`//` 开头）不是文案
+# ---------------------------------------------------------------------------
+
+
+def test_plugin_comments_are_not_extracted() -> None:
+    r"""★ `code 401` 里以 `//` 开头的行是**插件指令**，不是给玩家的文本。
+
+    MV 的 `401` 同时承载对白和用 `//` 写的插件配置，例如
+    `//メッセージバックを黒く`（让消息框变黑）、`//エンド`、`//移動`。
+    这些是给插件读的**配置**，翻译它们没有任何显示效果，
+    只会把开发者的注释变成中文。
+
+    真实游戏里实测有一批这样的行被抽出来并翻译成了中文。
+    """
+    obj = {
+        "1": [
+            {"code": 401, "indent": 0, "parameters": ["//メッセージバックを黒く"]},
+            {"code": 401, "indent": 0, "parameters": ["//演出\r"]},
+            {"code": 401, "indent": 0, "parameters": ["\r//移動\r"]},
+            {"code": 401, "indent": 0, "parameters": ["This one IS dialogue."]},
+        ]
+    }
+    texts = {u.source for u in _adapter()._extract_scenarios(obj, "Scenario.json")}
+    assert texts == {"This one IS dialogue."}, f"插件注释被当成文案：{texts}"
+
+
+def test_slash_in_the_middle_is_still_dialogue() -> None:
+    """★ 反向：`//` 出现在**行中间**时仍然是正常对白。
+
+    例如 URL、或者台词里本来就有的斜杠。只有**行首**的 `//` 才是注释。
+    """
+    obj = {
+        "1": [
+            {"code": 401, "indent": 0, "parameters": ["See https://example.com for it."]},
+            {"code": 101, "indent": 0, "parameters": ["", 0, 0, 2, ""]},
+            {"code": 401, "indent": 0, "parameters": ["Go left // then right."]},
+        ]
+    }
+    texts = {u.source for u in _adapter()._extract_scenarios(obj, "Scenario.json")}
+    assert len(texts) == 2, f"正常的斜杠被误判成注释：{texts}"
 
 
 # ---------------------------------------------------------------------------

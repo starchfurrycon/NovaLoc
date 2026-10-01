@@ -116,7 +116,12 @@ def _holder(cmds: list) -> dict:
 
 
 def test_dialogue_extracted_from_dict_commands() -> None:
-    """**核心回归**：字典形式的 401 台词必须被提取出来。"""
+    """**核心回归**：字典形式的 401 台词必须被提取出来。
+
+    ★ 注意连续的 401 属于**同一段对白**，会合成一条 `TextUnit`
+    （`source` 用 ``\\n`` 连接），其余位置记在 `location.siblings`。
+    见 `test_consecutive_401_are_merged_into_one_unit`。
+    """
     ad = _adapter()
     out = ad._commands_text(
         _holder([
@@ -126,10 +131,65 @@ def test_dialogue_extracted_from_dict_commands() -> None:
         "Map028.json",
         "/events/2/pages/0/list",
     )
-    assert len(out) == 2
-    assert str(out[0].source) == "This place is perfect"
+    assert len(out) == 1
+    assert str(out[0].source) == "This place is perfect\nI'll note it down"
     assert out[0].location.pointer == "/events/2/pages/0/list/0/parameters/0"
-    assert out[1].location.pointer == "/events/2/pages/0/list/1/parameters/0"
+    assert out[0].location.siblings == ["/events/2/pages/0/list/1/parameters/0"]
+
+
+def test_consecutive_401_are_merged_into_one_unit() -> None:
+    r"""★ 连续 `401` = 同一段对白被引擎按显示宽度拆开，必须合成一条翻译。
+
+    ## 真实事故
+
+    MV 会把一句话拆成多条 401：
+
+        [39] code=401  "…suffering of the slaves in the "
+        [40] code=401  "Kingdom of Bohelos, where they are treated…"
+
+    逐条翻译时模型只看到 `"…slaves in the "` 这种半句话。
+    实测这个游戏 23858 个 401 组里有 **11452 组（48%）** 是拆开的。
+
+    ## 断言什么
+
+    合成**一条**、`source` 用 ``\\n`` 连、其余位置进 ``siblings``
+    （回写时要按行拆回去，否则消息框只显示第一行）。
+    """
+    ad = _adapter()
+    out = ad._commands_text(
+        _holder([
+            {"code": 401, "indent": 1, "parameters": ["A magic device displays the "]},
+            {"code": 401, "indent": 1, "parameters": ["suffering of the slaves."]},
+        ]),
+        "Scenario.json",
+        "/2/list",
+    )
+    assert len(out) == 1, f"连续 401 没被合成一条：{[str(u.source) for u in out]}"
+    assert str(out[0].source) == (
+        "A magic device displays the \nsuffering of the slaves."
+    )
+    assert out[0].location.siblings == ["/2/list/1/parameters/0"]
+
+
+def test_non_401_command_breaks_the_dialogue_group() -> None:
+    """★ 中间插入别的指令就必须断开 —— 否则两段不相关的对白会被接在一起。
+
+    题外话：这本来不是"别的指令"的问题，而是**两个角色各自说话**。
+    合错了会让 A 的台词和 B 的台词混成一句。
+    """
+    ad = _adapter()
+    out = ad._commands_text(
+        _holder([
+            {"code": 401, "indent": 1, "parameters": ["First line."]},
+            {"code": 101, "indent": 1, "parameters": ["Face", 0, 0, 0, "Naho"]},
+            {"code": 401, "indent": 1, "parameters": ["Second line."]},
+        ]),
+        "Map001.json",
+        "/events/0/pages/0/list",
+    )
+    texts = [str(u.source) for u in out]
+    assert "First line." in texts and "Second line." in texts, texts
+    assert not any("\n" in t for t in texts if t not in ("First line.", "Second line."))
 
 
 def test_dialogue_extracted_from_array_commands() -> None:
@@ -140,8 +200,10 @@ def test_dialogue_extracted_from_array_commands() -> None:
         "Map001.json",
         "/events/0/pages/0/list",
     )
-    assert len(out) == 2
+    assert len(out) == 1
+    assert str(out[0].source) == "你好\n世界"
     assert out[0].location.pointer == "/events/0/pages/0/list/0/2/0"
+    assert out[0].location.siblings == ["/events/0/pages/0/list/1/2/0"]
 
 
 def test_speaker_name_extracted_from_dict_commands() -> None:
@@ -189,7 +251,11 @@ def test_script_commands_are_never_translated() -> None:
 
 
 def test_mixed_formats_in_one_list() -> None:
-    """同一个 list 里混着两种形式也要都能处理。"""
+    """同一个 list 里混着两种形式也要都能处理。
+
+    这里两种形式**都是 401**，所以按"同段对白"合成一条；
+    关键是两片的指针格式各自正确（字典用 `parameters`，数组用 `2`）。
+    """
     ad = _adapter()
     out = ad._commands_text(
         _holder([
@@ -199,10 +265,67 @@ def test_mixed_formats_in_one_list() -> None:
         "Map001.json",
         "/events/0/pages/0/list",
     )
-    assert [str(u.source) for u in out] == ["dict 台词", "array 台词"]
+    assert [str(u.source) for u in out] == ["dict 台词\narray 台词"]
     assert out[0].location.pointer == "/events/0/pages/0/list/0/parameters/0"
     # 数组形式的参数下标是 "2"，且块下标是 1（第二条）
-    assert out[1].location.pointer == "/events/0/pages/0/list/1/2/0"
+    assert out[0].location.siblings == ["/events/0/pages/0/list/1/2/0"]
+
+
+# ----------------------------------------------------------------------
+# 二b、把合成后的译文拆回各显示槽位
+# ----------------------------------------------------------------------
+
+
+def test_split_uses_newlines_when_counts_match() -> None:
+    """★ 行数正好等于槽位数时按行拆 —— 这是最常见的情况。"""
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    assert _split_across_slots("第一行\n第二行", 2) == ["第一行", "第二行"]
+
+
+def test_split_merges_extra_lines_into_the_last_slot() -> None:
+    """★ 行数多于槽位时把多出来的并到最后 —— **绝不能丢字**。"""
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    got = _split_across_slots("一\n二\n三", 2)
+    assert got[0] == "一"
+    assert "二" in got[1] and "三" in got[1], got
+    assert "".join(got).replace("\n", "") == "一二三"
+
+
+def test_split_divides_evenly_when_too_few_lines() -> None:
+    """★ 行数少于槽位时按字符均分，且**不丢字**。"""
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    got = _split_across_slots("一二三四五六", 3)
+    assert len(got) == 3
+    assert "".join(got) == "一二三四五六", got
+
+
+def test_split_never_loses_characters() -> None:
+    """★ 不变量：无论行数多少，拼起来必须等于原文。
+
+    `n == 1` 是**唯一**的例外：只有一格时原样返回（连换行也不动），
+    因为那一格就是消息框全文，换行是玩家看到的换行。
+    多格时换行会被**吃掉** —— MV 把参数原样显示，残留的 `\\n`
+    会在消息框里变成真的换行、把版面撑坏。
+    """
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    for text in ("a", "a\nb", "a\nb\nc\nd", "一二\n三四五\n六", "no newline here"):
+        for n in (2, 3, 5):
+            got = _split_across_slots(text, n)
+            assert len(got) == n, (text, n, got)
+            assert "".join(got) == text.replace("\n", ""), (text, n, got)
+        # n == 1：原样返回
+        assert _split_across_slots(text, 1) == [text]
+
+
+def test_single_slot_returns_text_unchanged() -> None:
+    """只有一格时原样返回（不要自作聪明去拆）。"""
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    assert _split_across_slots("完整一句", 1) == ["完整一句"]
 
 
 # ----------------------------------------------------------------------

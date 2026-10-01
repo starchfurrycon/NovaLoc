@@ -668,18 +668,59 @@ class RpgMakerAdapter(EngineAdapter):
         if not isinstance(lst, list):
             return out
 
+        # ★ 连续的 `401` 属于**同一段对白**，必须合成一条来翻译。
+        #
+        # MV 会把一句话按显示宽度拆成多条 401：
+        #
+        #     [39] code=401  "…the suffering of the slaves in the "
+        #     [40] code=401  "Kingdom of Bohelos, where they are treated…"
+        #
+        # 逐条翻译时模型只看到半句话 —— 实测这个游戏 23858 个 401 组里
+        # 有 **11452 组（48%）** 是拆开的，译文常常接不上原文。
+        # 合成后模型看到完整句子，译文再按行拆回各位置（见 `apply`）。
+        pending: list[tuple[int, str, str]] = []  # (命令下标, 指针, 原文片)
+
+        def flush_dialogue() -> None:
+            if not pending:
+                return
+            ci0, ptr0, _ = pending[0]
+            joined = "\n".join(t for _, _, t in pending)
+            u = self._mk(joined, fname, ptr0, TextKind.DIALOGUE)
+            if u:
+                if len(pending) > 1:
+                    u.location.siblings = [p for _, p, _ in pending[1:]]
+                out.append(u)
+            pending.clear()
+
         for ci, cmd in enumerate(lst):
             code, params, pkey = self._norm_command(cmd)
             if code is None:
+                flush_dialogue()
                 continue
             if code in (401, 405):
                 if isinstance(params, list) and params:
-                    u = self._mk(
-                        str(params[0]), fname, f"{base}/{ci}/{pkey}/0", TextKind.DIALOGUE
-                    )
-                    if u:
-                        out.append(u)
-            elif code == 102 and isinstance(params, list):
+                    raw = params[0]
+                    if not isinstance(raw, str):
+                        flush_dialogue()
+                        continue
+                    # ★ 以 `//` 开头的是**插件注释**，不是给玩家的文本。
+                    #
+                    # MV 里 `401` 既承载对白、也承载用 `//` 写的插件指令
+                    # （例如 `//メッセージバックを黒く` 让消息框变黑）。
+                    # 这些是给插件读的配置，翻了没有任何显示效果，
+                    # 只会把开发者的注释变成中文（还可能被插件反查失败）。
+                    if raw.lstrip("\r\n \t").startswith("//"):
+                        flush_dialogue()
+                        continue
+                    pending.append((ci, f"{base}/{ci}/{pkey}/0", raw))
+                    continue
+                flush_dialogue()
+                continue
+
+            # 非 401 的命令会打断对白组
+            flush_dialogue()
+
+            if code == 102 and isinstance(params, list):
                 # 选项：params = ["选项1", "选项2", ..., cancel_index]
                 for oi, choice in enumerate(params):
                     if not isinstance(choice, str):
@@ -700,6 +741,7 @@ class RpgMakerAdapter(EngineAdapter):
                     if u:
                         out.append(u)
             # 108/408 注释、355/655 脚本：有意跳过
+        flush_dialogue()
         return out
 
     @staticmethod
@@ -1106,7 +1148,19 @@ class RpgMakerAdapter(EngineAdapter):
                 text = translations[u.uid]
                 if not text:
                     continue
-                if self._set_pointer(obj, u.location.pointer, text):
+                pointers = [u.location.pointer, *u.location.siblings]
+                if len(pointers) > 1:
+                    pieces = _split_across_slots(text, len(pointers))
+                    ok_any = False
+                    for ptr, piece in zip(pointers, pieces, strict=True):
+                        if self._set_pointer(obj, ptr, piece):
+                            n += 1
+                            ok_any = True
+                        else:
+                            res.warnings.append(f"定位失败：{fname}{ptr}")
+                    if not ok_any:
+                        res.warnings.append(f"定位失败：{fname}{u.location.pointer}")
+                elif self._set_pointer(obj, u.location.pointer, text):
                     n += 1
                 else:
                     res.warnings.append(f"定位失败：{fname}{u.location.pointer}")
@@ -1240,6 +1294,61 @@ class RpgMakerAdapter(EngineAdapter):
             cur[last] = value
             return True
         return False
+
+
+def _split_across_slots(text: str, n: int) -> list[str]:
+    r"""把一条译文拆回引擎的 ``n`` 个显示槽位。
+
+    MV 的 `code 401` 是"消息框的第 i 行"，连续几条合起来才是完整一段话。
+    我们把它们合成一条来翻译（这样模型能看到完整句子），
+    写回时再拆开 —— 否则消息框只显示第一行，后面几行还是原文。
+
+    拆分策略按优先级：
+
+    1. **按换行拆**。提取时各片就是用 ``\n`` 连接的，模型通常保留结构。
+       行数正好等于槽位数时直接用。
+    2. **行数多于槽位**：把多出来的行并到最后一个槽位（宁可一行长一点，
+       也不要丢字）。
+    3. **行数少于槽位**：按字符数**均分**（不按源文比例 —— 中英文长度
+       比例差异太大，按比例会把中文切碎）。空片补 ``""``。
+
+    ## 为什么不"翻译时就逐片对应"
+
+    因为中文和英文的断句位置天然不同。强行让模型逐片产出
+    （"第 1 片译成…第 2 片译成…"）实测会让它按英文语序硬切中文，
+    读起来更糟。整段翻译 + 事后均分，玩家看到的是连贯的两行。
+    """
+    if n <= 1:
+        return [text]
+    lines = text.split("\n")
+    # 去掉末尾空行（模型常在最后多一个 \n）
+    while len(lines) > 1 and not lines[-1].strip():
+        lines.pop()
+    if len(lines) == n:
+        return lines
+    if len(lines) > n:
+        # 多出来的行并到最后一格，并且把**行内的换行去掉**。
+        # MV 会把参数原样显示，一个多余的 `\n` 就是消息框里一个空行，
+        # 版面会被撑坏 —— 宁可最后一格长一点。
+        head = lines[: n - 1]
+        tail = "".join(lines[n - 1 :])
+        return [*head, tail]
+    # 少于槽位：按字符**均分**（不按源文比例 —— 中英文长度比例差异太大，
+    # 按比例会把中文切碎）。换行在这里要**吃掉**：MV 会把参数原样显示，
+    # 多出来的 `\n` 会在消息框里变成真的换行，把版面撑坏。
+    body = "".join(lines)
+    if not body:
+        return [""] * n
+    per = max(1, -(-len(body) // n))  # 向上取整
+    out: list[str] = []
+    pos = 0
+    for k in range(n):
+        if k == n - 1:
+            out.append(body[pos:])
+        else:
+            out.append(body[pos : pos + per])
+            pos += per
+    return out
 
 
 __all__ = ["RpgMakerAdapter"]

@@ -91,6 +91,24 @@ class TextLocation(BaseModel):
     raw: bool = False
     """True 表示该串在文件里是转义存储的（如 RPG Maker 的 ``\\n``），写回需再转义。"""
 
+    siblings: list[str] = Field(default_factory=list)
+    """同一段文本**被引擎拆到多个位置**时的其余位置（不含 ``pointer`` 本身）。
+
+    ## 为什么需要它（真实事故）
+
+    RPG Maker MV 的 `code 401`（显示文字）会把**一句话按显示宽度拆成多条**：
+
+        [39] code=401  "A magic device displays footage of the suffering of the slaves in the "
+        [40] code=401  "Kingdom of Bohelos, where they are treated worse than livestock."
+
+    早先把每条 401 都当成**一句独立台词**，于是模型只拿到
+    `"...slaves in the "` 这种半句话就去翻译 —— 实测有 48% 的
+    401 组（11452/23858）是被拆开的句子。
+
+    现在把连续 401 组成一条 `TextUnit`（`source` 用 ``\\n`` 连接各片），
+    译文再按行拆回这些位置。``siblings`` 就是"其余那几片的指针"。
+    """
+
 
 class TextUnit(BaseModel):
     """一条待翻译文本。"""
