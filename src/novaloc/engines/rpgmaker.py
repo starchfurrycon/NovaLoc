@@ -1182,6 +1182,11 @@ class RpgMakerAdapter(EngineAdapter):
         # 这种"全绿但什么都没做"的形态必须直接判死，不能只留 warning
         # （warning 在几百行日志里没人会看）。
         files_all_failed: list[str] = []
+        # ▲ 槽位级计数器。存在的理由见下面那条"大面积定位失败"闸门 ——
+        #   `files_all_failed` 只在**整个文件**一条都写不进去时才触发，
+        #   拦不住"每个文件都写进去几条、绝大多数静默丢掉"。
+        slot_attempted = 0
+        slot_failed = 0
 
         # 写入目标必须落在**资源根**下（NW.js 布局是 out/www/data）。
         # `units` 是上一步从同一个根抽出来的，这里必须用同一套判定，
@@ -1210,20 +1215,25 @@ class RpgMakerAdapter(EngineAdapter):
                 attempted += 1
                 pointers = [u.location.pointer, *u.location.siblings]
                 if len(pointers) > 1:
-                    pieces = _split_across_slots(text, len(pointers))
+                    pieces = _split_across_slots(text, len(pointers), u.source)
                     ok_any = False
                     for ptr, piece in zip(pointers, pieces, strict=True):
+                        slot_attempted += 1
                         if self._set_pointer(obj, ptr, piece):
                             n += 1
                             ok_any = True
                         else:
+                            slot_failed += 1
                             res.warnings.append(f"定位失败：{fname}{ptr}")
                     if not ok_any:
                         res.warnings.append(f"定位失败：{fname}{u.location.pointer}")
-                elif self._set_pointer(obj, u.location.pointer, text):
-                    n += 1
                 else:
-                    res.warnings.append(f"定位失败：{fname}{u.location.pointer}")
+                    slot_attempted += 1
+                    if self._set_pointer(obj, u.location.pointer, text):
+                        n += 1
+                    else:
+                        slot_failed += 1
+                        res.warnings.append(f"定位失败：{fname}{u.location.pointer}")
 
             if attempted and not n:
                 files_all_failed.append(fname)
@@ -1247,6 +1257,35 @@ class RpgMakerAdapter(EngineAdapter):
                 f"这通常意味着**指针与文件真实结构不匹配**"
                 f"（例如多了一层不存在的键），不是数据问题。"
                 f"已中止，避免产出「看起来成功、剧情却全是原文」的游戏。"
+            )
+            res.ok = False
+            return res
+
+        # ▲ 大面积定位失败 ⇒ **硬失败**，不能报"成功"。
+        #
+        # 上面那条闸门只拦"整个文件一条都写不进去"。但真实事故是**部分**失败：
+        # 实测 DemonsRoots 的 `Scenario.json` 有 23159 条指针多了一层 `list`
+        # （修 bug 之前的 `units.jsonl` 是过时的），于是
+        #
+        #   * 剧情对白几乎全部静默丢掉（原文留在游戏里）；
+        #   * 同时**其它 443 个数据文件写得好好的** ⇒ `files_written = 644`；
+        #   * `files_all_failed` 里没有 Scenario.json（它写进去过一条）⇒ 闸门不响；
+        #   * 阶段报 ✅ 完成。
+        #
+        # 用户拿到的是"菜单是中文、剧情全是原文"的游戏，而所有数字都说没问题。
+        # 所以判据必须是**槽位级**的：定位失败占比过高就直接失败。
+        #
+        # 阈值取 1%：真实工程里偶发个别失败（源文件被改过、某个事件结构特殊）
+        # 是可能的，不该一票否决；而"过时指针"这类结构性错配会命中**成百上千**条，
+        # 1% 能稳稳拦住。
+        if slot_attempted and slot_failed / slot_attempted > 0.01:
+            res.error = (
+                f"回写大面积失败：{slot_failed}/{slot_attempted} 个位置"
+                f"（{slot_failed / slot_attempted:.1%}）找不到对应原文，已中止。"
+                f"这几乎一定是**抽取结果与文件结构不匹配**"
+                f"（最常见：`units.jsonl` 是旧代码抽的、指针格式已经变了），"
+                f"不是译文问题。请重新抽取后再回写 —— "
+                f"否则会产出「菜单是中文、剧情全是原文」的游戏，而所有计数都显示成功。"
             )
             res.ok = False
             return res
@@ -1370,7 +1409,7 @@ class RpgMakerAdapter(EngineAdapter):
         return False
 
 
-def _split_across_slots(text: str, n: int) -> list[str]:
+def _split_across_slots(text: str, n: int, source: str = "") -> list[str]:
     r"""把一条译文拆回引擎的 ``n`` 个显示槽位。
 
     MV 的 `code 401` 是"消息框的第 i 行"，连续几条合起来才是完整一段话。
@@ -1379,18 +1418,39 @@ def _split_across_slots(text: str, n: int) -> list[str]:
 
     拆分策略按优先级：
 
-    1. **按换行拆**。提取时各片就是用 ``\n`` 连接的，模型通常保留结构。
-       行数正好等于槽位数时直接用。
-    2. **行数多于槽位**：把多出来的行并到最后一个槽位（宁可一行长一点，
-       也不要丢字）。
-    3. **行数少于槽位**：按字符数**均分**（不按源文比例 —— 中英文长度
-       比例差异太大，按比例会把中文切碎）。空片补 ``""``。
+    1. **模型自己保留了换行**（``译文行数 >= 2``）：**按译文的换行拆**，
+       多出来的行并到最后一格。这是最好的结果 —— 换行位置是作者定的。
+    2. 译文是**一整行**、源文是多行：按**源文各行的长度比例**分配切点。
+    3. 译文一整行、源文也一整行（或没给 ``source``）：按字符数均分。
+
+    ## ▲ 为什么先看译文的换行（真实缺陷，330 条）
+
+    MV 的 401 参数**就是**消息框里的一行，模型看到 ``\n`` 会自然保留 ——
+    实测 330 条"源文 2 行"里，模型给回来的译文**自己带 ``\n``**：
+
+        source = "Migrant:\\nI made the right choice when I moved here with my family."
+        target = "移民：\\n只返回 JSON：…"
+
+    老代码把 `target` 的 ``\n`` **吃掉**、再去按字符数均分，于是
+
+        槽1 = "移民："          槽2 = "只返回 JSON：…"
+
+    看着像"均匀"，其实是在**词中间硬切**。更糟的是两行长短悬殊时
+    （``"Macho Gorilla:"`` 配一句长话），第一格只放得下说话人名字。
+    而模型给的 ``\n`` 本来就该落到槽位上 —— 直接用它就是对版面。
+
+    ## 为什么需要按源文比例（退一步的做法）
+
+    只有当译文**没有**换行时才需要自己找切点。这时源文各行的长度比例
+    是**现成的**版面信息：原文把长句放第二行，译文也该这么放。
+    实测 ``source='short\\na very much longer second line indeed'``
+    配 ``target='短长…'``：均分会切在中间，按比例会把长的那段放第二格。
 
     ## 为什么不"翻译时就逐片对应"
 
     因为中文和英文的断句位置天然不同。强行让模型逐片产出
     （"第 1 片译成…第 2 片译成…"）实测会让它按英文语序硬切中文，
-    读起来更糟。整段翻译 + 事后均分，玩家看到的是连贯的两行。
+    读起来更糟。整段翻译 + 事后按模型自己的断行拆，玩家看到的是连贯的两行。
     """
     if n <= 1:
         return [text]
@@ -1398,8 +1458,6 @@ def _split_across_slots(text: str, n: int) -> list[str]:
     # 去掉末尾空行（模型常在最后多一个 \n）
     while len(lines) > 1 and not lines[-1].strip():
         lines.pop()
-    if len(lines) == n:
-        return lines
     if len(lines) > n:
         # 多出来的行并到最后一格，并且把**行内的换行去掉**。
         # MV 会把参数原样显示，一个多余的 `\n` 就是消息框里一个空行，
@@ -1407,12 +1465,39 @@ def _split_across_slots(text: str, n: int) -> list[str]:
         head = lines[: n - 1]
         tail = "".join(lines[n - 1 :])
         return [*head, tail]
-    # 少于槽位：按字符**均分**（不按源文比例 —— 中英文长度比例差异太大，
-    # 按比例会把中文切碎）。换行在这里要**吃掉**：MV 会把参数原样显示，
-    # 多出来的 `\n` 会在消息框里变成真的换行，把版面撑坏。
-    body = "".join(lines)
+    # ▲ 译文的换行位置就是版面。行数不够槽位时最多补到 n（补空片而不是
+    #   把已有的一行切碎），直接返回 —— 不要再去均分它。
+    if len(lines) > 1:
+        return [*lines, *([""] * (n - len(lines)))]
+    # ---- 译文只有一整行：需要自己找切点 ----
+    body = lines[0]
     if not body:
         return [""] * n
+    if source:
+        srt = source.split("\n")
+        while len(srt) > 1 and not srt[-1].strip():
+            srt.pop()
+        if len(srt) == n:
+            weights = [len(ln) for ln in srt]
+            if sum(weights) > 0:
+                cuts: list[str] = []
+                pos = 0
+                total = sum(weights)
+                for k in range(n):
+                    if k == n - 1:
+                        cuts.append(body[pos:])
+                    else:
+                        take = round(len(body) * weights[k] / total)
+                        # 每格至少留 1 个字符，避免出现空槽位
+                        take = max(1, min(take, len(body) - pos - (n - k - 1)))
+                        cuts.append(body[pos : pos + take])
+                        pos += take
+                # 只在"没有空片"时采用；否则退回均分（空格位会让游戏里
+                # 出现一个空消息行，比切点不完美更难看）。
+                if all(cuts) and "".join(cuts) == body:
+                    return cuts
+    # 最后兜底：按字符**均分**。换行在这里要**吃掉** —— MV 会把参数
+    # 原样显示，多出来的 `\n` 会在消息框里变成真的换行，把版面撑坏。
     per = max(1, -(-len(body) // n))  # 向上取整
     out: list[str] = []
     pos = 0

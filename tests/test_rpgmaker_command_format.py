@@ -322,10 +322,84 @@ def test_split_never_loses_characters() -> None:
         assert _split_across_slots(text, 1) == [text]
 
 
+def test_split_prefers_the_models_own_newlines_over_even_division() -> None:
+    """★ 译文自带换行时**必须**按它拆，不能吃掉换行再去均分。
+
+    ## 这是真实缺陷，实测 DemonsRoots 命中 330 条
+
+    模型看到 `\\n` 会自然保留，所以"源文 2 行"的 unit 常常给回
+    **自带换行**的译文。老代码把换行吃掉、再按字符数均分：
+
+        target = '移民：\\n只返回 JSON：…'   n = 2
+        老结果 = ['移民：', '只返回 JSON：…']   ← 看着像巧合，其实是硬切
+
+    看起来"对"只是因为那一条恰好切对了。真正的证据是比例悬殊的源文：
+
+        source = 'Macho Gorilla:\\nKalinka... I will knock you flat!'
+        target = '大猩猩：\\n只有你能做到！'   n = 3
+
+    这时按**字符数**均分 5 个字的译文到 3 格，会得到
+    `['大猩', '猩：只有', '你能做到！']` —— 把"大猩猩"从中间劈开。
+    按译文的换行拆才对：`['大猩猩：', '只有你能做到！', '']`。
+    """
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    # 模型保留了换行：直接用它的结构，字数悬殊也不管
+    got = _split_across_slots(
+        "大猩猩：\n只有你能做到！", 3,
+        "Macho Gorilla:\nKalinka... I will knock you flat!",
+    )
+    assert got == ["大猩猩：", "只有你能做到！", ""], got
+    assert "".join(got) == "大猩猩：只有你能做到！"
+
+    # 不能出现"把一个词从中间劈开"的碎片
+    assert not any(len(p) == 2 and p.startswith("大猩") for p in got)
+
+
+def test_split_uses_source_line_lengths_when_translation_is_one_line() -> None:
+    """译文只有一整行时才需要自己找切点 —— 这时按源文各行的长度比例。"""
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    # 源文第二行远长于第一行 ⇒ 译文也该把长的那段放第二格
+    got = _split_across_slots(
+        "短长句子在这里很长很长", 2,
+        "short\na very much longer second line indeed",
+    )
+    assert len(got) == 2
+    assert "".join(got) == "短长句子在这里很长很长"
+    assert len(got[1]) > len(got[0]), got
+
+    # 没有 source 信息时退回均分（不崩、不丢字）
+    got2 = _split_across_slots("一二三四五六", 3)
+    assert "".join(got2) == "一二三四五六"
+
+
+def test_split_never_emits_an_empty_middle_slot() -> None:
+    """比例分配**不许**在字符够分时留下空槽位。
+
+    空槽位在游戏里就是一个空消息行。注意字符**不够**分时（正文 1 个字、
+    槽位 2 个）空片是必然的，所以只对 `len(body) >= n` 断言。
+    """
+    from novaloc.engines.rpgmaker import _split_across_slots
+
+    for body, src, n in (
+        ("一二", "aaaaaaaaaaaaaaaaaaaa\nb", 2),
+        ("一二三", "a\nbbbbbbbbbbbbbbbb\nc", 3),
+        ("一二三四五六", "aaaaaaaaaaaa\nb", 2),
+    ):
+        got = _split_across_slots(body, n, src)
+        assert len(got) == n, got
+        assert all(got), f"出现空槽位：{got}"
+        assert "".join(got) == body
+
+    # 字符不够分：空片是必然的，但仍不许丢字
+    got = _split_across_slots("一", 2, "a\nbbbbbbbbbbbbbbbbbbbb")
+    assert "".join(got) == "一"
+
+
 def test_single_slot_returns_text_unchanged() -> None:
     """只有一格时原样返回（不要自作聪明去拆）。"""
     from novaloc.engines.rpgmaker import _split_across_slots
-
     assert _split_across_slots("完整一句", 1) == ["完整一句"]
 
 
@@ -619,6 +693,73 @@ def test_apply_hard_fails_when_nothing_can_be_written(tmp_path: Path) -> None:
     assert not res.ok, "全部定位失败却报了成功"
     assert res.error and "回写全部失败" in res.error, res.error
     assert res.files_written == 0
+
+
+def test_apply_hard_fails_on_massive_partial_skip(tmp_path: Path) -> None:
+    r"""★ 硬闸门：**大面积部分失败**也必须报错。
+
+    ## 这是真实事故，不是假想
+
+    上一条闸门只拦"整个文件一条都写不进去"。但 DemonsRoots 真实发生的是
+    **部分**失败：`Scenario.json` 的 23159 条指针多了一层 `list`
+    （`units.jsonl` 是修 bug 之前抽的、已经过时），于是
+
+    * 剧情对白几乎全部静默丢掉，游戏里留的是**原文**；
+    * 同时其它数据文件写得好好的 ⇒ `files_written = 644`；
+    * `files_all_failed` 里**没有** `Scenario.json`（它写进去过一条）
+      ⇒ 上面那条闸门不响；
+    * 阶段报 ✅ 完成、`全部完成。可玩目录：…`。
+
+    用户拿到"菜单是中文、剧情全是原文"的游戏，**所有数字都显示成功**。
+    所以判据必须落到**槽位**一级。
+    """
+    # 连续的 401 会被合并成一条 unit，所以每条之间插一条非 401 指令
+    cmds: list = []
+    for i in range(200):
+        cmds.append({"code": 401, "indent": 0, "parameters": [f"Line {i}."]})
+        cmds.append({"code": 101, "indent": 0, "parameters": [""]})
+    game = _game_with_scenario(tmp_path, cmds)
+    ad = _adapter()
+    units, _rep = ad.extract_text(game)
+    assert len(units) == 200, len(units)
+    tr = {u.uid: f"第{i}行。" for i, u in enumerate(units)}
+
+    # 让**绝大多数**指针坏掉，但留 1 条好的 —— 这样文件仍会被写、
+    # `files_all_failed` 不触发，只有槽位级闸门能拦住。
+    for u in units[:-1]:
+        u.location.pointer = "/1/list/" + u.location.pointer.lstrip("/")
+        u.location.siblings = []
+
+    res = ad.apply(game, tmp_path / "out", units, tr)
+    assert not res.ok, (
+        f"199/200 个位置定位失败却报了成功（写了 {res.files_written} 个文件）"
+    )
+    assert res.error and "大面积失败" in res.error, res.error
+    assert "199/200" in res.error, res.error
+
+
+def test_apply_does_not_hard_fail_on_a_few_missing_pointers(tmp_path: Path) -> None:
+    r"""★ 反向：偶发个别失败**不该**一票否决。
+
+    真实工程里源文件被手改过、某个事件结构特殊都可能让极少数指针失效。
+    1% 的阈值就是为了让这种情况照常产出，同时拦住结构性错配。
+    """
+    cmds: list = []
+    for i in range(200):
+        cmds.append({"code": 401, "indent": 0, "parameters": [f"Line {i}."]})
+        cmds.append({"code": 101, "indent": 0, "parameters": [""]})
+    game = _game_with_scenario(tmp_path, cmds)
+    ad = _adapter()
+    units, _rep = ad.extract_text(game)
+    tr = {u.uid: f"第{i}行。" for i, u in enumerate(units)}
+
+    # 只坏 1 条（0.5% < 1%）
+    units[0].location.pointer = "/1/list/" + units[0].location.pointer.lstrip("/")
+    units[0].location.siblings = []
+
+    res = ad.apply(game, tmp_path / "out", units, tr)
+    assert res.ok, f"0.5% 的偶发失败被误判成灾难：{res.error}"
+    assert res.files_written == 1
 
 
 def test_apply_does_not_hard_fail_on_empty_translations(tmp_path: Path) -> None:
