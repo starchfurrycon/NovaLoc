@@ -1021,6 +1021,95 @@ class OllamaTranslationProvider:
         #   和没修一样，但会让人以为已经修了 —— 这比不修更危险。
         #   真实失败机理与后续方向见 docs/ROADMAP.md §3.21。
 
+        # ---- 3.7 多行条目失败 ⇒ **逐行重译**（实测救回约 23%）----
+        #
+        # ## 为什么是"逐行"，而不是再改判据或换模型
+        #
+        # ROADMAP §3.21 记录了两个已实测否掉的方向：
+        #
+        # * **改判据**（把"丢换行记号"降级为警告）—— 不行：丢换行记号里
+        #   混着"两行并成一行、内容完整"和"真的丢了第二行"两种，
+        #   而 `compare_restored` 对**两者都返回 ok**（它比内容重叠，
+        #   丢掉的第二行在还原前后都没有，于是"相等"）。
+        #   换行记号是目前**唯一**能抓住"少翻一行"的信号。
+        # * **换模型** —— 不行：同一批 24 条真实多行条目上，
+        #   `translategemma:4b` 成功 16/24，两个专精翻译的 7B
+        #   （含腾讯混元翻译）都只有 14/24 且慢 5~12 倍。
+        #
+        # 那剩下的就是**改任务形态**：不要让模型一次面对多行。
+        # 逐行送翻时每行都是独立条文，模型**没有"合并/截断"的机会**。
+        #
+        # ## 实测收益（30 条真实多行条目）
+        #
+        # 合并送翻通过 17、判死 13；对判死的 13 条逐行重译
+        # **救回 7 条**（占全部抽样 **23%**），且原通过的 17 条
+        # **一条都没被改动**。样例：
+        #
+        #     Lifia ↵ 「I have to go.」   →  莉菲娅 ↵ 我得走了。
+        #     Please enter a number between 1 and 15. ↵ (Standard difficulty is 5)
+        #       → 请输入一个 1 到 15 之间的数字。↵（标准难度为 5）
+        #
+        # ## 代价与安全
+        #
+        # * 代价：一条 n 行 → n 次请求。**只对已经失败的条目**做，
+        #   那本来就没有译文，重试没有下行风险。
+        # * **逐行过守卫**（不是把拼好的整条过一次）：
+        #   这样每一行都要自己满足长度/重复/占位符判据。
+        #   实测必须逐行，因为整条判据会漏掉行内的坏产物 ——
+        #   例如 `「邪恶之 bane」`（原词泄漏）在整条校验里看不出来。
+        # * ⚠️ **已知残留限制**：`guards.guard` 抓不住"中文里混进一个
+        #   原文拉丁词"这种泄漏（它既不是 `foreign_script`，也不会
+        #   触发重复/长度判据）。实测 `「邪恶之 bane」` 就是漏过的。
+        #   这属于**质量瑕疵而非静默丢内容**，比"整条保留原文"好，
+        #   但仍需人工审校；后续方向见 ROADMAP §3.21。
+        perline_saved = 0
+        for local_i, _global_i in enumerate(batch):
+            entry = out[_global_i]
+            if entry.status != EntryStatus.FAILED:
+                continue
+            unit = batch_items[local_i].unit
+            src_lines = [x for x in (unit.source or "").split("\n") if x.strip()]
+            if len(src_lines) < 2:
+                continue  # 单行条目不走这条路
+            got_lines: list[str] = []
+            bad = False
+            for one in src_lines:
+                try:
+                    got_one = self._call_single(batch_items[local_i], one)
+                except ProviderError:
+                    bad = True
+                    break
+                if not got_one or ph.remaining_masks(got_one):
+                    bad = True
+                    break
+                # ★ **逐行**过守卫 —— 见上面"代价与安全"的说明
+                r_one = guard(
+                    one,
+                    got_one,
+                    max_chars=None,
+                    length_ratio=self.cfg.translate.max_chars_ratio,
+                    target_lang=target_lang,
+                    hints=self._hints_of(batch_items[local_i]),
+                )
+                if r_one.fatal:
+                    bad = True
+                    break
+                got_lines.append(r_one.text.strip())
+            if bad or len(got_lines) != len(src_lines):
+                continue
+            entry.target = "\n".join(got_lines)
+            entry.warnings = []
+            entry.status = EntryStatus.TRANSLATED
+            entry.meta["perline_fallback"] = True
+            entry.meta["raw_model_output"] = entry.target
+            entry.retries = 1
+            perline_saved += 1
+        if perline_saved:
+            self.stats["perline_recovered"] = (
+                self.stats.get("perline_recovered", 0) + perline_saved
+            )
+            log.info("逐行重译救回 %d 条多行译文", perline_saved)
+
         # ---- 4. 把去重后的结果摊回重复项 ----
         # 重复项的 `uid` 各不相同（同一句台词出现在多个事件里，
         # 引擎用 `location.pointer` 区分），所以每个 uid 都要有自己的条目 ——

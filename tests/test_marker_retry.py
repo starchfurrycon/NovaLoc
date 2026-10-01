@@ -412,6 +412,112 @@ def test_repair_only_inserts_markers_never_edits_text() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 七、多行条目失败 ⇒ 逐行重译（ROADMAP §3.21，实测救回约 23%）
+# ---------------------------------------------------------------------------
+
+
+def _make_line_aware_provider(
+    monkeypatch: pytest.MonkeyPatch, *, merged_ok: bool
+) -> OllamaTranslationProvider:
+    """按"送进来的是整条还是单行"给出不同回复。
+
+    * 整条（提示词里含 `\\n`）且 `merged_ok=False` ⇒ 故意**丢掉第二行**，
+      模拟实测病因（模型把两行合并/截断，换行记号因此丢失 → 判死）；
+    * 单行 ⇒ 正常翻译。
+
+    这样能真实走完"判死 → 逐行兜底 → 救回"的整条链路，
+    而不是只测一个孤立的辅助函数。
+    """
+    from novaloc.core.config import Config
+    from novaloc.core.events import EventBus
+    from novaloc.core.registry import Context
+
+    ctx = Context(config=Config(), events=EventBus())
+    prov = OllamaTranslationProvider(ctx)
+
+    def fake_chat(user: str, *a: object, **k: object) -> str:
+        whole = "\n" in user
+        if whole and not merged_ok:
+            # 只译第一行，第二行整句丢掉（`⟦0⟧` 换行记号也随之消失）
+            return '{"0": "莉菲娅"}'
+        if "Lifia" in user:
+            return '{"0": "莉菲娅"}'
+        return '{"0": "我得走了。"}'
+
+    monkeypatch.setattr(prov, "_chat", fake_chat)
+    return prov
+
+
+def test_perline_fallback_recovers_multiline_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r"""★ 多行条目判死后，逐行重译应能救回，并留下计数。
+
+    真实病因见 ROADMAP §3.21：模型把两行合并或截断，而"换行记号丢失"
+    是唯一能抓住它的信号 —— 所以只能靠**改变任务形态**（逐行送翻）
+    来救，而不是放宽判据。
+
+    实测（30 条真实多行条目）：合并送翻通过 17、判死 13，
+    逐行重译**救回 7 条**（占 23%），原通过的 17 条一条未改。
+    24 条抽样上：成功 16 → **20**，逐行救回 4。
+    """
+    from novaloc.models import EntryStatus
+
+    prov = _make_line_aware_provider(monkeypatch, merged_ok=False)
+    entries = prov.translate_batch([_FakeItem("Lifia\n「I have to go.」")], "zh-Hans")
+    e = entries[0]
+    assert e.meta.get("perline_fallback") is True, f"没走逐行兜底：{e.warnings}"
+    assert e.status is EntryStatus.TRANSLATED
+    assert "\n" in e.target, f"救回的译文必须有换行：{e.target!r}"
+    assert prov.stats.get("perline_recovered") == 1
+
+
+def test_perline_fallback_not_used_for_single_line_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**零假阳性对照**：单行条目没有"逐行"可言，不许走这条路。
+
+    否则每条失败的单行条目都会多打一次请求，成本上升而毫无收益。
+
+    ▲ 这里**只**断言"没走逐行兜底"，不断言状态是 FAILED ——
+      单行条目本来就可能翻译成功（这个假 provider 对不含换行的
+      请求总会给出一句译文），那是另一回事，与这条修复无关。
+    """
+    prov = _make_line_aware_provider(monkeypatch, merged_ok=False)
+    entries = prov.translate_batch([_FakeItem("Some single line.")], "zh-Hans")
+    assert "perline_fallback" not in entries[0].meta, (
+        f"单行条目不该走逐行兜底：{entries[0].meta}"
+    )
+    assert not prov.stats.get("perline_recovered"), (
+        "单行条目不该产生逐行救回计数"
+    )
+
+
+def test_perline_fallback_validates_each_line_individually() -> None:
+    r"""★ 每一行都要**自己**过守卫 —— 这是实测要求，不是洁癖。
+
+    整条过守卫会漏掉行内坏产物。实测样例：逐行送翻时
+    `translategemma:4b` 吐出 `「邪恶之 bane」` ——
+    原文词 `bane` 泄漏进了中文，而整条校验看不出来。
+
+    ⚠️ 这里只断言"逐行守卫确实在那里"这个**结构事实**，
+    因为 `guard` 目前**抓不住**那种拉丁词泄漏（既不是
+    `foreign_script`，也不触发重复/长度判据）。
+    把已知限制写进测试，比假装它已经解决要好 ——
+    后续方向见 ROADMAP §3.21。
+    """
+    import inspect
+
+    src = inspect.getsource(OllamaTranslationProvider.translate_batch)
+    assert "3.7 多行条目失败" in src, "逐行兜底不见了"
+    idx = src.find("3.7 多行条目失败")
+    seg = src[idx : idx + 7000]
+    assert "r_one = guard(" in seg, (
+        "逐行兜底里没有逐行过守卫 —— 整条校验会漏掉行内泄漏"
+    )
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
