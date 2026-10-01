@@ -329,9 +329,24 @@ class OllamaTranslationProvider:
                     continue
                 if got:
                     mapping[li] = got
+        # 最后再筛一遍类型：单条补漏也可能带回非字符串
+        # （实测模型会把某一条回成 `["译文", ""]`）。
+        # 非字符串在这里**丢掉**比带下去好 —— 带下去会让
+        # `verify_restored` 抛异常，而异常信息完全指不到真正的原因。
+        bad = [i for i, v in mapping.items() if not isinstance(v, str)]
+        for i in bad:
+            log.debug("批内第 %d 条返回了非字符串（%r），丢弃", i, type(mapping[i]).__name__)
+            del mapping[i]
         return mapping
 
-    def _call_single(self, item: TranslateItem, masked: str) -> str:
+    def _call_single(
+        self, item: TranslateItem, masked: str, *, marker_warning: str = ""
+    ) -> str:
+        """单条翻译。
+
+        ``marker_warning`` 会**追加到用户提示词末尾**，用于"上一次把
+        掩码记号弄丢了，重来一次"的定向重试 —— 见 `_retry_lost_markers`。
+        """
         user = prompts.build_single_user_prompt(
             masked,
             kind=item.unit.kind,
@@ -340,19 +355,50 @@ class OllamaTranslationProvider:
             glossary_block=self._collect_glossary([item]),
             extra_context=self._context_hint([item]),
         )
+        if marker_warning:
+            user = f"{user}\n\n{marker_warning}"
         raw = self._chat(
             user, system=prompts.SYSTEM_PROMPT, n_items=1, src_chars=len(masked or "")
         )
         mapping, res = parse_translations(raw, expect_indices=[0])
-        if 0 in mapping:
-            return mapping[0]
+        # ⚠️ 这里的类型处理**必须**分三步走，顺序不能调换。
+        #
+        # 背景（实测，见 `tests/README.md` 第 43 条）：模型对单条请求
+        # 回 `{"t": ["译文", ""]}` —— 把一句话切成了数组。
+        # `parse_translations` 会摊成 `{0: '译文', 1: ''}`，于是：
+        #
+        #   * `mapping[0]` 是**合法字符串** ⇒ 类型检查抓不到，
+        #     结果是**静默丢掉后半句**（这比报错危险得多）；
+        #   * 早先版本更早的写法直接 `return mapping[0]`，
+        #     当值真是 list 时会带到下游抛 `AttributeError`，
+        #     被 `except ProviderError` 漏掉 ⇒ **重试静默失效**。
+        #
+        # 三步顺序：
+        #   ① 先把"唯一非空片段"还原成一句（实测最常见的形态，
+        #      拼起来正好是完整译文，丢掉可惜）；
+        #   ② 再拦"多个**非空**片段"（拼接语义不明，绝不能只取第一个）；
+        #   ③ 最后拦纯类型错误。
+        # 把 ② 放在 ① 前面会把 `["译文", ""]` 也误杀（编号 1 存在但为空）。
+        parts = [
+            v for v in mapping.values() if isinstance(v, str) and v.strip()
+        ]
+        if len(parts) == 1 and all(isinstance(v, str) for v in mapping.values()):
+            if len(mapping) > 1:
+                log.debug("单条结果被模型回成了数组，已取唯一非空片段：%r", mapping)
+            return parts[0]
+        if len(parts) > 1:
+            raise ProviderError(
+                f"单条翻译返回了 {len(parts)} 个非空片段：模型把一句话切成了数组，"
+                f"拼接语义不明，拒绝只取第一个（那会静默丢掉后半句）。"
+                f"原文：{masked[:80]!r}"
+            )
         if res.ok and isinstance(res.value, str):
             return res.value
         # 有些模型即使要求 JSON 也只给纯文本，当译文用
         stripped = raw.strip()
         if stripped and not stripped.startswith(("[", "{")):
             return stripped
-        raise ProviderError(f"单条翻译失败：{raw[:200]!r}")
+        raise ProviderError(f"单条翻译失败（结果不是字符串）：{raw[:200]!r}")
 
     @staticmethod
     def _context_hint(items: list[TranslateItem]) -> str:
@@ -616,6 +662,80 @@ class OllamaTranslationProvider:
                 entry.glossary_hits = [g.source for g in item.glossary]
                 entry.retries = 0
                 entry.status = EntryStatus.FAILED if res.fatal else EntryStatus.TRANSLATED
+
+        # ---- 3.5 定向重试：把"整条掩码记号弄丢"的条目重问一次 ----
+        #
+        # ## 为什么值得单独重试
+        #
+        # 实测 `translategemma:4b` 对 Ren'Py 的成对文本标签
+        # （`{color=#ffd700}…{/color}`）会**整条丢掉两个记号**只译文字：
+        #
+        #     源文  {color=#ffd700}The lamp was lit at dawn.{/color}
+        #     掩码  ⟦0⟧The lamp was lit at dawn.⟦1⟧
+        #     输出  '灯在黎明时被点亮了。'          ← 两个 ⟦⟧ 都没了
+        #
+        # `repair_dropped_masks` 对**这种**情况帮不上忙：它擅长补回
+        # 单侧记号（`\C[6]` 只能放开头、`\n` 只能放中间），
+        # 而 `{color…}` / `{/color}` 是**成对**的 —— 丢了开标签时
+        # 谁也不知道作者想让哪几个字变色。硬补一个位置是**猜**，
+        # 猜错了就是"颜色标错"，比不翻更糟。所以它返回 None 是对的。
+        #
+        # 但**不翻**并不是唯一出路：模型丢记号是"没听清要求"，
+        # 不是"做不到"。单独重问一次、并在提示词里明确点出
+        # "必须原样保留 ⟦数字⟧ 记号"，实测能把大部分救回来。
+        #
+        # 代价可控：只对**已经失败的**条目多打一次请求
+        # （失败的本来结果就是空，重试没有下行风险）。
+        retried = 0
+        for local_i, _global_i in enumerate(batch):
+            entry = out[_global_i]
+            if entry.status != EntryStatus.FAILED or not entry.warnings:
+                continue
+            if not any("placeholder" in w for w in entry.warnings):
+                continue
+            if not slots_all[local_i]:
+                continue  # 本来就没有记号，不是这个病因
+            try:
+                again = self._call_single(
+                    batch_items[local_i],
+                    masked_all[local_i],
+                    marker_warning=prompts.marker_retry_hint(
+                        masked_all[local_i], slots_all[local_i]
+                    ),
+                )
+            except ProviderError:
+                continue
+            if not again or again == entry.meta.get("raw_model_output"):
+                continue
+            restored2, check2 = ph.verify_restored(
+                batch_items[local_i].unit.source,
+                again,
+                slots_all[local_i],
+                masked_source=masked_all[local_i],
+            )
+            if check2.fatal:
+                continue  # 还是不行 —— 保持失败，绝不写回坏译文
+            res2 = guard(
+                batch_items[local_i].unit.source,
+                restored2,
+                max_chars=batch_items[local_i].unit.max_chars,
+                length_ratio=self.cfg.translate.max_output_chars_factor,
+                target_lang=target_lang,
+            )
+            if res2.fatal:
+                continue
+            entry.target = res2.text
+            entry.warnings = list(res2.warnings)
+            entry.status = EntryStatus.TRANSLATED
+            entry.meta["marker_retry"] = True
+            entry.meta["raw_model_output"] = again
+            entry.retries = 1
+            retried += 1
+        if retried:
+            self.stats["marker_retry_recovered"] = (
+                self.stats.get("marker_retry_recovered", 0) + retried
+            )
+            log.info("定向重试救回 %d 条丢失掩码记号的译文", retried)
 
         # ---- 4. 把去重后的结果摊回重复项 ----
         # 重复项的 `uid` 各不相同（同一句台词出现在多个事件里，
