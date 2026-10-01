@@ -443,6 +443,18 @@ class Pipeline:
                 )
 
             existing = {e.uid: e for e in self.ws.load_entries()}
+            # ---- 先按**当前**守卫规则重查一遍已有译文 ----
+            #
+            # 守卫规则会随真实数据演进（`foreign_script` 这条就改过三次判据）。
+            # 而 `only_pending` 会把"状态=已翻译 且译文非空"的旧条目永远跳过，
+            # 于是**改好规则、重跑、坏数据还在**，且不报任何错。
+            #
+            # 在这里重查一次，等于让每次 `translate` 都自带"用新规则复核旧数据"。
+            # 有作废就让下面的跳过判定把它们重新排进待办。
+            if only_pending:
+                n_bad = self.revalidate_foreign_script()
+                if n_bad:
+                    existing = {e.uid: e for e in self.ws.load_entries()}
             # 刻意**不**自动并入内置游戏术语表。实测结论（数据在下面）：
             # 内置表能修好单条缩写（`MP` → `魔法值`），但代价是整体变差 ——
             # 同一批 27 条样本跑 3 遍：漏译从 0 升到 2.67/遍，
@@ -1252,6 +1264,38 @@ class Pipeline:
             )
 
         return self._run("qa", go)
+
+    def revalidate_foreign_script(self) -> int:
+        """按**当前**守卫规则重查所有已有译文，作废跑偏的那些。
+
+        ## 为什么需要一个独立的入口（而不是只放在 `apply` 里）
+
+        `apply` 里那道闸门能挡住坏译文**回写进游戏**，但它的作废动作
+        只在"用户跑了 apply"时才发生。而 `translations/entries.jsonl`
+        里的坏数据是**每一轮 translate 都会跳过**的 ——
+        用户如果不跑 `apply`（或者先跑 `translate`），坏数据就一直躺着。
+
+        这个入口让"重查"变成一个**可以随时单独执行**的动作，
+        `novaloc revalidate <项目>` 直接调它。
+
+        返回作废的条数。
+        """
+        entries = self.ws.load_entries()
+        bad = {
+            e.uid
+            for e in entries
+            if e.target.strip() and check_foreign_script(e.target, source=e.source)
+        }
+        if not bad:
+            return 0
+        n = self._invalidate_entries(bad)
+        if n:
+            self.bus.log(
+                f"重查发现 {n} 条译文混进了别的文字系统，已作废（下一轮翻译会重译）",
+                stage="translate",
+                severity=Severity.WARN,
+            )
+        return n
 
     def _invalidate_entries(self, uids: set[str]) -> int:
         """把指定条目**标记为未完成**（清空译文），让下一轮重译它们。
