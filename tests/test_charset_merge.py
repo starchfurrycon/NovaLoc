@@ -139,6 +139,15 @@ def main() -> int:
     print("步骤 5：验证「硬失败」逻辑")
     print("=" * 80)
     # 先确认候选里到底覆盖哪些 emoji，再用一个真正没人覆盖的码点
+    #
+    # ⚠️ 探测字符**不能**挑"不需要字形"的（空格/零宽/变体选择符）——
+    # 那些会被 `plan_charset` 的 `is_ignorable` 过滤掉，
+    # `still_missing` 自然是空的，于是"硬失败"分支永远走不到，
+    # 而测试会以"❌ 不该通过"的面目失败。
+    #
+    # 这里原来在兜底分支里用了 `U+E0100`（VARIATION SELECTOR-17）——
+    # 把变体选择符补进 `is_ignorable` 之后它就踩了这个坑。
+    # 换成私用区码点：正常字体一定没有它，而且它**确实**需要字形。
     probe = "\U0001F600\U0001F3AE\u16A0\u16A1\u16A2"  # emoji + 卢恩字母
     uncovered = []
     for ch in probe:
@@ -151,9 +160,28 @@ def main() -> int:
         if not covered:
             uncovered.append(ch)
     print(f"  候选字体覆盖情况：{[(c, c not in uncovered) for c in probe]}")
+    uncovered = [c for c in uncovered if not cs.is_ignorable(c)]
     if not uncovered:
-        print("  候选字体意外覆盖了全部探测字符，改用合成码点 U+E0100")
-        uncovered = ["\U000E0100"]
+        # 兜底码点**不能硬编码**：候选集换了、系统装了别的字体，
+        # "这个码点没人覆盖"就不再成立 —— 而失败表现是
+        # "❌ 不该通过"（看着像判据坏了，其实是探测字符选错了）。
+        #
+        # 实测踩过两次：`U+E0100`（变体选择符，被 `is_ignorable` 过滤）
+        # 和 `U+E000`（`seguisym.ttf` 把大半个私用区都 cmap 了）。
+        # 所以改成**现扫**：在候选集上找一个确认没人覆盖、
+        # 而且确实需要字形的码点。
+        from novaloc.fonts.coverage import load_font_info as _lfi
+
+        _infos = [i for i in (_lfi(p) for p in candidates) if i is not None]
+        for _cp in range(0xE000, 0xF900):
+            _ch = chr(_cp)
+            if cs.is_ignorable(_ch):
+                continue
+            if not any(i.has_char(_ch) for i in _infos):
+                uncovered = [_ch]
+                break
+        print(f"  候选字体意外覆盖了全部探测字符，改用现扫出的 U+{ord(uncovered[0]):04X}")
+        assert uncovered, "候选集覆盖了整个私用区 —— 找不到可用于硬失败验证的码点"
 
     bogus = required + "".join(uncovered)
     p2 = cs.plan_charset(bogus, base, candidates, prioritize=prio)

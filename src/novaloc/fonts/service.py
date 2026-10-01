@@ -677,7 +677,22 @@ class FontService:
             res.warnings.append("为避免游戏内出现口口口，本次结果**未采用**")
             return res
         if res.qa is not None and not res.qa.ok:
-            res.error = f"QA 未通过：{res.qa.summary()}"
+            # ⚠️ `summary` 是 **property**，不是方法。
+            #
+            # 这里原先写的是 `res.qa.summary()`，于是**一调用就抛
+            # `TypeError: 'str' object is not callable`** ——
+            # 因为 `str(summary)`（property 的返回值，一个字符串）
+            # 被当成可调用对象去调了。
+            #
+            # 后果不是"少一条报错信息"，而是**整轮字体适配崩掉**：
+            # 实测 DemonsRoots（MV）跑到第 4 个字体（`koin.ttf`）时崩，
+            # 前 3 个字体**已经注入成功**却因为异常没被记进 patches，
+            # `apply` 于是没有任何字体可回写 —— 玩家满屏口口口。
+            #
+            # 这条错误路径**只有在 QA 真的不通过时才会走到**，
+            # 所以正常项目里永远测不到。修它的时候顺手确认了
+            # `FontQAReport.summary` 与 `PatchResult.summary` 都是 property。
+            res.error = f"QA 未通过：{res.qa.summary}"
             res.warnings.append("为避免游戏内出现口口口，本次结果**未采用**")
             return res
         if plan.still_missing:

@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from .coverage import FontInfo, load_font_info
+from .textutil import is_blank_by_design
 
 log = logging.getLogger(__name__)
 
@@ -179,17 +180,39 @@ def _shared_render_groups(
 def _is_blank_by_design(ch: str) -> bool:
     """空白类字符渲染成空是**正确的**，不能当成缺字。
 
-    包括 ASCII 空格、NBSP、各类 Unicode 空格、ZWSP、制表/换行。
-    把这些误报成"缺字"会掩盖真正的问题。
-    """
-    if not ch:
-        return True
-    cp = ord(ch)
-    if cp in (0x20, 0x09, 0x0A, 0x0D, 0xA0, 0x200B, 0x200C, 0x200D, 0xFEFF):
-        return True
-    import unicodedata
+    包括 ASCII 空格、NBSP、全角空格、各类 Unicode 空格、ZWSP、
+    制表/换行、变体选择符与组合记号。
 
-    return unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cc", "Cf")
+    ## ★ 判定只有一份实现，但它和 `is_ignorable` **不是同一件事**
+
+    早先这里是**自己一套**判据（`Zs/Zl/Zp/Cc/Cf` + 几个硬编码码点），
+    而 `textutil.is_ignorable`（字符集汇总用的那个）是**另一套**
+    （只认 `NON_RENDERING` 那 7 个）。两个"裁判"对 `U+FE0F` 给出不同结论：
+
+    * `is_ignorable` 说"要字形" ⇒ 它进了"必翻"字符集 ⇒
+      `plan.still_missing` 里永远留着它 ⇒ **每个**字体都报缺 1 个字符；
+    * `_is_blank_by_design` 说"渲染成空是对的" ⇒ QA 又不报它。
+
+    结果是一条**永远消不掉**的噪音提示，把 `ship.otf` 的真实失败原因
+    （缺 `glyf`/`loca`）盖住了。
+
+    修的时候**顺手想合并成一个函数，结果炸了两条测试** ——
+    因为这两个问题其实**不同**：
+
+    | 问题 | 谁答 | 答"是"的含义 |
+    |---|---|---|
+    | 这个字符**需要字形**吗？ | `is_ignorable` | 不需要 ⇒ 不该进字符集 |
+    | 渲染成空白**可以接受**吗？ | 这个函数 | 可以 ⇒ 不算缺字 |
+
+    反例（`test_ui_safe_chars_contain_no_ignorables` 与
+    `test_incident_chars_would_be_source_only` 就是在守它们）：
+
+    * **全角空格**：占宽度 ⇒ 字符集里**该有**它（`UI_SAFE_CHARS` 特意列了）；
+    * **泰文声调符号**：有宽度、要渲染 ⇒ 不能因为类别是 `Mn` 就从字符集剔掉。
+
+    所以这里是"更宽"的那一侧，`is_ignorable` 是"更窄"的那一侧。
+    """
+    return is_blank_by_design(ch)
 
 
 def verify_font(

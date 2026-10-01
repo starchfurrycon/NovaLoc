@@ -215,3 +215,180 @@ def test_no_ignorable_survives_any_charset_size(n: int) -> None:
     cs = build_required_charset(translated_texts=[text], include_ui_safe=False)
     assert NL not in cs
     assert len(cs) == len({c for c in text if c != NL})
+
+
+# ----------------------------------------------------------------------
+# 五、★ 变体选择符（U+FE0F）也必须算"本来就没有字形"
+# ----------------------------------------------------------------------
+
+#: 译文里真实出现过的组合记号。`✌️`/`❤️` 这类是"基础字符 + U+FE0F"。
+VARIATION_SELECTORS = ["\U0000FE0E", "\U0000FE0F", "\U0000FE00", "\U000E0100"]
+
+
+@pytest.mark.parametrize("ch", VARIATION_SELECTORS)
+def test_variation_selectors_are_blank_by_design(ch: str) -> None:
+    r"""变体选择符没有自己的字形，渲染成空是**正确**的。
+
+    ## 真实事故：一个看不见的字符吓住了每一个字体
+
+    `U+FE0F`（把前一个字符选成 emoji 呈现）出现在译文里，
+    而没有任何字体"提供"它 ⇒ `plan.still_missing` 里永远留着它 ⇒
+    **每一个**游戏字体都报
+
+        字符集里有 1 个字符没有任何候选字体能提供，无法生成完整字体：️
+
+    （注意冒号后面**看着是空的** —— 那个字符本来就不可见。）
+
+    后果有三层：
+
+    1. 每个字体都白跑一遍"剔除 → 重试"的弯路；
+    2. `ship.otf` 的**真实**失败原因（缺 `glyf`/`loca`，CFF 字体
+       无法合并）被这条噪音盖住，差点没查出来；
+    3. 如果 `still_missing` 的判据更严一点，它会让**整轮字体适配失败** ——
+       也就是"因为一个玩家看不见的字符，让全部中文变口口口"。
+
+    `unicodedata.category(U+FE0F)` 是 `Mn`（Nonspacing Mark），
+    而原来的判据只认 `("Zs","Zl","Zp","Cc","Cf")`，所以漏了。
+    """
+    from novaloc.fonts.qa import _is_blank_by_design
+
+    assert _is_blank_by_design(ch) is True, f"U+{ord(ch):04X} 没有字形却被当成缺字"
+
+
+@pytest.mark.parametrize("ch", ["\U0000FE10", "A", "的", "，", "♥", "①", "…"])
+def test_blank_by_design_does_not_swallow_real_chars(ch: str) -> None:
+    r"""★ **反例**：真需要渲染的字符一个都不能被判成"空白"。
+
+    这个方向错了比漏掉变体选择符更糟 —— 会让真需要的字
+    不进"必翻"集合，游戏里直接显示口口口。
+
+    特意包含 `U+FE10`（垂直形式的逗号，**紧邻**变体选择符区间的
+    真字形）和 `①`（`No` 类别，容易被"非字母就算空白"这类粗糙判据误伤）。
+
+    注：组合记号（如 `U+0301` 组合尖音符）**确实**属于"本来就没有字形"
+    （它是接在别的字上的），所以**不在**这个反例表里 ——
+    它由 `test_variation_selectors_are_blank_by_design` 那侧的同类断言覆盖。
+    """
+    from novaloc.fonts.qa import _is_blank_by_design
+
+    assert _is_blank_by_design(ch) is False, f"{ch!r} 被误判成「本来就没有字形」"
+
+
+@pytest.mark.parametrize("ch", ["\u0301", "\u0300", "\u20dd"])
+def test_combining_marks_are_blank_by_design(ch: str) -> None:
+    r"""组合记号（`Mn`/`Me`）没有独立字形，渲染成空是正确的。
+
+    它们必须和变体选择符一起被放行 —— 否则同样是
+    "因为一个看不见的字符让每个字体都报缺字"。
+    """
+    from novaloc.fonts.qa import _is_blank_by_design
+
+    assert _is_blank_by_design(ch) is True
+
+
+# ----------------------------------------------------------------------
+# 五之二、★ 两个判据**故意不同**的地方（想合并它们会炸掉真实需求）
+# ----------------------------------------------------------------------
+
+#: 这两类字符上，"需要字形吗"与"渲染成空白可以接受吗"的答案**必须不同**。
+MUST_BE_IN_CHARSET_BUT_RENDER_BLANK = [
+    "\u3000",  # 全角空格：占宽度 ⇒ 字符集里该有它
+    "\u00a0",  # NBSP：同上
+    "\u0e48",  # 泰文声调符号：有宽度、要渲染 ⇒ 不能从字符集剔掉
+    "\u0e35",  # 泰文元音 II：同上
+    "\u064b",  # 阿拉伯文元音符号：同上
+]
+
+
+@pytest.mark.parametrize("ch", MUST_BE_IN_CHARSET_BUT_RENDER_BLANK)
+def test_ignorable_and_blank_by_design_are_not_the_same_question(ch: str) -> None:
+    r"""★ **契约**：这两个判据在空格与泰文/阿拉伯记号上**必须**给出不同答案。
+
+    ## 为什么会想去合并它们（以及合并后炸了什么）
+
+    起因是 `U+FE0F` 在两个判据下结论不一致，于是造成一条永远消不掉的
+    "缺 1 个字符"噪音提示，把 `ship.otf` 的真实失败原因盖住了。
+    直觉修法是"让它们共用一份实现"。
+
+    照做之后**两条既有测试同时变红**：
+
+    * `test_ui_safe_chars_contain_no_ignorables` —— `UI_SAFE_CHARS`
+      特意列了 `\u00a0`/`\u3000`，合并后它们被判成"可忽略"；
+    * `test_incident_chars_would_be_source_only` —— 事故字符集里的
+      泰文记号（`\u0e48` `\u0e35` …）被判成"可忽略"而剔出字符集。
+
+    原因是这两个问题的答案**本来就不一样**：
+
+    | 问题 | 谁答 | 答"是"的含义 |
+    |---|---|---|
+    | 这个字符**需要字形**吗？ | `is_ignorable` | 不需要 ⇒ 不该进字符集 |
+    | 渲染成空白**可以接受**吗？ | `_is_blank_by_design` | 可以 ⇒ 不算缺字 |
+
+    全角空格占宽度（要在字符集里），但渲染出来确实是空白（QA 不该报）。
+    泰文声调符号有宽度要渲染（要在字符集里），渲染差异极小（QA 放过）。
+
+    正确的修法是**只把 `U+FE0F` 这一处**补进 `is_ignorable`
+    （它确实没有字形），而不是把两个函数合成一个。
+    """
+    from novaloc.fonts.qa import _is_blank_by_design
+
+    assert is_ignorable(ch) is False, (
+        f"{ch!r} 被判成「不需要字形」 ⇒ 会被踢出字符集，"
+        "而它事实上是要渲染的（占宽度）"
+    )
+    assert _is_blank_by_design(ch) is True, (
+        f"{ch!r} 渲染成空白被当成了缺字 ⇒ 又会制造噪音"
+    )
+
+
+def test_ui_safe_chars_survive_the_charset_filter() -> None:
+    """`UI_SAFE_CHARS` 里那两个空格必须真的留在字符集里（真实需求）。"""
+    cs = build_required_charset(translated_texts=["你好"], include_ui_safe=True)
+    assert "\u3000" in cs, "全角空格被踢出字符集 —— 界面里会变口口口"
+    assert "\u00a0" in cs
+
+
+# ----------------------------------------------------------------------
+# 六、★ `summary` 是 property，不是方法（调用它会让整轮字体适配崩掉）
+# ----------------------------------------------------------------------
+
+def test_font_summaries_are_properties_not_methods() -> None:
+    r"""`FontQAReport.summary` / `PatchResult.summary` 都是 **property**。
+
+    ## 真实事故
+
+    `service.py` 在"QA 未通过"这条错误路径上写的是
+    `res.qa.summary()` —— 而 `summary` 是 property，取值已经是 `str`，
+    再调一次就是 `TypeError: 'str' object is not callable`。
+
+    后果不是"少一条报错信息"，而是**整轮字体适配崩掉**：
+    实测 DemonsRoots（MV）跑到第 4 个字体（`koin.ttf`）时抛异常，
+    前 3 个字体**已经注入成功**却因为异常没被记进 `patches.json`，
+    `apply` 于是没有任何字体可回写 —— **游戏里满屏口口口**。
+
+    这条路径**只在 QA 真的不通过时才会走到**，所以正常项目里永远测不到；
+    而 `koin.ttf` 恰好是一个 base 字体本身就有空白字形的真实案例。
+
+    断言方式刻意选择"取值必须是 `str`"而不是"不能调用" ——
+    前者同时钉住了"它是 property"，也钉住了"它给的是人能读的文本"。
+    """
+    from novaloc.fonts.qa import FontQAReport
+    from novaloc.fonts.service import PatchResult
+
+    qa = FontQAReport(path="x.ttf")
+    assert isinstance(qa.summary, str), "FontQAReport.summary 必须是 property（取值即 str）"
+    pr = PatchResult()
+    assert isinstance(pr.summary, str), "PatchResult.summary 必须是 property（取值即 str）"
+
+
+def test_patch_result_summary_reports_qa_issues() -> None:
+    """`summary` 的文本必须真的能反映 QA 状态（不是一句套话）。"""
+    from novaloc.fonts.qa import FontQAReport, GlyphIssue
+    from novaloc.fonts.service import PatchResult
+
+    qa = FontQAReport(path="x.ttf", ok=False, loaded=True, checked=100)
+    qa.blank = ["你", "魔"]
+    qa.issues = [GlyphIssue("你", ord("你"), "blank", "渲染为空白")]
+    pr = PatchResult(qa=qa)
+    assert "QA" in pr.summary
+    assert "1" in pr.summary, f"没报出问题条数：{pr.summary!r}"
