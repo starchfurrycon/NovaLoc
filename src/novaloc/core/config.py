@@ -84,10 +84,23 @@ class OllamaConfig(BaseModel):
     """同时驻留的模型数。Ollama 默认 3×GPU 数，在 8 GB 上会导致反复换入换出。
     建议固定为 1（或 2：翻译模型 + embed 模型）。"""
 
-    kv_cache_type: str = "q8_0"
-    """KV cache 量化。f16 是默认值；q8_0 能显著省显存且质量损失很小。"""
-
-    flash_attention: bool = True
+    kv_cache_type: str = Field(
+        default="q8_0",
+        description=(
+            "KV cache 量化。⚠️ 这是 **Ollama 服务器**的环境变量"
+            "（OLLAMA_KV_CACHE_TYPE=q8_0），**不是**每个请求能带的参数。"
+            "放进请求的 options 会被 Ollama **静默忽略**。"
+            "程序里改这个字段**不会有任何效果**，它只用来记下你打算怎么配。"
+        ),
+    )
+    flash_attention: bool = Field(
+        default=True,
+        description=(
+            "Flash Attention 开关。⚠️ 同上 —— 这是 **Ollama 服务器**的环境变量"
+            "（OLLAMA_FLASH_ATTENTION=1），不是请求参数。"
+            "程序里改这个字段**不会有任何效果**。"
+        ),
+    )
 
 
 class TranslateConfig(BaseModel):

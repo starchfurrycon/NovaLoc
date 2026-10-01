@@ -145,6 +145,17 @@ class OllamaTranslationProvider:
         src_chars: int = 0,
     ) -> dict:
         o = self.cfg.ollama
+        # ⚠️ 这里**只放 Ollama `/api/chat` 真正认识的参数**。
+        #
+        # `OllamaConfig` 里还有 `flash_attention` 与 `kv_cache_type`，
+        # 但它们是 **Ollama 服务器**的环境变量
+        # （`OLLAMA_FLASH_ATTENTION` / `OLLAMA_KV_CACHE_TYPE`），
+        # **不是**每个请求能带的参数 —— 放进 `options` 会被静默忽略。
+        # 两个字段的 docstring 已写明这件事。
+        #
+        # 早先这里在 `return opts` **之后**还留了一段（不可达）代码，
+        # 显然是想把这两个塞进 options 但没写完。
+        # 留着比删掉更糟：读代码的人会以为设置生效了。
         opts: dict[str, object] = {
             "temperature": o.temperature if temperature is None else temperature,
             "top_p": o.top_p,
