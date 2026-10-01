@@ -428,10 +428,47 @@ def remaining_masks(text: str) -> list[str]:
 # 校验
 # --------------------------------------------------------------------------
 
+#: **纯样式**的单字符反斜杠命令。丢了只影响演出，不影响内容。
+#:
+#: 依据是 RPG Maker MV/MZ 的转义表：
+#:
+#: * ``\{`` ``\}`` —— 这一段放大 / 缩小文字
+#: * ``\!`` —— 等待玩家按键
+#: * ``\.`` ``\|`` —— 停顿若干帧
+#: * ``\>`` ``\<`` ``\^`` —— 快速显示 / 立即显示 / 不等待
+#: * ``\\`` —— 转义出一个真正的反斜杠字符
+#:
+#: 对应的**内容类**是 ``\V[n]`` ``\N[n]`` ``\P[n]`` ``\C[n]`` ``\I[n]``
+#: ``\S[n]``（带编号，值会变）、``\D`` ``\R``（插件表达式）、
+#: ``\$`` ``\G``（货币）。这些丢了游戏会显示错东西，必须判死。
+_STYLE_ONLY_MARKS: frozenset[str] = frozenset(
+    {"\\{", "\\}", "\\!", "\\.", "\\|", "\\>", "\\<", "\\^", "\\\\"}
+)
+
+#: 内容类的单字符命令（不带编号的那些）。
+_CONTENT_SINGLE_MARKS: frozenset[str] = frozenset(
+    {"\\D", "\\R", "\\$", "\\G"}
+)
+
+
+def _is_style_only_mark(mark: str) -> bool:
+    """这个占位符是不是**纯样式**记号（丢了不算坏）。
+
+    带编号的（``\\V[1]`` / ``\\S[3]`` …）一律算内容类 —— 值会变，
+    丢了游戏就显示错东西。只有明确列在 :data:`_STYLE_ONLY_MARKS`
+    里的单字符命令才算样式。
+    """
+    if mark in _STYLE_ONLY_MARKS:
+        return True
+    if mark in _CONTENT_SINGLE_MARKS:
+        return False
+    # 带 `[...]` 的（含嵌套形式）都是内容类
+    return False
+
 
 @dataclass
 class PlaceholderCheck:
-    ok: bool
+    ok: bool = True
     missing: list[str] = field(default_factory=list)
     extra: list[str] = field(default_factory=list)
     changed: list[tuple[str, str]] = field(default_factory=list)
@@ -471,7 +508,39 @@ class PlaceholderCheck:
 
     @property
     def fatal(self) -> bool:
-        return bool(self.missing or self.extra or self.order_changed or self.runs_split)
+        return bool(
+            self.fatal_missing or self.extra or self.order_changed or self.runs_split
+        )
+
+    @property
+    def fatal_missing(self) -> list[str]:
+        """``missing`` 里**真正致命**的那些（剔除纯样式记号）。
+
+        ## 为什么纯样式记号丢了不算坏（真实数据）
+
+        RPG Maker 的单字符反斜杠命令里有两类，混在一起判会误杀：
+
+        * **内容类** —— `\\V[1]`（变量值）、`\\N[2]`（角色名）、
+          `\\D`/`\\R`（插件表达式）、`\\$`（货币单位）、`\\G`（货币名）。
+          丢了会让游戏**显示错东西**或插件解析失败，必须判死。
+        * **样式类** —— `\\{` `\\}`（放大/缩小文字）、`\\!`（停顿）、
+          `\\.`（等待）、`\\|`（等待）、`\\>` `\\<` `\\^`（显示控制）、
+          `\\\\`（转义反斜杠）。挪位或丢掉只影响**演出节奏与字号**，
+          不影响内容。
+
+        实测真实游戏 `Scenario.json` 里有 **165 处** `\\{`，几乎都长这样：
+
+            源：'\\{Ahahahaha!'        译：'啊哈哈哈哈！'
+            源：'\\{Gwahahahaha! ...'   译：'哇哈哈哈！……'
+
+        模型**正确地**丢掉了 `\\{`（中文里没有"放大这段字"的概念，
+        留着反而会让它变成可翻译的明文）。而这里原先把它算进 `missing`
+        ⇒ 判死 ⇒ **一条完全正确的译文被整条丢弃、对话框变空白**。
+
+        怎么区分：内容类在 `find_placeholders` 的匹配结果里一定带
+        `[数字]` 或属于 `\\D \\R \\$ \\G`；其余单字符命令都是样式。
+        """
+        return [p for p in self.missing if not _is_style_only_mark(p)]
 
     def describe(self) -> str:
         bits: list[str] = []

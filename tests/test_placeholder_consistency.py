@@ -311,3 +311,85 @@ def test_plugin_letter_loss_is_detected_by_the_guard() -> None:
         "守卫没发现 `\\D` 丢失 —— 这条坏译文会被写回游戏，"
         "玩家看到的是一个裸字母 D，而所有检查都报成功。"
     )
+
+
+# ----------------------------------------------------------------------
+# 纯样式记号：丢了**不算坏**（真实数据里 165 处 `\{`）
+# ----------------------------------------------------------------------
+
+STYLE_ONLY_FORMS = ["\\{", "\\}", "\\!", "\\.", "\\|", "\\>", "\\<", "\\^"]
+
+
+@pytest.mark.parametrize("token", STYLE_ONLY_FORMS)
+def test_style_only_mark_loss_is_not_fatal(token: str) -> None:
+    r"""★ 纯样式记号丢了**不许判死**（反例：内容类必须照样判死）。
+
+    ## 真实事故
+
+    `Scenario.json` 里有 **165 处** `\{`（这一段放大显示），几乎都长这样：
+
+        源：'\\{Ahahahaha!'        译：'啊哈哈哈哈！'
+        源：'\\{Gwahahahaha! ...'   译：'哇哈哈哈！……'
+
+    模型**正确地**丢掉了 `\{` —— 中文里没有"把这段字放大"的概念，
+    留着反而会变成可翻译的明文。而原先把它算进 `missing` ⇒ 判死 ⇒
+    **一条完全正确的译文被整条丢弃、对话框变空白**。
+
+    实测：合并了多片的条目里，含记号的共 29 条，判死 8 条（27.6%）；
+    剔除样式类之后降到 3 条（10.3%），剩下的 3 条是真丢了 `\\V[72]`。
+    """
+    src = f"{token}Ahahahaha!"
+    translated = "啊哈哈哈哈！"  # 模型正确丢掉了样式记号
+    restored, chk = ph.verify_restored(src, translated, [token], masked_source="⟦0⟧Ahahahaha!")
+    assert not chk.fatal, (
+        f"{token!r} 丢了就被判死 —— 这条正确的译文会被整条丢弃：{chk.describe()}"
+    )
+    assert token in chk.missing, "记一笔 missing 是可以的（便于观察），但不该致命"
+
+
+@pytest.mark.parametrize("token", ["\\V[1]", "\\N[2]", "\\I[96]", "\\C[3]", "\\S[5]"])
+def test_content_mark_loss_is_still_fatal(token: str) -> None:
+    r"""★ **反例必须同批存在**：内容类记号丢了必须照样判死。
+
+    没有这一条，"修复"很容易退化成"把判据废掉"。
+    `\V[1]`（变量值）丢了游戏会显示错东西；`\I[96]`（图标）丢了
+    玩家的武器类型图标就没了。
+    """
+    src = f"Weapon: {token}"
+    translated = "武器："  # 记号丢了
+    _restored, chk = ph.verify_restored(src, translated, [token], masked_source="Weapon: ⟦0⟧")
+    assert chk.fatal, f"{token!r} 丢了却没判死 —— 判据被废掉了"
+    assert token in chk.missing
+
+
+def test_style_and_content_marks_are_both_masked() -> None:
+    r"""★ 两侧必须一致：样式记号**照样要屏蔽**，只是丢了不算致命。
+
+    屏蔽与判死是两回事：`\{` 仍然要被换成 `⟦n⟧`，否则它会留在明文里
+    被模型当普通文字处理（实测模型会把它翻成"反斜杠加大括号"之类的怪东西）。
+    """
+    src = "\\{Hello \\V[1]}"
+    masked, slots = ph.mask_batch([src])
+    assert "\\{" not in masked[0], f"样式记号没被屏蔽：{masked[0]!r}"
+    assert "\\V[1]" not in masked[0], f"内容记号没被屏蔽：{masked[0]!r}"
+    assert len(slots[0]) == 2, f"应该屏蔽两个记号：{slots[0]}"
+
+
+def test_style_mark_kept_is_also_fine() -> None:
+    """模型若**保留**了样式记号，同样不该报错（多出才算错）。"""
+    src = "\\{Hello"
+    restored, chk = ph.verify_restored(src, "\\{你好", ["\\{"], masked_source="⟦0⟧Hello")
+    assert not chk.fatal, chk.describe()
+    assert restored == "\\{你好"
+
+
+def test_extra_style_mark_is_still_fatal() -> None:
+    r"""★ 边界：样式记号**多出来**仍然判坏。
+
+    模型凭空加一个 `\{` 会让游戏里这段文字莫名其妙变大 ——
+    "丢了不算坏"不等于"随便加都行"。
+    """
+    src = "Hello"
+    _restored, chk = ph.verify_restored(src, "\\{你好", [], masked_source="Hello")
+    assert chk.fatal, "凭空多出的样式记号没被判坏"
+    assert "\\{" in chk.extra

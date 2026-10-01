@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -633,3 +634,51 @@ def test_apply_does_not_hard_fail_on_empty_translations(tmp_path: Path) -> None:
     units, _rep = ad.extract_text(game)
     res = ad.apply(game, tmp_path / "out", units, {})
     assert res.ok, f"空译文被误判成失败：{res.error}"
+
+
+def test_every_real_pointer_resolves() -> None:
+    r"""★ **最重要的一条端到端断言**：真实游戏里每一个指针都能定位到原文。
+
+    这条比"某几条能写"强得多：它把**所有**抽取路径（Scenario 的裸数组、
+    Map 的 page.list、CommonEvents 的元素、数据库词条…）一次性覆盖。
+    实测真实 MV 游戏 27642 个指针全部通过；修 `/list/` 那个 bug 之前，
+    单 `Scenario.json` 一个文件就有 23159 个全部失败。
+
+    没有本机游戏副本时跳过（CI 上没有）。
+    """
+    game = Path(r"D:\NovaLocData\real\DemonsRoots")
+    if not (game / "www" / "data" / "Scenario.json").is_file():
+        pytest.skip("本机没有真实游戏副本")
+    ad = _adapter()
+    units, _rep = ad.extract_text(game)
+    assert len(units) > 20000, f"只抽到 {len(units)} 条 —— 抽取很可能退化了"
+
+    data = game / "www" / "data"
+    checked = bad = 0
+    failures: list[str] = []
+    cache: dict[str, Any] = {}
+    for u in units:
+        fn = u.location.file
+        # 加密/非 JSON 资源不适合这条判据，只查能解析的 JSON
+        if not fn.endswith(".json"):
+            continue
+        if fn not in cache:
+            try:
+                cache[fn] = json.loads(
+                    (data / fn).read_text(encoding="utf-8-sig")
+                )
+            except Exception:  # noqa: BLE001
+                cache[fn] = None
+        obj = cache[fn]
+        if obj is None:
+            continue
+        checked += 1
+        if not ad._set_pointer(obj, u.location.pointer, "PROBE"):
+            bad += 1
+            if len(failures) < 5:
+                failures.append(f"{fn}{u.location.pointer}")
+
+    assert checked > 20000, f"只检查了 {checked} 个指针"
+    assert bad == 0, (
+        f"{bad}/{checked} 个指针定位失败（回写会静默丢掉这些译文）：{failures}"
+    )
