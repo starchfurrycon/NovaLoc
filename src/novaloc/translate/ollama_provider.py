@@ -342,6 +342,28 @@ class OllamaTranslationProvider:
 
         missing = [i for i in expect if i not in mapping]
         if missing:
+            # ★ 大比例缺失 = **提示词格式没被遵守**，不是偶发漏条。
+            #
+            # 真实事故：提示词要求 `[{"i":…,"t":…}]` 数组时，
+            # translategemma:4b 把示例里的 `{"i": 0, "t": "…"}` 当成
+            # "要产出的那**一个**对象"，输出完就 `done_reason=stop`。
+            # 无论批大小（4/8/16/24/40）都只回 1 条，缺 3~39 条。
+            #
+            # 只靠"逐条降级补漏"兜住的后果是**每批发 1+N 次请求** ——
+            # 慢到看起来像卡死（每批 200 秒以上），但流水线一切"正常"。
+            # 这种"整批系统性残缺"必须显式记一笔，否则没人会去看
+            # `single_fallbacks` 这个数字（它本来就有，只是没人盯）。
+            if len(missing) >= max(2, len(expect) // 2):
+                self.stats["batch_mostly_missing"] = (
+                    self.stats.get("batch_mostly_missing", 0) + 1
+                )
+                log.warning(
+                    "批 %d 条里只回 %d 条（缺 %d 条）—— 提示词格式可能没被遵守；"
+                    "本批改用逐条翻译。若这条反复出现，先查 prompts 里的输出格式说明。",
+                    len(expect),
+                    len(mapping),
+                    len(missing),
+                )
             log.debug("批次漏了 %d 条：%s", len(missing), missing[:10])
             # 只补漏的那些，**不**重发整批：重发整批既慢又可能再次漏。
             # 逐条调用实测可靠（单条成功率远高于批量），所以用可靠性换速度，

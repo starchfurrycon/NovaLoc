@@ -390,7 +390,19 @@ def main() -> int:
     entries, prov = run_case(host, "good")
     prompts = STATE["prompts"]
     check("提示词里出现屏蔽记号 ⟦n⟧", any("⟦" in str(p) for p in prompts))
-    check("提示词要求带索引的对象数组", any('"i"' in str(p) for p in prompts))
+    # ★ 格式要求是「行号为键的对象」，不是 `[{"i":…,"t":…}]` 数组。
+    #
+    # 实测（同一批 40 条真实文本）：要求数组时模型生成 26 token
+    # 只回 1 个对象就停（静默漏译 39 条，再靠逐条降级补漏），
+    # 要求对象时回满 40 条。详见 `prompts.build_batch_user_prompt` 的注释。
+    check(
+        "提示词要求行号为键的 JSON 对象",
+        any(isinstance(p, str) and "行号" in p and "键" in p for p in prompts),
+    )
+    check(
+        "提示词不许再要求带 i/t 的数组",
+        not any('"i"' in str(p) and "数组" in str(p) for p in prompts),
+    )
 
     # ---------- 场景 9：repeat_penalty 已显式设置 ----------
     p = OllamaTranslationProvider(build_ctx(host))
