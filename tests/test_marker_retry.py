@@ -350,6 +350,68 @@ def test_clean_translation_keeps_target(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 # ---------------------------------------------------------------------------
+# 六、【已撤回】换行重试分支不可达 —— 改为守住真实病因
+# ---------------------------------------------------------------------------
+#
+# 这里原来有 4 个测试，测的是「换行记号被吞掉 ⇒ 不屏蔽换行重问一次」。
+# **它们喂的是不现实的输入**，所以"通过"并不代表分支会被走到：
+#
+# * 实测：`repair_dropped_masks` 会把丢掉的记号**重新插回去**（含换行
+#   记号，插在数字/量词后面），所以 `verify_restored` 失败的原因
+#   **从来不是**"缺换行记号"；
+# * 实测 60 条真实多行条目：`placeholder_fatal` 27 条，命中该路径 **0 条**。
+#
+# 测一个永不执行的分支比不测更糟 —— 它给出"这条修复有效"的假信号。
+# 所以换成守住**真实病因**的不变量：真实病因是模型丢掉**内容类**记号
+# （`\V[122]` 这种），见 docs/ROADMAP.md §3.21。
+
+
+def test_dropped_content_marker_never_writes_back_a_broken_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r"""★ 丢了**内容类**记号（`\V[n]`）时，绝不写回残缺译文。
+
+    这是这条路径唯一真正要守的东西：宁可少翻一条，也不能让玩家
+    看到人名/数值消失或错位的文本。
+    """
+    from novaloc.models import EntryStatus
+
+    # 模型把 ⟦0⟧（即 `\V[1]`，一个变量）整个丢了
+    prov = _make_provider(monkeypatch, '{"0": "说这里。"}')
+    entries = prov.translate_batch([_FakeItem(r"Say \V[1] here.")], "zh-Hans")
+    e = entries[0]
+    if e.status is EntryStatus.TRANSLATED:
+        # 允许 repair 插回记号后通过，但必须**真的插回去了**
+        assert r"\V[1]" in (e.target or ""), (
+            f"判成功却没把变量写回去，玩家会看不到名字：{e.target!r}"
+        )
+    else:
+        assert not (e.target or "").strip(), "判死的条目不许可留译文"
+
+
+def test_repair_only_inserts_markers_never_edits_text() -> None:
+    r"""★ 补回记号时**只许插记号**，正文一个字都不许改。
+
+    这条和上面那条是一对：上面守"缺记号不许算成功"，这条守
+    "补记号的过程本身不能改动玩家看到的文字"。两者都成立，
+    才谈得上"安全地救回条目"。
+
+    用真实条目里的形态（`\V[122]` —— 实测被吞掉的就是这种）。
+    """
+    src = r"Say \V[122] here."
+    m = ph.mask(src)
+    body = "在这里说。"
+    rep = ph.repair_dropped_masks(m.text, body, m.slots)
+    if rep is not None:
+        stripped = rep
+        for i in range(len(m.slots)):
+            stripped = stripped.replace(f"⟦{i}⟧", "")
+        assert stripped == body, (
+            f"补回只许插记号、不许改正文，实际：{rep!r}（正文应仍为 {body!r}）"
+        )
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
