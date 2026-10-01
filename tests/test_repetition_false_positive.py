@@ -93,3 +93,68 @@ def test_mask_marks_are_stripped_before_comparison() -> None:
     a = "使用 ⟦0⟧攻击⟦1⟧ 和 ⟦2⟧防御⟦3⟧"
     b = "使用 \\C[1]攻击\\C[0] 和 \\C[2]防御\\C[0]"
     assert check_repetition(a, b) == []
+
+
+# ----------------------------------------------------------------------
+# ★ 象声词 / 叠词：原文自己就重复，**跨语言**时"减掉原文重复"会失效
+# ----------------------------------------------------------------------
+
+ONOMATOPOEIA = [
+    # 真实数据（DemonsRoots）：这些原先**全部**被判 repetition 致命。
+    # 抽 12 条重译验证过：每一条的译文都是**忠实**的。
+    ("*Pant* *Pant* *Pant*...", "喘... 喘... 喘..."),
+    ("*Shake* *Shake*! *Wobble* *Wobble* *Wobble*!", "摇一摇！摇！摇摇晃晃！"),
+    ("*Chomp* *Chomp* *Chomp*... *Slurp*...", "哇啊… 咀嚼… 咀嚼… 咕噜…"),
+    ("*Slap* *Slap* *Slap* *Slap*!", "啪！啪！啪！啪！"),
+    ("*Munch* *Munch*... *Munch* *Munch*...", "咀嚼… 咀嚼…"),
+    ("*Smack* *Smack* *Smack* *Smack* *Smack*!", "啪！啪！啪！啪！啪！"),
+    # 叠词
+    ("Ehehe... hehe... hehe!", "嘿嘿…嘿嘿…嘿嘿！"),
+]
+
+
+@pytest.mark.parametrize(("src", "tgt"), ONOMATOPOEIA)
+def test_onomatopoeia_is_not_repetition(src: str, tgt: str) -> None:
+    r"""★ 原文是象声词/叠词时**不许**判复读（真实数据里的最大一类误报）。
+
+    ## 为什么"减掉原文重复"这条挡不住
+
+    那条判据是**按字符**比对两侧的重复 n-gram：
+
+        源 `*Pant* *Pant* *Pant*` 里的重复串是 `*Pan`、`Pant`
+        译 `喘... 喘... 喘...`   里的重复串是 `喘...`
+
+    字符上一个都对不上 ⇒ 译文的重复被当成"原文里没有的**新**重复" ⇒ 判死。
+
+    而实际上**必须**跟着重复：原文就是靠重复表达动作发生了三次。
+    翻成"喘"只写一遍才是**漏译**。
+
+    ## 判据改成看**原文**
+
+    原文里同一个 4-gram 出现 ≥3 次 ⇒ "重复"是作者的手法 ⇒ 整个跳过。
+    这次实测被判 `repetition` 的条目，抽 12 条重译**全部**是忠实翻译。
+
+    ## 代价方向
+
+    漏判复读 ⇒ 一屏重复文字（难看，但内容在）；
+    误判忠实翻译 ⇒ **一条完全正确的译文被整条丢弃**（对话框空白），
+    而且会送进重试、反复浪费模型调用。后者更坏。
+    """
+    assert check_repetition(src, tgt) == [], f"象声词被误判成复读：{src!r} → {tgt!r}"
+
+
+def test_onomatopoeia_guard_does_not_disable_the_criterion() -> None:
+    r"""★ 边界：**只有原文自己重复时**才跳过。
+
+    原文是普通句子、译文却复读，必须照样抓 —— 否则这条"修复"
+    就退化成"把复读判据整个废掉"，而那正是
+    `test_real_repetition_is_still_caught` 在防的事。
+    """
+    # 原文不重复（同一个 4-gram 不到 3 次），译文复读
+    assert check_repetition("Open the door.", "开门开门开门开门开门开门")
+    # 原文只重复两次 —— 不足以说明"重复是作者手法"，仍要判。
+    # （注意得写得够长，"no no" 只有 5 个字符，凑不出一个 4-gram，
+    #   那样走的是 `_repeated_ngrams` 的长度短路，测不到这条边界。）
+    assert check_repetition(
+        "no no, that is not right at all", "不不不不不不不不不不不不不"
+    )

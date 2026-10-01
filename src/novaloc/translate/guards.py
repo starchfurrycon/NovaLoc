@@ -363,10 +363,36 @@ def check_repetition(source: str, target: str) -> list[str]:
     关键：**先减掉原文里本来就有的重复**。原文如果自己就写了
     "no no no"，译文重复同样的词是正常翻译，不该误报。
 
+    ## ★ 原文本身是"象声词/叠词"时**整个跳过**（真实数据校准）
+
+    上面那条"减掉"只在**跨语言**时失效：原文是 `*Pant*`、译文是 `喘`，
+    字符上一个都对不上，于是译文被当成"原文里没有的新重复"。
+
+    实测这个游戏里被判 `repetition` 的条目，**抽 12 条重译全部是忠实翻译**：
+
+        源 '*Pant* *Pant* *Pant*...'       译 '喘... 喘... 喘...'
+        源 '*Shake* *Shake*! *Wobble*...'   译 '摇一摇！摇！摇摇晃晃！'
+        源 '*Chomp* *Chomp* *Chomp*...'     译 '咀嚼… 咀嚼… 咕噜…'
+        源 '*Smack* *Smack* *Smack*! ...'   译 '啪啪啪！那个男人…'
+
+    这些**必须**跟着原文重复（原文就是靠重复表达动作次数）。
+    判别方式看**原文**而不是译文：原文里同一个 4-gram 出现 ≥3 次，
+    就说明"重复"是作者的手法，此时对重复下判断只会误杀。
+
+    ## 代价的方向
+
+    漏判复读 ⇒ 一屏重复文字（难看，但内容在）；
+    误判忠实翻译 ⇒ **一条完全正确的译文被整条丢弃**（对话框空白）。
+    后者更坏 —— 而且误判会把它送进重试，反复浪费模型调用。
+
     两侧都先过 :func:`_repeat_view` —— 理由见那里的说明
     （掩码记号与引擎转义码的形态差异会造出**假复读**）。
     """
-    src_grams = set(_repeated_ngrams(_repeat_view(source), min_hits=2))
+    src_view = _repeat_view(source)
+    # 原文自己就在重复 ⇒ 不判（象声词、叠词、"no no no" 都走这条）
+    if _repeated_ngrams(src_view, min_hits=3):
+        return []
+    src_grams = set(_repeated_ngrams(src_view, min_hits=2))
     hits = _repeated_ngrams(_repeat_view(target))
     novel = [g for g in hits if g not in src_grams]
     if not novel:
