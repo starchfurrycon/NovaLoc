@@ -53,11 +53,42 @@ from .charset import (
     plan_charset,
 )
 from .coverage import load_font_info
-from .downloader import download
+from .downloader import DownloadError, download
 from .merge import MergeReport, merge_fonts_multi, subset_font_for_chars
 from .qa import FontQAReport, verify_font
 
 log = logging.getLogger(__name__)
+
+#: 合法字体文件的开头（`sfntVersion` / WOFF / WOFF2 / TTC）。
+#:
+#: ## 为什么需要这个，而不是靠扩展名或文件大小
+#:
+#: 实测 `fonts/cache/lxgw-wenkai-screen.ttf` 的开头是 `<b'<!DO'`
+#: —— 一个 **HTML 错误页**被当成了字体，且**永久缓存**在那里：
+#: 它 157 KB，轻松通过了下载器那条 `min_bytes=10240` 的检查，
+#: 之后每一轮 `fonts` 都认为"本机已有这个字体"，永远不再重新下载。
+#:
+#: **一次下载失败让这个字体永久坏掉**，而且直到合并阶段才报错
+#: （`Not a TrueType or OpenType font`）—— 报错点离病因很远。
+#:
+#: 所以校验必须**按内容判**，不能按长度或扩展名判。
+_FONT_MAGICS = (
+    b"\x00\x01\x00\x00",  # TrueType
+    b"OTTO",              # CFF / OpenType
+    b"true",              # 旧 Mac TrueType
+    b"ttcf",              # TrueType Collection
+    b"wOFF",              # WOFF
+    b"wOF2",              # WOFF2
+)
+
+
+def _looks_like_font_file(path: Path) -> bool:
+    """按魔数判断这是不是一个真的字体文件（而不是 HTML 错误页）。"""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) in _FONT_MAGICS
+    except OSError:
+        return False
 
 
 @dataclass
@@ -257,6 +288,18 @@ class FontService:
                 continue
             for f in d.rglob("*"):
                 if f.is_file() and f.suffix.lower() in (".ttf", ".otf", ".ttc", ".otc"):
+                    # 缓存里可能有**坏文件**（历史版本下过一个 HTML 错误页进来）。
+                    # 坏文件不能只看扩展名就当字体用，否则它对每一轮都
+                    # "看起来是已缓存"，永远不重新下载 —— 一次失败永久坏掉。
+                    # 先按魔数排掉，坏的就删掉让它有机会重新下载。
+                    if not _looks_like_font_file(f):
+                        log.warning(
+                            "缓存里的 %s 不是合法字体（开头 %r），已删除以便重新获取",
+                            f.name,
+                            f.read_bytes()[:8],
+                        )
+                        f.unlink(missing_ok=True)
+                        continue
                     if self._family_matches(f, spec.family):
                         self._downloaded[spec.id] = f
                         return f
@@ -274,6 +317,29 @@ class FontService:
         try:
             dest = self._font_cache_dir() / f"{spec.id}{Path(spec.direct_url).suffix or '.ttf'}"
             download(spec.direct_url, dest, min_bytes=10240)
+            # ⚠️ **下载完必须验证它真的是字体。**
+            #
+            # ## 事故：一个 HTML 错误页被当成字体**永久缓存**下来
+            #
+            # 实测发现 `fonts/cache/lxgw-wenkai-screen.ttf` 的
+            # `sfntVersion` 是 `<b'<!DO'` —— 一个 HTML 错误页。
+            # 它 157 KB，**轻松通过了 `min_bytes=10240`**，
+            # 于是被当成"已缓存的字体"写进磁盘。
+            #
+            # 后果不是"某个字体用不了"这么简单：
+            # 它对**每一轮** `fonts` 阶段都是"本机已有这个字体"，
+            # 于是永远不再重新下载 —— **一次失败让这个字体永久坏掉**。
+            # 而且直到合并阶段才炸（`Not a TrueType or OpenType font`），
+            # 报错点离病因很远。
+            #
+            # 所以：**只检查大小的校验挡不住错误页**。
+            # 内容类型必须按内容本身判，不能按长度判。
+            if not _looks_like_font_file(dest):
+                head = dest.read_bytes()[:12]
+                dest.unlink(missing_ok=True)
+                raise DownloadError(
+                    f"下载到的内容不是字体文件（开头 {head!r}，疑似错误页），已丢弃"
+                )
             self._downloaded[spec.id] = dest
             return dest
         except Exception as exc:  # noqa: BLE001
@@ -300,6 +366,7 @@ class FontService:
         return None
 
     def find_preferred_cjk_font(self, families: list[str] | None = None) -> Path | None:
+
         """**一次扫描**挑出最合适的中文字体。
 
         为什么必须一次扫描：``_find_system_font`` 每次都要 rglob 整个系统
