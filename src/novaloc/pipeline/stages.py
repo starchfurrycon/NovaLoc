@@ -45,6 +45,7 @@ from ..models import (
 )
 from ..translate.glossary import engine_label_target, merge_engine_labels
 from ..translate.guards import check_foreign_script, is_unsafe_writeback
+from ..translate.placeholders import content_runs_split_in_restored
 
 log = logging.getLogger(__name__)
 
@@ -1371,18 +1372,31 @@ class Pipeline:
         bad: set[str] = set()
         n_foreign = 0
         n_pct = 0
+        n_runs = 0
         for e in entries:
             if not e.target.strip():
                 continue
             # 用同一份判据（`guards.is_unsafe_writeback`），只是分开计数
             # 以便日志能说清"作废的原因分别是什么"。
-            if not is_unsafe_writeback(e.source, e.target):
+            if is_unsafe_writeback(e.source, e.target):
+                bad.add(e.uid)
+                if check_foreign_script(e.target, source=e.source):
+                    n_foreign += 1
+                else:
+                    n_pct += 1
                 continue
-            bad.add(e.uid)
-            if check_foreign_script(e.target, source=e.source):
-                n_foreign += 1
-            else:
-                n_pct += 1
+
+            # ★ 连续「内容记号」组被拆散（真实事故：图标滑到别的词旁边）
+            #
+            # 这一条**不在** `is_unsafe_writeback` 里 —— 那套判据管的是
+            # "丢了变量 / 混进外文"，而这里记号**一个没少、顺序也对**，
+            # 坏的只是它们贴着什么词。所以必须单独查，
+            # 否则那 13 条会永远被 `only_pending` 当成"已完成"跳过。
+            split = content_runs_split_in_restored(e.source, e.target)
+            if split:
+                bad.add(e.uid)
+                n_runs += 1
+
         if not bad:
             return 0
         n = self._invalidate_entries(bad)
@@ -1392,6 +1406,8 @@ class Pipeline:
                 why.append(f"{n_foreign} 条混进了别的文字系统")
             if n_pct:
                 why.append(f"{n_pct} 条丢了 %1/%2 消息变量")
+            if n_runs:
+                why.append(f"{n_runs} 条把连续图标码拆散了（图标会贴到错的词上）")
             self.bus.log(
                 f"重查发现 {n} 条已有译文不合格（{'；'.join(why)}），"
                 "已作废（下一轮翻译会重译）",

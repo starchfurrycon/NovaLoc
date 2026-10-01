@@ -443,9 +443,35 @@ class PlaceholderCheck:
     文本看着也通顺，但游戏渲染必然出错。这类"沉默的损坏"比丢字更危险。
     """
 
+    runs_split: list[tuple[int, ...]] = field(default_factory=list)
+    """被**拆散**的连续记号组（源文里连在一起，译文里被文字隔开）。
+
+    ## 为什么顺序对了还不够（真实事故）
+
+    MV 的 `Actors.json` 角色 profile：
+
+        源：…Weapon Type: \\I[96]\\I[97]   Armor Type:\\I[129]\\I[135]\\I[139]
+        译：…武器类型：[武器名称]  防具类型\\I[96]\\I[97]：[防具名称]\\I[129]…
+
+    编号顺序是 **96, 97, 129, 135, 139 —— 递增，顺序判据完全通过**。
+    坏掉的是**相邻关系**：图标原本紧跟在 `Weapon Type:` 后面，
+    现在跑到了 `防具类型` 后面。玩家看到的是"防具类型"配武器图标。
+
+    这类"顺序对、邻接错"的损坏，`order_changed` 抓不到 ——
+    它比的是编号序列，而拆散改变的是**记号与文字的相邻关系**。
+
+    实测：凡是有连续记号组的条目，**100%（14/14）** 都被拆散。
+
+    ## 判据只针对 `\\I[...]` 这类**内容**记号
+
+    `\\C[29]`（改文字颜色）挪位只影响配色；
+    `\\I[96]`（画一个图标）挪位就**换了内容** —— 图标本身是有意义的。
+    所以只有"内容记号"的组被拆散才判坏。
+    """
+
     @property
     def fatal(self) -> bool:
-        return bool(self.missing or self.extra or self.order_changed)
+        return bool(self.missing or self.extra or self.order_changed or self.runs_split)
 
     def describe(self) -> str:
         bits: list[str] = []
@@ -455,6 +481,11 @@ class PlaceholderCheck:
             bits.append(f"多出占位符：{self.extra}")
         if self.order_changed:
             bits.append(f"占位符顺序被打乱（下标 {self.order_changed}）")
+        if self.runs_split:
+            bits.append(
+                f"连续记号组被拆散（{self.runs_split[:3]}）—— "
+                "图标滑到了别的词旁边"
+            )
         if self.changed:
             bits.append(f"占位符被改写：{self.changed[:5]}")
         return "；".join(bits) or "占位符一致"
@@ -565,7 +596,181 @@ def verify_restored(
                     if a != b
                 ]
                 check.ok = False
+
+        # ---- 连续「内容记号」组不许被拆散 ----
+        #
+        # 只在多重集完整时判（缺/多记号另有分支报错，且拆散判定需要编号可比）。
+        if not check.missing and not check.extra:
+            check.runs_split = find_split_content_runs(
+                masked_source, translated_raw, slots
+            )
+            if check.runs_split:
+                check.ok = False
     return restored, check
+
+
+#: 连续记号组的最小长度 —— 单个记号谈不上"被拆散"
+_MIN_RUN = 2
+
+#: **内容**类记号的形状（挪位会换内容，不只是换样式）。
+#: `\I[96]` 画一个图标、`\N[1]` 是角色名 —— 都有实义。
+#: `\C[29]`（文字颜色）与 `<color=…>`（样式标签）**不在**这里：
+#: 它们挪位只影响配色，而中文语序本来就和原文不同，
+#: 强行要求邻接会误杀大量正常译文。
+_CONTENT_MARK_RE = re.compile(r"\\(?:I|N|V|P)\[")
+
+
+def _content_runs(masked: str, slots: list[str]) -> list[tuple[int, ...]]:
+    """取出掩码文本里**连续的、内容是实义符号**的记号组。"""
+    out: list[tuple[int, ...]] = []
+    for m in re.finditer(r"(?:⟦(\d+)⟧)+", masked):
+        idxs = tuple(int(x) for x in re.findall(r"⟦(\d+)⟧", m.group(0)))
+        if len(idxs) < _MIN_RUN:
+            continue
+        # 整组都必须是内容记号（混了样式记号就跳过，避免误杀）
+        texts = [slots[i] for i in idxs if 0 <= i < len(slots)]
+        if len(texts) != len(idxs):
+            continue
+        if all(_CONTENT_MARK_RE.match(t) for t in texts):
+            out.append(idxs)
+    return out
+
+
+def find_split_content_runs(
+    masked_source: str, translated_raw: str, slots: list[str]
+) -> list[tuple[int, ...]]:
+    r"""找出邻居被换掉的「内容记号」连续组。
+
+    ## 判据：记号紧贴的**字符类**不能变
+
+    源文 ``Weapon Type: \\I[96]\\I[97]   防具类型…`` —— 组紧跟在**冒号**后面。
+    译文 ``…[武器名称]  防具类型\\I[96]\\I[97]：`` —— 组现在紧跟在**汉字**后面。
+
+    记号本身没丢、编号顺序也对，但**它贴着的东西从标点变成了汉字**，
+    说明它滑到了另一个词旁边。
+
+    所以判据是：组前/后紧邻的第一个**非空白**字符，
+    从"标点"变成了"汉字/字母"，或反过来 —— 就算拆散。
+
+    ## 为什么不能只数"组之间有没有文字"
+
+    实测那 14 条里，组与组之间**本来就有** `   Armor Type: ` 这类标签，
+    所以"组之间出现文字"在原文和译文里都成立，区分不出来。
+    真正变的是**组自己贴着什么**。
+
+    ## 为什么只对内容记号判
+
+    `\\C[29]`（改颜色）挪位只影响配色，而中文语序本来就和原文不同 ——
+    对它判邻接会误杀大量正常译文。
+    `\\I[96]`（画图标）挪位就**换了内容**。
+    """
+    raw = translated_raw or ""
+    runs = _content_runs(masked_source, slots)
+    if not runs:
+        return []
+
+    # 译文里每个编号的位置
+    pos: dict[int, tuple[int, int]] = {}
+    for m in re.finditer(r"⟦(\d+)⟧", raw):
+        pos.setdefault(int(m.group(1)), (m.start(), m.end()))
+
+    split: list[tuple[int, ...]] = []
+    for run in runs:
+        if any(i not in pos for i in run):
+            continue  # 缺记号 → 交给 missing 分支
+        src_span = _mask_span(masked_source, run)
+        tgt_span = (pos[run[0]][0], pos[run[-1]][1])
+        if src_span is None:
+            continue
+        for side in ("before", "after"):
+            a = _neighbour_class(masked_source, src_span, side)
+            b = _neighbour_class(raw, tgt_span, side)
+            if not a or not b:
+                continue
+            # 只拦"标点 ↔ 词"的跨越。
+            #
+            # * `punct → punct`（`:` → `：`）是正常的中文标点转换；
+            # * `latin → cjk` 是**标点前面的标签被翻译了**
+            #   （`Weapon Type:` → `武器类型：`），完全正常；
+            # * 但 `punct → cjk/latin` 表示记号本来贴着标点
+            #   （即"标签之后"），现在却贴着一个词 —— 它滑到别的词旁边了。
+            if a == "punct" and b in ("cjk", "latin", "digit"):
+                split.append(run)
+                break
+            if b == "punct" and a in ("cjk", "latin", "digit"):
+                split.append(run)
+                break
+    return split
+
+
+def content_runs_split_in_restored(
+    source: str, target: str, *, slots: list[str] | None = None
+) -> list[tuple[int, ...]]:
+    r"""对**已还原**的译文判断"连续内容记号组有没有被拆散"。
+
+    用于**重查已有数据**（工作区里躺着的旧译文）——
+    :func:`find_split_content_runs` 需要"带 ``⟦n⟧`` 的模型原始输出"，
+    而落盘的是还原后的文本，所以这里把槽位内容**反推**回记号。
+
+    ## 只在槽位内容互不相同时才敢反推
+
+    反推是把第一个出现的 ``\I[96]`` 换成 ``⟦0⟧``、第二个换成 ``⟦1⟧``……
+    如果**多个槽位的内容一模一样**（例如同一个图标码用了两次），
+    第一处到底对应哪个编号就**无法确定**，反推可能张冠李戴。
+    那种情况直接返回空（宁可漏报，不可误报 ——
+    误报会把一条好译文作废并重译）。
+    """
+    if not source or not target:
+        return []
+    m = mask(source)
+    if len(m.slots) < _MIN_RUN:
+        return []
+    # 槽位内容必须唯一，否则反推不可靠
+    if len(set(m.slots)) != len(m.slots):
+        return []
+    used = slots if slots is not None else m.slots
+    raw = target
+    for i, s in enumerate(used):
+        if s and s in raw:
+            raw = raw.replace(s, f"⟦{i}⟧", 1)
+    return find_split_content_runs(m.text, raw, used)
+
+
+def _mask_span(masked: str, run: tuple[int, ...]) -> tuple[int, int] | None:
+    """一组连续记号在掩码文本里的 ``[起, 止)`` 区间。"""
+    first, last = run[0], run[-1]
+    m1 = re.search(rf"⟦{first}⟧", masked)
+    if not m1:
+        return None
+    m2 = re.search(rf"⟦{last}⟧", masked[m1.start() :])
+    if not m2:
+        return None
+    return m1.start(), m1.start() + m2.end()
+
+
+def _neighbour_class(text: str, span: tuple[int, int], side: str) -> str:
+    """记号组前/后紧邻的第一个**非空白**字符属于哪一类。
+
+    返回 ``"cjk"`` / ``"latin"`` / ``"digit"`` / ``"punct"`` / ``""``（没有）。
+    """
+    if side == "before":
+        seg = text[: span[0]]
+        chars = [c for c in reversed(seg) if not c.isspace()]
+    else:
+        seg = text[span[1] :]
+        chars = [c for c in seg if not c.isspace()]
+    if not chars:
+        return ""
+    c = chars[0]
+    if c in "⟦⟧":
+        return ""  # 紧挨着另一个记号 → 本来就该合并，另算
+    if "\u4e00" <= c <= "\u9fff":
+        return "cjk"
+    if c.isascii() and c.isalpha():
+        return "latin"
+    if c.isdigit():
+        return "digit"
+    return "punct"
 
 
 # --------------------------------------------------------------------------
