@@ -254,3 +254,100 @@ def test_slot_classification() -> None:
         assert ph._needs_word_boundary(slot), f"{slot!r} 应需词边界"
     for slot in ("%d", "%s", "{name}"):
         assert ph._needs_arg_boundary(slot), f"{slot!r} 应需参数边界"
+
+
+# ----------------------------------------------------------------------
+# 断行/停顿类：`\|` `\.` 必须落在词边界
+# ----------------------------------------------------------------------
+
+#: 真实的"停顿类"控制码。它们**会断行**，所以插在词中间玩家看得见。
+BREAK_SLOTS = [BS + c for c in "|.!><"]
+
+
+@pytest.mark.parametrize("slot", BREAK_SLOTS)
+def test_break_chars_need_word_boundary(slot: str) -> None:
+    r"""`\|` `\.` `\!` `\>` `\<` **会断行**，所以必须落在词边界。
+
+    ## 事故：它们被当成"插哪都行"
+
+    原先只有 `\n` / `<br>` 被归为"位置敏感"，而 `\|` `\.` 落在
+    `_REPAIR_FREE_CHARS`（"在哪触发都只是时机差别"）里。
+    这在**颜色**类上成立，对**停顿**类是错的 ——
+    `\|` 是 RPG Maker 的**等待玩家按键**，它会在游戏里断行。
+
+    实测真实数据（BeyondPortal 的 7 条失败）：
+
+        译文: '嗯……（亲吻）……嗯……（亲吻）……'
+        补回: '嗯……（亲⟦0⟧吻）……嗯⟦1⟧……'    ← `\|` 劈开了"亲吻"
+
+    玩家看到的是一句被控制码劈开的台词。
+    """
+    assert ph._needs_word_boundary(slot), f"{slot!r} 会断行，必须需要词边界"
+
+
+def test_break_token_never_lands_inside_a_word() -> None:
+    r"""整条链路的回归：补回后的 `\|` **不得**落在词中间。
+
+    比"分类正确"更靠近用户可见结果 —— 它直接检查**补回的产物**。
+
+    实测来源：`'Mmmm...\|*smooch* \|Ngh...'` 那几条
+    （模型把 `\|` 全丢掉只译文字，旧行为整条丢弃 → 玩家看到空白对话框）。
+
+    这里给的译文带标点（真实模型输出都有），所以能定位到词缝。
+    """
+    source = "亲" + BS + "|吻" + BS + "|，再见。"
+    m = ph.mask(source)
+    assert m.slots, "应当识别出停顿记号"
+    model_out = "亲吻，再见。"
+    rep = ph.repair_dropped_masks(m.text, model_out, m.slots)
+    assert rep is not None, "应当能补回"
+    restored, chk = ph.verify_restored(source, rep, m.slots, masked_source=m.text)
+    assert not chk.fatal, chk.describe()
+    # 每个 `\|` 的两侧不能同时是词内字符
+    for pos in range(len(restored)):
+        if restored.startswith(BS + "|", pos):
+            left = restored[pos - 1] if pos > 0 else ""
+            right = restored[pos + 2] if pos + 2 < len(restored) else ""
+            glued = bool(left) and bool(right) and ph._is_wordish(left) and ph._is_wordish(right)
+            assert not glued, (
+                f"停顿记号把词劈开了：{restored!r}"
+                f"（位置 {pos}，上下文 {restored[max(0, pos - 3):pos + 2]!r}）"
+            )
+
+
+def test_pure_cjk_without_boundaries_still_refuses_pause() -> None:
+    r"""纯汉字、无任何标点空格时，**仍然拒绝**补回停顿。
+
+    这不是回归，是刻意的：`_snap_to_boundary` 找不到词缝，
+    插进去只会把中文词劈开（`'亲⟦0⟧吻'`）。
+    宁可整条不译，也不产出劈开词的文本 ——
+    与 `\n` / `%d` 那条"换行但译文无任何边界 → 拒绝"完全一致。
+
+    实测真实数据里带停顿的译文**几乎都有标点**
+    （`'嗯...亲亲'`、`'这水不错啊'`、`'亲吻...'`），
+    所以这条限制不会挡住真实可救的条目。
+    """
+    source = "亲" + BS + "|吻" + BS + "|再见"
+    m = ph.mask(source)
+    assert ph.repair_dropped_masks(m.text, "亲吻再见", m.slots) is None, (
+        "纯汉字无边界时不该补回（会劈开中文词）"
+    )
+
+
+def test_pause_radius_is_wider_than_plain_newline() -> None:
+    r"""停顿类放宽搜索半径，`\n`/`%d` 不放宽 —— 两类诉求不同。
+
+    * `\n` / `%d` 的**绝对位置**有意义（换行挪到别的句子就是错的）；
+    * `\|` / `\.` 是**停顿**，绝对位置不必精确，但**必须落在词缝里**。
+
+    一个 20 字的句子，停顿真值离最近标点常常有 10 个字以上；
+    半径固定为 6 时 `_snap_to_boundary` 返回 `None`，调用方只好放弃补回，
+    整条译文仍然失败、玩家看到空白对话框。
+    """
+    text = "这是一句很长的中文台词没有任何标点只有最后才有句号。"
+    # 靠近结尾的位置：半径 6 够不到句号，半径 24 够得到
+    near_end = len(text) - 8
+    assert ph._snap_to_boundary(text, near_end) is None, "半径 6 应当够不到"
+    assert ph._snap_to_boundary(text, near_end, radius=24) is not None, (
+        "放宽半径后应当能找到词边界"
+    )

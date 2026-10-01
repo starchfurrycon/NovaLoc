@@ -46,8 +46,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from novaloc.translate import guards  # noqa: E402
 from novaloc.translate import placeholders as ph  # noqa: E402
 from novaloc.translate.guards import check_leak  # noqa: E402
+
+#: 反斜杠。**不在源码里写反斜杠字面量** —— 历史上因为转义层数反复踩坑
+#: （见 `placeholders._BS` 的说明），统一从被测模块取。
+BS = ph._BS
 
 # ----------------------------------------------------------------------
 # bug A：剧情里的"对不起"不是泄漏
@@ -120,6 +125,66 @@ def test_leak_regex_compiles_with_scoped_flags() -> None:
     """
     assert check_leak("I'm sorry, but I cannot translate this.")
     assert not check_leak("Sorry I'm late.")
+
+
+# ----------------------------------------------------------------------
+# bug C：补回占位符把拒答"撑出"窗口，导致 prompt_leak 漏掉
+# ----------------------------------------------------------------------
+
+def test_refusal_is_caught_even_with_markup_inserted() -> None:
+    r"""**核心回归**：补回占位符**不得**让拒答漏网。
+
+    ## 事故经过
+
+    拒答判据的形状是"道歉 + 做不到同时出现、且隔得不远"，
+    中间用 `[^。！？\n]{0,12}?` 限制窗口。这是为 `请稍等，我现在无法确定`
+    这类写法留的余地。
+
+    但补回占位符会把标签**插进这个窗口**：
+
+        模型回复: '抱歉，我无法完成这个请求。'          → 命中 ✅
+        补回标签: '抱歉，<color=#ff0000></color>我无法…' → **漏掉** ❌
+
+    `<color=#ff0000></color>` 是 25 个字符，把窗口撑爆了。
+    而玩家在游戏里**一个字都看不到它**。
+
+    修法：`check_leak` 除了查原样文本，还把**纯样式记号**剥掉再查一遍。
+    这条测试就是那次修复的钉子 —— 它是在
+    `tests/test_translate_integration.py` 的"完全不是 JSON"场景
+    被改红之后才发现的（**改好了补回，却把这道闸门撑漏了**）。
+    r"""
+    plain = "抱歉，我无法完成这个请求。"
+    tagged = "抱歉，<color=#ff0000></color>我无法完成这个请求。"
+    assert check_leak(plain), "基准：不带标签的拒答必须命中"
+    assert check_leak(tagged), "带标签的拒答也**必须**命中（这就是回归）"
+    # RPG Maker 颜色码同理
+    assert check_leak(BS + "C[29]".join(["抱歉，", "我没办法。"]))
+
+
+def test_markup_stripping_does_not_create_false_positives() -> None:
+    """剥样式记号**不能**把正常道歉台词变成拒答（34 条误杀的历史）。"""
+    for text in [
+        "对不起……",
+        "抱歉……但是你的阴道很棒……！",
+        "对不起，我没办法不爱上你。",
+        BS + "C[29]抱歉……" + BS + "C[0]",
+        "勇者" + BS + "V[1]，你终于醒了！",
+        "造成 5 点伤害。",
+    ]:
+        assert not check_leak(text), f"误杀：{text!r}"
+
+
+def test_variable_placeholders_are_not_stripped_from_the_gap() -> None:
+    r"""`\V[1]` / `%s` 这类**实义**占位符**不能**从窗口里剔掉。
+
+    它们在句子里占一个真实位置（会显示成玩家名/数字）。
+    剔掉它们会让窗口里凭空少一段，反而更容易误判 ——
+    所以只有"纯样式"的那批（颜色/图标/停顿/标签）才剔。
+    r"""
+    stripped = guards._LEAK_GAP_MARKUP_RE.sub("", BS + "V[1] 和 %s 与 " + BS + "C[3]")
+    assert BS + "V[1]" in stripped, "变量占位符不该被剔掉"
+    assert "%s" in stripped, "参数占位符不该被剔掉"
+    assert BS + "C[3]" not in stripped, "颜色码应当被剔掉"
 
 
 # ----------------------------------------------------------------------

@@ -67,6 +67,10 @@ _REPAIR_FREE_LETTERS = frozenset("CIVN")
 #: 单字符控制码（等待、停顿、清屏、加速等），在哪触发都只是时机差别。
 _REPAIR_FREE_CHARS = frozenset("{}|.!><^$")
 
+#: `_REPAIR_FREE_CHARS` 里**其实会断行**的那几个：等待按键 `\|`、停顿 `\.` `\!`、
+#: 瞬间显示 `\>` `\<`。它们插在词中间玩家看得见（见 `_needs_word_boundary`）。
+_REPAIR_BREAK_CHARS = frozenset("|.!><")
+
 #: 补回时**必须落在词边界**的占位符（换行类）。
 #: 找不到边界就干脆不补 —— 见 :func:`_snap_to_boundary`。
 _REPAIR_NEEDS_BOUNDARY = (frozenset({"n", "r"}), "<br")
@@ -98,7 +102,28 @@ def _is_free_anywhere(slot: str) -> bool:
 
 
 def _needs_word_boundary(slot: str) -> bool:
-    """该占位符补回时是否必须落在词边界（换行类）。"""
+    r"""该占位符补回时是否必须落在词边界（换行/停顿类）。
+
+    ## 为什么 `\|` 和 `\.` 也算（一开始把它们归成"插哪都行"是错的）
+
+    `_REPAIR_FREE_CHARS` 里有一批"单字符控制码"，理由是"在哪触发
+    都只是时机差别"。这在**颜色/样式**类上成立，但 `\|` 和 `\.` 不是样式：
+
+    * `\|` 是 RPG Maker 的**等待玩家按键** —— 它会在游戏里**断行**；
+    * `\.` / `\!` 是停顿 —— 也断行。
+
+    所以它们插在词中间是**玩家看得见的损坏**。实测真实数据：
+
+        译文: '嗯……（亲吻）……嗯……（亲吻）……'
+        补回: '嗯……（亲⟦0⟧吻）……嗯⟦1⟧……'    ← `\|` 劈开了"亲吻"
+
+    改动很小（把它们从 FREE 挪到 NEEDS_BOUNDARY），
+    但 `_snap_to_boundary` 只在**半径 6 个字符**内找边界，
+    找不到就返回 `None` → 调用方放弃补回 → 整条仍被判失败。
+    对一个 20 字的句子来说半径 6 太窄，所以这里同时把半径放宽到
+    能覆盖整句（停顿的"绝对位置"本来就不需要精确，
+    落在正确的**词缝**里比落在精确的**字符位**更重要）。
+    """
     if not slot:
         return False
     rest = slot[2:] if slot.startswith(_BS + _BS) else (
@@ -106,6 +131,9 @@ def _needs_word_boundary(slot: str) -> bool:
     )
     low = rest.lower()
     if low in ("n", "r", "n\n", "r\n"):
+        return True
+    # 断行/停顿类控制码：必须落在词边界
+    if rest and rest[0] in _REPAIR_BREAK_CHARS:
         return True
     return low.startswith("<br")
 
@@ -415,6 +443,13 @@ def strip_unknown_masks(text: str, n_slots: int) -> str:
     return _MASK_RE.sub(_sub, text)
 
 
+def _strip_tokens(text: str, tokens: frozenset[str]) -> str:
+    """去掉 ``tokens`` 里的控制码，留下"内容"（用于算比例）。"""
+    for tok in sorted(tokens, key=len, reverse=True):
+        text = text.replace(tok, "")
+    return text
+
+
 def verify_restored(
     original: str,
     translated_raw: str,
@@ -538,7 +573,15 @@ def repair_dropped_masks(
         # `⟦0⟧gold`；而比例位置吸附到最近空白才得到正确的 `⟦0⟧ gold`。
         # 比例位置本来就是这个记号在句子里的相对位置，更贴近真实语义位置。
         if _needs_word_boundary(slot) or _needs_arg_boundary(slot):
-            snapped = _snap_to_boundary(translated_raw, _prop)
+            # 停顿/断行类（`\|` `\.`）放宽搜索半径，理由见 `_snap_to_boundary`：
+            # 它们的绝对位置不需要精确，但**必须**落在词缝里；
+            # 半径太窄会找不到边界而放弃补回，玩家就看到空白对话框。
+            is_break = bool(slot) and len(slot) >= 2 and slot[0] == _BS and (
+                slot[1] in _REPAIR_BREAK_CHARS
+            )
+            snapped = _snap_to_boundary(
+                translated_raw, _prop, radius=24 if is_break else None
+            )
             if snapped is None or _glues_tokens(
                 translated_raw, snapped, _is_free_anywhere(slot)
             ):
@@ -675,7 +718,7 @@ def _anchor_probes(text: str) -> list[str]:
     return out
 
 
-def _snap_to_boundary(text: str, pos: int) -> int | None:
+def _snap_to_boundary(text: str, pos: int, *, radius: int | None = None) -> int | None:
     r"""把插入点吸附到最近的**词边界之后**，找不到返回 ``None``。
 
     用于换行与格式化参数，这类记号必须落在词的**边缘**：落在词中间会得到
@@ -689,12 +732,26 @@ def _snap_to_boundary(text: str, pos: int) -> int | None:
     空格优先于标点：``You got |gold and items.`` 里候选落在 ``got`` 中间，
     半径内既有空格也有句末句号；取**最近的空格**，否则记号会跑到句尾。
 
-    半径限定为 ``_SNAP_RADIUS``，避免记号跨到别的词之外。
+    半径默认 ``_SNAP_RADIUS``（6），避免记号跨到别的词之外。
+
+    ``radius`` 可放宽，**只给"断行/停顿"类用**（见下）。
+
+    ## 为什么 `\|` / `\.` 要放宽半径，而 `\n` / `%d` 不能
+
+    * `\n` 和 `%d` 的**绝对位置**有意义：换行挪到别的句子、参数挪到别的
+      语法位，都是错的。半径必须窄。
+    * `\|` / `\.` 是**停顿**：玩家感知到的是"这里停一下"。
+      它的绝对位置本来就不需要精确 —— 重要的是**落在词缝里**。
+      一个 20 字的句子，停顿真值离最近标点常有 10 个字以上，
+      半径 6 就会返回 `None` → 调用方放弃补回 → 整条译文失败、
+      玩家看到空白对话框（真实事故，7 条）。
+
+    所以放宽**只对停顿类**生效，`\n`/`%d` 仍然用默认的 6。
     """
     if not text:
         return None
     pos = max(0, min(len(text), pos))
-    _SNAP_RADIUS = 6
+    _SNAP_RADIUS = 6 if radius is None else max(1, radius)
     punct = set("，。！？；：、,.!?;:）)」』】”\"'")
 
     # 收集半径内所有边界候选：(距离, 插入下标)
