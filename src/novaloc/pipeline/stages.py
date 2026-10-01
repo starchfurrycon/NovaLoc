@@ -714,21 +714,56 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def _collect_texts(self) -> tuple[list[str], list[str]]:
-        """收集 (译文, 原文) 用于构建字符集。"""
+        """收集 (译文, 原文) 用于构建字符集。
+
+        ⚠️ **被守卫拒绝的条目不算数**。
+
+        真实事故：`foreign_script` 守卫把 3 条跑偏译文判坏之后，
+        它们的 `target` **仍然留着**（那是模型写的俄文/格鲁吉亚文），
+        于是被当成"译文"收进字符集：
+
+            等等！？你要去打შინ纳王？这不可能！      ← 格鲁吉亚文
+            приходится долго ждать动画，真是让人受不了。 ← 俄文
+
+        后果不是"多几个字符"：这几个字符**本机任何 CJK 字体都没有**，
+        而字符集缺字会触发**硬失败** ⇒ 整轮字体适配中止
+        ⇒ `apply` 把原字体原样拷过去 ⇒ **游戏里满屏口口口**。
+
+        也就是说：**三条被正确拒绝的坏译文，差点让整个游戏的
+        全部中文变成方块**。判据本身没错，错在这里把它们当成了有效译文。
+
+        按 `status` 过滤（而不是按 warnings 猜）：被守卫判死的条目
+        状态就是 `FAILED`，这是明确的、单一的事实来源。
+        """
         units = {u.uid: u for u in self.ws.load_units()}
         entries = self.ws.load_entries()
         translated: list[str] = []
         source: list[str] = []
+        rejected = 0
         for e in entries:
-            if e.target.strip():
-                translated.append(e.target)
             u = units.get(e.uid)
             if u is not None:
                 source.append(u.source)
+
+            # 被拒绝的译文不进字符集（它的字符是模型的错误产物）
+            if e.status == EntryStatus.FAILED:
+                rejected += 1
+                continue
+
+            if e.target.strip():
+                translated.append(e.target)
             # 译文为空时把原文也算进去：UI 里可能直接显示未翻译的原文，
             # 那些字符同样需要字体覆盖，否则一样是口口口。
             if not e.target.strip() and e.source.strip():
                 translated.append(e.source)
+
+        if rejected:
+            self.bus.log(
+                f"{rejected} 条被守卫拒绝的条目未计入字符集"
+                f"（它们的内容是模型写坏的文字系统，不是要渲染的中文）",
+                stage="fonts",
+                severity=Severity.INFO,
+            )
 
         # 贴图译文也参与字符集 —— 贴图重绘用的是真实字体，
         # 缺字会直接在图上画出口口口。

@@ -32,12 +32,13 @@ from novaloc.translate.ollama_provider import OllamaTranslationProvider  # noqa:
 
 
 class _FakeUnit:
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, uid: str = "u1") -> None:
         from novaloc.models import TextKind
 
         self.source = source
         self.kind = TextKind.DIALOGUE
         self.max_chars = 0
+        self.uid = uid
 
 
 class _FakeItem:
@@ -255,6 +256,68 @@ def test_complete_answer_still_verifies() -> None:
     restored, check = ph.verify_restored(src, got, m.slots, masked_source=m.text)
     assert not check.fatal, check.describe()
     assert restored == "{color=#ffd700}黎明时，油灯被点亮了。{/color}"
+
+
+# ---------------------------------------------------------------------------
+# 三、★ 被守卫判死的条目**不许留译文**
+# ---------------------------------------------------------------------------
+
+
+def test_fatal_guard_result_clears_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""★ 判死之后必须把译文清掉，否则垃圾会污染下游。
+
+    ## 真实事故
+
+    `foreign_script` 守卫把 3 条跑偏译文判坏之后，它们的 `target`
+    **仍然留着**（模型写的俄文/格鲁吉亚文）。而下游 `fonts` 阶段的
+    `_collect_texts()` 只看"target 非空"，于是把它们当译文收进字符集：
+
+        приходится долго ждать动画，真是让人受不了。   ← 俄文
+        等等！？你要去打შინ纳王？这不可能！              ← 格鲁吉亚文
+
+    那几个字符**本机任何 CJK 字体都没有**，而字符集缺字触发**硬失败**
+    ⇒ 整轮字体适配中止 ⇒ `apply` 把原字体原样拷过去
+    ⇒ **游戏里满屏口口口**。
+
+    也就是说：**三条被正确拒绝的坏译文，差点让整个游戏的全部中文
+    变成方块。** 判据没错，错在拒绝之后没把垃圾清掉。
+
+    `FAILED` 的语义本来就是"没有可用的译文"，
+    `_invalidate_entries()` 一直是"清空 + 标 FAILED"，
+    只有 provider 这条路径当初漏了清空。
+    """
+    from novaloc.models import EntryStatus
+
+    # 让 batch 路径直接回一条"跑偏"的译文（西里尔），必须被守卫判死
+    prov = _make_provider(monkeypatch, '{"0": "приходится долго ждать"}')
+    entries = prov.translate_batch(
+        [_FakeItem("It takes a long time to wait.")], "zh-Hans"
+    )
+    assert len(entries) == 1
+    e = entries[0]
+
+    if e.status is not EntryStatus.FAILED:
+        pytest.skip("这条样本没被判死（判据调整了？）—— 本用例专门测判死后的清理")
+
+    assert e.warnings, "判死必须留下原因"
+    assert not (e.target or "").strip(), (
+        f"判死的条目必须清空译文，实际留着：{e.target!r}\n"
+        "留着会让 fonts 阶段把它当译文收进字符集 —— "
+        "那几个外文字符没有字体覆盖，会让整个字体适配硬失败。"
+    )
+
+
+def test_clean_translation_keeps_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """对照组：正常译文必须**保留** —— 证明上面的清空不是"一律清空"。"""
+    from novaloc.models import EntryStatus
+
+    prov = _make_provider(monkeypatch, '{"0": "等待需要很长时间。"}')
+    entries = prov.translate_batch(
+        [_FakeItem("It takes a long time to wait.")], "zh-Hans"
+    )
+    e = entries[0]
+    assert e.status is not EntryStatus.FAILED, f"正常译文被判死：{e.warnings}"
+    assert (e.target or "").strip(), "正常译文被清空了"
 
 
 # ---------------------------------------------------------------------------

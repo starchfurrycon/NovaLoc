@@ -697,7 +697,28 @@ class OllamaTranslationProvider:
                     length_ratio=ratio,
                     target_lang=target_lang,
                 )
-                entry.target = res.text
+                # ★ 判死的条目**不留译文**。
+                #
+                # ## 为什么这一行很关键（真实事故）
+                #
+                # 早先是 `entry.target = res.text`（无条件赋值）。于是一条被
+                # `foreign_script` 守卫判坏的译文，虽然状态是 FAILED，
+                # **文字还留着** —— 而下游好几处只看"target 非空"：
+                #
+                # * `fonts` 的 `_collect_texts()` 把它当译文收进字符集 ⇒
+                #   俄文/格鲁吉亚文字符进了**硬失败**判据 ⇒ 本机任何 CJK
+                #   字体都没有它们 ⇒ 整轮字体适配中止 ⇒ `apply` 把原字体
+                #   原样拷过去 ⇒ **游戏里满屏口口口**；
+                # * 翻译记忆（`memory.py`）虽然按 status 过滤了，
+                #   但那是它自己额外加的保险，不该依赖。
+                #
+                # 三条被**正确拒绝**的坏译文，差点让整个游戏的全部中文
+                # 变成方块 —— 判据没错，错在拒绝之后没把垃圾清掉。
+                #
+                # 清空也让语义自洽：`FAILED` 的定义就是"没有可用的译文"。
+                # `_invalidate_entries()` 一直是这么做的（清空 + 标 FAILED），
+                # 这里当初漏了。
+                entry.target = "" if res.fatal else res.text
                 entry.warnings = list(res.warnings)
                 entry.provider = self.name
                 entry.model = self._model
