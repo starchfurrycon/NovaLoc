@@ -47,8 +47,9 @@
 | `test_archives_pipeline_e2e.py` | 6 | 归档**穿过整条流水线**：解包 → 翻译 → 回写 → 归档里真的是中文（`.rpa`/`.zip`/`.tar`） |
 | `test_ocr_lang_router.py` | 36 | OCR 按语种路由：映射表、大小写变体、清单一致性、离线不联网；1 项真实识别对比（标 `needs_models`+`needs_gpu`） |
 | `test_qa_label_collision.py` | 9 | 质检"反向碰撞"：不同的 **UI 缩写**撞成同一译文必须报 ERROR；语气词/简繁变体不许报（纯本地，CI 里跑） |
-| `test_prompt_contract.py` | 8 | 系统提示词里"用真实事故换来的"每条规则都不能被顺手删掉（纯本地，CI 里跑） |
+| `test_prompt_contract.py` | 9 | 系统提示词里"用真实事故换来的"每条规则都不能被顺手删掉；**`%n` 规则必须给出语义（只说"要保留"是负作用）**（纯本地，CI 里跑） |
 | `test_percent_message_vars.py` | 13 | RPG Maker 的 `%1`/`%2` 消息变量：**不许屏蔽**（屏蔽后保住率从 ~50% 掉到 ~7%）、出站按**数量+内容**比对；`100% complete` 这类正常百分比不许误伤（纯本地，CI 里跑） |
+| `test_font_download_validation.py` | 6 | 下载到的**不是字体**必须拒绝：真实事故那个 157 KB HTML 错误页曾被当成字体**永久缓存**；6 种合法魔数不许误删（纯本地，CI 里跑） |
 | `test_rpgmaker_www_layout.py` | 8 | **NW.js 打包布局**（资源在 `www/` 下）：探测、抽取、以及最阴的"贴图/字体路径必须相对**游戏根**"（纯本地 + Pillow，CI 里跑） |
 | `test_texture_block_filter.py` | 13 | 挡住立绘上的 OCR 幻觉：单字符块、占画面过大的块被否掉，而 `Now Loading...` 和 emoji 必须留下（纯本地，CI 里跑） |
 | `test_surrogate_sanitize.py` | 13 | 孤立代理项净化：请求体不再抛 `UnicodeEncodeError`；**emoji 必须不被误伤**（纯本地，CI 里跑） |
