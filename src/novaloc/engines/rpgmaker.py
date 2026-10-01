@@ -274,10 +274,30 @@ class RpgMakerAdapter(EngineAdapter):
                 units.extend(self._extract_map(obj, f.name))
             elif f.name == "CommonEvents.json":
                 units.extend(self._extract_common_events(obj, f.name))
+            elif f.name == "Scenario.json":
+                units.extend(self._extract_scenarios(obj, f.name))
             elif f.name in DATABASE_FIELDS:
                 units.extend(self._extract_database(obj, f.name))
             elif f.name == "Tilesets.json":
                 units.extend(self._extract_tilesets(obj, f.name))
+            else:
+                # ★ 兜底：**没被任何分支认领**的数据文件不许静默跳过。
+                #
+                # 为什么会需要这个兜底：`Scenario.json` 此前不在派发链里，
+                # 而循环末尾那段"统计被跳过的原因"是个**空壳**
+                # （`for _ in range(0): pass`），于是**没有任何输出**
+                # 告诉用户有文件被跳过了。11 MB、34,151 条剧情对白
+                # 就这样静默消失，报告还显示"抽取成功"。
+                #
+                # 两种处理，都不猜：
+                #   * 结构像剧本文件（顶层是 `场景名 → 指令列表`）
+                #     ⇒ 用同一套指令解析抽一遍（`401/102/101` 抽，
+                #       `355/655` 脚本照旧不碰）；
+                #   * 其余 ⇒ 记进 `skipped`，让报告里**看得见**。
+                if self._looks_like_scenario_map(obj):
+                    units.extend(self._extract_scenarios(obj, f.name))
+                else:
+                    skipped[f.name] = 1
 
             if len(units) > before:
                 report.files_matched += 1
@@ -498,6 +518,66 @@ class RpgMakerAdapter(EngineAdapter):
                 u = self._mk(entry["name"], fname, f"/{i}/name", TextKind.UI_LABEL)
                 if u:
                     out.append(u)
+        return out
+
+    @staticmethod
+    def _looks_like_scenario_map(obj: Any) -> bool:
+        """判断顶层是不是 `场景名 → 指令列表` 形态（剧本文件）。
+
+        判据要**严**：只有"绝大多数值都是指令列表"才算，
+        避免把 `Animations.json`（`id → 动画定义`）、
+        `TrpParticles.json`（`id → 粒子参数`）这类**数据定义文件**
+        误当成剧本。
+
+        抽样前 40 个值即可 —— 混进真剧本的判据错一次就是几万条噪音。
+        """
+        if not isinstance(obj, dict) or not obj:
+            return False
+        vals = list(obj.values())[:40]
+        lists = 0
+        for v in vals:
+            if not isinstance(v, list):
+                continue
+            # 指令列表里的元素必须是 `{"code": int, ...}` 形态
+            cmds = [c for c in v[:6] if isinstance(c, dict)]
+            if cmds and all(isinstance(c.get("code"), int) for c in cmds):
+                lists += 1
+        return lists >= max(1, int(len(vals) * 0.8))
+
+    def _extract_scenarios(self, obj: Any, fname: str) -> list[TextUnit]:
+        """按**场景名 → 指令列表**组织的剧本文件（`Scenario.json`）。
+
+        ## 为什么单独一个抽取器（真实游戏事故）
+
+        `data/Scenario.json` 是 11 MB、**981 个场景**的剧本文件，
+        里面 **37,146 条 ``code 401``（显示文字）** —— 也就是这个游戏的
+        **主要剧情对白**。而 :meth:`extract_text` 的派发链里
+        **根本没有它的分支**，于是整个文件被静默跳过：
+
+        * 工具报"抽取 29,174 条文本"，看着很正常；
+        * 实际剧情对话 **34,151 条去重条目一个字都没抽到**；
+        * 玩家打开游戏会看到：菜单是中文，**剧情全是英文**。
+
+        这比"报错"严重得多 —— **报告全绿，核心功能等于没做**。
+
+        ## 与 `CommonEvents.json` 的形态差异
+
+        ``CommonEvents.json`` 是 ``list[dict]``（每个 dict 自带 ``list`` 键），
+        而这里是 ``dict[场景名, list[指令]]`` —— **指令列表直接在顶层**，
+        没有中间的 ``"list"`` 包装。所以这里自己包一层再交给
+        :meth:`_commands_text`，复用同一套指令解析与指针规则。
+
+        场景名本身**不是文案**（实测是 `'1'`、`'00boheA_deai1'`、
+        `'EV22'` 这类内部标识），所以**不**抽取，否则会多出上千条噪音。
+        """
+        out: list[TextUnit] = []
+        if not isinstance(obj, dict):
+            return out
+        for key, cmds in obj.items():
+            if not isinstance(cmds, list):
+                continue
+            # 场景名不抽（内部标识，不是文案）
+            out.extend(self._commands_text({"list": cmds}, fname, f"/{key}/list"))
         return out
 
     def _extract_common_events(self, obj: Any, fname: str) -> list[TextUnit]:

@@ -300,6 +300,9 @@ def check_leak(target: str) -> list[str]:
 #: 复读检测用的 n-gram 长度（字符数）
 _REPEAT_N = 4
 
+#: 掩码记号（`⟦0⟧`）—— 复读检测比较前必须去掉，理由见 `_repeat_view`
+_MASK_MARK_RE = re.compile(r"⟦\d+⟧")
+
 
 def _repeated_ngrams(text: str, n: int = _REPEAT_N, *, min_hits: int = 3) -> list[str]:
     """找出在文本里重复出现达到 ``min_hits`` 次的 n-gram（按出现次数降序）。"""
@@ -320,17 +323,51 @@ def _repeated_ngrams(text: str, n: int = _REPEAT_N, *, min_hits: int = 3) -> lis
     return out[:5]
 
 
+def _repeat_view(text: str) -> str:
+    r"""把文本化成"只看真实文字"的形态，供复读检测比较。
+
+    ## 为什么两侧都要过这一道（真实游戏误报）
+
+    复读检测的运行时机很微妙：`guard()` 在 provider 里被调用时，
+    **原文是掩码状态**（``⟦0⟧``），而**译文已经还原**（引擎转义码回来了）。
+    两边形态根本不一样：
+
+    ```
+    掩码原文  '…Weapon Type: ⟦0⟧⟦1⟧   Armor Type:⟦2⟧⟦3⟧⟦4⟧'
+    还原译文  '…武器类型：\I[96]\I[97]   护甲类型：\I[129]\I[135]\I[139]'
+    ```
+
+    :func:`strip_placeholders` 认引擎转义码（``\I[96]``）和 ``%1``，
+    但**不认掩码记号** ``⟦0⟧``。于是早先只对 source 调用它时：
+    原文里的重复被减掉了，而**译文里还原出来的同一批图标码**
+    （``\I[96]\I[97]`` / ``\I[129]\I[135]\I[139]``）没被减掉 ⇒
+    n-gram ``']\I['``、``'\I[1'`` 命中 ≥3 次 ⇒ **误报复读**，
+    整条被判致命、译文清空。
+
+    实测这类误报在这个游戏里是 **13 条**，全部是长得完全正确的译文
+    （`Actors.json` 的角色 profile，含武器/护甲图标码）。
+
+    修法：两侧都去掉**掩码记号 + 引擎转义码**，只比较真实文字。
+    这样"两侧括号不同但文字相同"的误报消失，
+    而"译文里真实文字反复出现"的真复读照旧抓得到。
+    """
+    return strip_placeholders(_MASK_MARK_RE.sub("", text or ""))
+
+
 def check_repetition(source: str, target: str) -> list[str]:
-    """检测模型复读。
+    r"""检测模型复读。
 
     本地小模型（尤其没设 ``repeat_penalty`` 时）会把同一短语吐很多遍。
     这是**不可修复**的故障，必须判致命 —— 写回游戏会得到一屏"重复重复重复"。
 
     关键：**先减掉原文里本来就有的重复**。原文如果自己就写了
     "no no no"，译文重复同样的词是正常翻译，不该误报。
+
+    两侧都先过 :func:`_repeat_view` —— 理由见那里的说明
+    （掩码记号与引擎转义码的形态差异会造出**假复读**）。
     """
-    src_grams = set(_repeated_ngrams(strip_placeholders(source), min_hits=2))
-    hits = _repeated_ngrams(target)
+    src_grams = set(_repeated_ngrams(_repeat_view(source), min_hits=2))
+    hits = _repeated_ngrams(_repeat_view(target))
     novel = [g for g in hits if g not in src_grams]
     if not novel:
         return []

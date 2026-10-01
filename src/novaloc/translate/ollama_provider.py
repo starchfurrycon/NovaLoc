@@ -314,6 +314,21 @@ class OllamaTranslationProvider:
             self.stats["recovered_json"] += 1
             log.debug("批 %d 通过 %s 级恢复解析", len(batch_items), res.method)
 
+        # ★ 越界编号必须删掉，**而且**要把"越界"当成"这条没译"。
+        #
+        # 实测模型会在批响应里给出**本批不存在的编号**
+        # （例如本批 2 条却回了 `{"0": ..., "2": ...}`）。
+        # 早先只做 `missing = [i for i in expect if i not in mapping]`，
+        # 越界编号根本不参与判断；而它又占着一个键，于是
+        # 真正缺的那条不会被发现 —— 补漏逻辑**静默跳过**。
+        #
+        # 现在把越界编号直接剔除，让对应的真实编号落进 `missing`。
+        n_expect = len(batch_items)
+        out_of_range = [i for i in mapping if not (0 <= i < n_expect)]
+        for i in out_of_range:
+            log.debug("批响应里有越界编号 %r（本批只有 %d 条），丢弃", i, n_expect)
+            del mapping[i]
+
         missing = [i for i in expect if i not in mapping]
         if missing:
             log.debug("批次漏了 %d 条：%s", len(missing), missing[:10])
@@ -361,37 +376,53 @@ class OllamaTranslationProvider:
             user, system=prompts.SYSTEM_PROMPT, n_items=1, src_chars=len(masked or "")
         )
         mapping, res = parse_translations(raw, expect_indices=[0])
-        # ⚠️ 这里的类型处理**必须**分三步走，顺序不能调换。
+        # ⚠️ 这里的处理**必须**认得出"模型按批格式回答单条请求"这一形态。
         #
-        # 背景（实测，见 `tests/README.md` 第 43 条）：模型对单条请求
-        # 回 `{"t": ["译文", ""]}` —— 把一句话切成了数组。
-        # `parse_translations` 会摊成 `{0: '译文', 1: ''}`，于是：
+        # ## 实测形态（真实游戏，ITEM_DESC）
         #
-        #   * `mapping[0]` 是**合法字符串** ⇒ 类型检查抓不到，
-        #     结果是**静默丢掉后半句**（这比报错危险得多）；
-        #   * 早先版本更早的写法直接 `return mapping[0]`，
-        #     当值真是 list 时会带到下游抛 `AttributeError`，
+        #     源文  'A girl who grew up in the Kingdom of Bohelos. Not very athletic.\n
+        #             Weapon Type: \C[6]Sword\C[0]'
+        #     输出  {"t": [{"i": 0, "t": "来自博赫洛斯王国的女孩。并不擅长运动。"},
+        #                  {"i": 1, "t": "武器类型：剑"}]}
+        #
+        # 模型把**原文里的换行**当成了"两条独立文本"，于是按**批**的格式
+        # 编号回答（`{"i": n, "t": ...}`），而 `parse_translations` 会把它
+        # 摊成 `{0: ..., 1: ...}`。
+        #
+        # 这时候：
+        #   * `mapping[0]` 是**合法字符串**（类型检查抓不到）；
+        #   * 若只取 `mapping[0]` ⇒ **静默丢掉第二行**；
+        #   * 若像早先那样看到 list 就带下去 ⇒ 下游抛 `AttributeError`，
         #     被 `except ProviderError` 漏掉 ⇒ **重试静默失效**。
         #
-        # 三步顺序：
-        #   ① 先把"唯一非空片段"还原成一句（实测最常见的形态，
-        #      拼起来正好是完整译文，丢掉可惜）；
-        #   ② 再拦"多个**非空**片段"（拼接语义不明，绝不能只取第一个）；
-        #   ③ 最后拦纯类型错误。
-        # 把 ② 放在 ① 前面会把 `["译文", ""]` 也误杀（编号 1 存在但为空）。
+        # ## 正确处理
+        #
+        # 按**编号顺序**把各段接起来（编号是模型自己给的顺序信息，
+        # 用它比用字典插入顺序可靠）。这个动作**不丢任何内容**，
+        # 比"只取第一段"和"整条拒收"都好。
+        #
+        # ⚠️ 但**只在编号连续、且都从 0 开始时**才敢接 ——
+        # 编号有洞说明模型自己都没弄清段落边界，那种情况照旧拒收。
+        keys = sorted(mapping)
+        joins = isinstance(mapping.get(0), str)
+        if joins and len(keys) > 1:
+            if keys != list(range(len(keys))):
+                raise ProviderError(
+                    f"单条翻译返回的编号不连续（{keys}）：段落边界不明，拒绝拼接。"
+                    f"原文：{masked[:80]!r}"
+                )
+            if not all(isinstance(mapping[k], str) for k in keys):
+                raise ProviderError(
+                    f"单条翻译返回了非字符串片段：{ {k: type(mapping[k]).__name__ for k in keys} }"
+                )
+            joined = "\n".join(mapping[k].strip() for k in keys)
+            log.debug("单条请求收到批格式多段响应，按编号拼接：%r", mapping)
+            return joined
         parts = [
             v for v in mapping.values() if isinstance(v, str) and v.strip()
         ]
         if len(parts) == 1 and all(isinstance(v, str) for v in mapping.values()):
-            if len(mapping) > 1:
-                log.debug("单条结果被模型回成了数组，已取唯一非空片段：%r", mapping)
             return parts[0]
-        if len(parts) > 1:
-            raise ProviderError(
-                f"单条翻译返回了 {len(parts)} 个非空片段：模型把一句话切成了数组，"
-                f"拼接语义不明，拒绝只取第一个（那会静默丢掉后半句）。"
-                f"原文：{masked[:80]!r}"
-            )
         if res.ok and isinstance(res.value, str):
             return res.value
         # 有些模型即使要求 JSON 也只给纯文本，当译文用

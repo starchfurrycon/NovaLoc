@@ -60,11 +60,11 @@ class _FakeItem:
         '{"t": {"nested": "obj"}}',
         '{"t": 123}',
         '{"t": null}',
-        # 多个非空片段：无法判断该怎么拼，宁可失败也不猜
-        '{"t": ["第一段", "第二段"]}',
+        # 编号**有洞**：模型自己都没弄清段落边界 ⇒ 不许猜
+        '{"0": "第一段", "2": "第三段"}',
     ],
 )
-def test_call_single_rejects_non_string(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+def test_call_single_rejects_unusable_shapes(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
     """★ 拼不出唯一一句的非字符串值必须在**边界处**被拦住，不许带下去。
 
     带下去的后果不是"报错"，而是**下游抛异常 + 重试静默失效**。
@@ -75,13 +75,44 @@ def test_call_single_rejects_non_string(monkeypatch: pytest.MonkeyPatch, raw: st
         prov._call_single(_FakeItem(src), src)
     msg = str(ei.value)
     # 错误信息必须说清是"类型/拼接"问题（而不是一个下游的 AttributeError）
-    assert any(k in msg for k in ("非空片段", "不是字符串", "多个条目")), (
+    assert any(k in msg for k in ("不连续", "非字符串", "失败")), (
         f"报错信息应说明类型/拼接问题，实际：{msg!r}"
     )
 
 
+def test_call_single_joins_numbered_segments(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""★ 实测形态：模型把**原文里的换行**当成"两条独立文本"，
+    于是对单条请求回了**批格式**、带编号的答案。
+
+    ```
+    源文  'A girl who grew up in the Kingdom of Bohelos. Not very athletic.\n
+            Weapon Type: \C[6]Sword\C[0]'
+    输出  {"t": [{"i": 0, "t": "来自博赫洛斯王国的女孩。并不擅长运动。"},
+                 {"i": 1, "t": "武器类型：剑"}]}
+    ```
+
+    `parse_translations` 摊成 `{0: ..., 1: ...}`。此时：
+
+    * 只取 `mapping[0]` ⇒ **静默丢掉第二行**；
+    * 整条拒收 ⇒ 白丢一条本来完全可用的译文。
+
+    正确做法是**按编号顺序接起来** —— 编号是模型自己给的顺序信息，
+    比字典插入顺序可靠，而且**不丢任何内容**。
+    """
+    prov = _make_provider(
+        monkeypatch,
+        '{"t": [{"i": 0, "t": "来自博赫洛斯王国的女孩。"}, {"i": 1, "t": "武器类型：剑"}]}',
+    )
+    out = prov._call_single(_FakeItem("x"), "x")
+    assert isinstance(out, str), f"必须返回 str，实际 {type(out).__name__}"
+    # 两段都要在，且按编号顺序
+    assert "来自博赫洛斯王国的女孩。" in out
+    assert "武器类型：剑" in out
+    assert out.index("来自") < out.index("武器类型")
+
+
 def test_call_single_joins_single_fragment_array(monkeypatch: pytest.MonkeyPatch) -> None:
-    """★ 实测形态：模型把**一句话**切成数组，且只有一个非空片段。
+    """实测形态：模型把**一句话**切成数组，且只有一个非空片段。
 
     `{"t": ["清晨，油灯被点亮了。", ""]}` —— 拼起来正好是完整译文。
     丢掉可惜，所以接受；但**只在这一个片段非空时**接受。
@@ -89,7 +120,7 @@ def test_call_single_joins_single_fragment_array(monkeypatch: pytest.MonkeyPatch
     prov = _make_provider(monkeypatch, '{"t": ["清晨，油灯被点亮了。", ""]}')
     out = prov._call_single(_FakeItem("x"), "x")
     assert isinstance(out, str), f"必须返回 str，实际 {type(out).__name__}"
-    assert out == "清晨，油灯被点亮了。"
+    assert out.strip() == "清晨，油灯被点亮了。"
 
 
 def test_call_single_accepts_valid_string(monkeypatch: pytest.MonkeyPatch) -> None:
