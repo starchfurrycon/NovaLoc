@@ -156,3 +156,123 @@ def test_forward_inconsistency_still_reported(tmp_path: Path) -> None:
     ])
     assert issues, "同一原文两种译法应该照旧报出来"
     assert any(i.get("severity") == "warn" for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# 收紧判据：只查 **ASCII 缩写**，不查语气词 / 短句 / 简繁变体
+# ---------------------------------------------------------------------------
+#
+# ## 事故：这条判据在真实数据上**误报 59 组**，而且是 ERROR 级
+#
+# 在一份 29,792 条的真实游戏上跑质检，得到 786 个问题，其中
+# **唯一的一个 error** 就是这条规则，命中 59 组：
+#
+#     '操…' / '等等…'                    → '喂…'
+#     'Eh?/为什么？/什么事？/什么？/啊？'   → '怎么了？'
+#     '*脸红*' / '*臉紅*'                 → '脸红'
+#     '你是誰？' / '你是谁？'               → '你是谁？'
+#     '再見！' / '再见！'                   → '再见！'
+#
+# **没有一组是真问题。** 两类天然误报：
+#
+# 1. **语气词一对多**：`Eh?` `Hm?` `啊？` 译成"怎么了？"完全正确，
+#    中文里"嗯/唔/呃"本来都可对应 `Hm`。
+# 2. **简繁/全半角变体**：`你是誰？` 与 `你是谁？` 是**同一条目**的
+#    两种写法，本来就该译成同一个词 —— 这不是"不同标签撞词"。
+#
+# ## 为什么必须收紧，而不是"接受 59 组误报"
+#
+# ERROR 级判据会让质检整体 `ok=False`（实测就是这个 error 卡住了
+# `apply`）。而**一个永远在误报的判据只会教会人忽略质检** ——
+# 那比没有判据更糟，因为它同时消耗了"报告可信度"和"人的注意力"。
+#
+# ## 收紧的边界：形状，不是数字
+#
+# 缩写的形状是明确的：**纯 ASCII 字母数字**（可带 `_ + - . / %`），
+# 不含问号/波浪号/星号/汉字。所以判据从"长度 <= 4"改成
+# "长度 <= 4 **且形如缩写**"。
+#
+# **代价是刻意接受的**：`Hm` 与 `MP` 撞词这种"一个是缩写、一个是
+# 语气词"的情况不再报。换来的是这个判据在这一份真实数据上从
+# 59 组误报降到 0 组，同时仍然抓住它本来要抓的 `HP`/`MP`。
+
+#: 真实数据上被误报的 59 组里挑出来的代表（**全都不是错译**）
+_FALSE_POSITIVES_FROM_REAL_DATA: list[tuple[str, str]] = [
+    # 语气词一对多
+    ("Eh?", "怎么了？"), ("Hm?", "怎么了？"), ("啊？", "怎么了？"),
+    ("嗯？", "怎么了？"), ("什么？", "怎么了？"), ("¿Eh?", "喂？"),
+    ("操…", "喂…"), ("等等…", "喂…"), ("呃！", "哎呀！"),
+    ("天哪！", "哎呀！"), ("呃！", "哎！"), ("誒！", "哎！"),
+    # 简繁 / 全半角变体（同一条目的两种写法）
+    ("你是誰？", "你是谁？"), ("你是谁？", "你是谁？"),
+    ("再見！", "再见！"), ("再见！", "再见！"),
+    ("*脸红*", "脸红"), ("*臉紅*", "脸红"),
+    ("該死…", "该死的…"), ("该死…", "该死的…"),
+    # 中文原文的标点变体
+    ("但是…", "但是..."), ("不过……", "不过..."),
+]
+
+
+def test_real_data_false_positives_are_not_flagged(tmp_path: Path) -> None:
+    """真实数据上误报过的 22 组，现在一组都不能报。
+
+    这条是这次收紧的**回归钉子** —— 判据放宽（或有人"顺手"把
+    `_ASCII_LABEL_RE` 那段去掉）就会立刻变红。
+    """
+    issues = _consistency_issues(tmp_path, _FALSE_POSITIVES_FROM_REAL_DATA)
+    errors = [i for i in issues if i.get("severity") == "error"]
+    assert not errors, (
+        f"这些是语气词/简繁变体，不是错译，不该报 ERROR："
+        f"{[i.get('message') for i in errors]}"
+    )
+
+
+def test_ascii_abbreviations_are_still_flagged(tmp_path: Path) -> None:
+    """收紧之后，**真正的 UI 缩写碰撞**仍必须报出来。
+
+    这是"放宽判据"必须配的那一半 —— 只测"不报了"会掩盖判据被彻底关掉。
+    """
+    issues = _consistency_issues(tmp_path, [
+        ("HP", "生命值"),
+        ("MP", "生命值"),          # 缩写撞词 → 必须报
+        ("ATK", "攻击力"),
+        ("DEF", "攻击力"),         # 缩写撞词 → 必须报
+        ("EXP", "经验值"),
+    ])
+    errors = [i for i in issues if i.get("severity") == "error"]
+    assert errors, "真缩写碰撞被放宽掉了，判据等于失效"
+    msg = " ".join(i.get("message", "") for i in errors)
+    assert "MP" in msg and "HP" in msg, f"应报出 HP/MP：{msg}"
+    assert "DEF" in msg and "ATK" in msg, f"应报出 ATK/DEF：{msg}"
+
+
+def test_abbreviation_with_punctuation_counts(tmp_path: Path) -> None:
+    """带下标点/百分号的缩写仍算缩写（`HP%`、`ATK+`、`E.G.`）。
+
+    形状判据不能窄到把真实标签漏掉 —— 这些在真实游戏里很常见。
+    """
+    issues = _consistency_issues(tmp_path, [
+        ("HP%", "生命值%"),
+        ("MP%", "生命值%"),
+    ])
+    assert any(i.get("severity") == "error" for i in issues), (
+        "带 % 的缩写应该照旧算缩写"
+    )
+
+
+def test_simplified_traditional_variant_is_not_a_collision(tmp_path: Path) -> None:
+    """简繁变体是**同一条目的两种写法**，不是"不同标签"。
+
+    这条单独钉出来，因为它在真实数据里出现了 20+ 次，
+    是 59 组误报里占比最大的一类。
+    """
+    issues = _consistency_issues(tmp_path, [
+        ("训练？", "训练？"),
+        ("訓練？", "训练？"),
+        ("骨頭…", "骨头…"),
+        ("骨头……", "骨头…"),
+    ])
+    assert not [i for i in issues if i.get("severity") == "error"], (
+        "简繁变体不该报 ERROR"
+    )
+

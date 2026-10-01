@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -36,6 +37,14 @@ SHORT_KINDS = {
 
 #: 没有实际语义、不该要求"翻译结果必须不同"的串
 _TRIVIAL = {"ok", "hp", "mp", "tp", "exp", "lv", "id", "no", "yes", "→", "←", "↑", "↓"}
+
+#: **UI 缩写**的形状：纯 ASCII 字母数字（可带 `_ + - . / %`）。
+#:
+#: 用于"反向碰撞"判据 —— 只有缩写撞词才是真缺陷。
+#: 语气词（`Eh?` `Hm?`）、短句（`你是谁？`）、简繁变体（`你是誰？`）
+#: 都会在真实数据上造成大量误报，必须排除在外。
+#: 详见 `qa_report` 里"反向碰撞"那一段的说明。
+_ASCII_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+\-./%]*$")
 
 
 def _issue(severity: Severity, stage: str, message: str, **detail: Any) -> dict[str, Any]:
@@ -150,7 +159,32 @@ def run_qa(ws: Workspace, ctx: Context) -> dict[str, Any]:
     # 语义几乎必然互不相同，撞成同词基本等于错译。长句撞词可能是正常的
     # 同义表述，所以不查，避免用规则压住合理的翻译自由度。
     #
-    # 判为 ERROR 而不是 WARN：撞词的短标签**一定**是用户可见的缺陷，
+    # ## 还要再收一层：只查 **ASCII 缩写**
+    #
+    # 原先只按"长度 <= 4 且无空格"筛，在真实数据上**误报 59 组**：
+    #
+    #     '操…' / '等等…'              → '喂…'
+    #     'Eh?/为什么？/什么事？/什么？/啊？' → '怎么了？'
+    #     '*脸红*' / '*臉紅*'           → '脸红'
+    #     '你是誰？' / '你是谁？'         → '你是谁？'
+    #
+    # 这些**全都不是错译**，是这个判据的两类天然误报：
+    #
+    # 1. **语气词/短句**：`Eh?` `Hm?` `啊？` 译成"怎么了？"完全正确。
+    #    短感叹词本来就一对多 —— 中文里"嗯/唔/呃"都可对应 `Hm`。
+    # 2. **简繁+全半角变体**：`你是誰？` 与 `你是谁？` 是**同一条目**的
+    #    两种写法，本来就该译成同一个词。
+    #
+    # 这条判据**本来要抓的**是 UI 缩写（原始事故：把 `MP` 译成"生命值"，
+    # 应为"魔法值"）。缩写的形状很明确：**纯 ASCII 字母数字**，
+    # 不含问号/波浪号/星号/汉字。所以只保留"至少两个不同的 ASCII 缩写
+    # 撞到同一个译文"的组。
+    #
+    # 代价：`Hm` 与 `MP` 撞词这种"一个是缩写、一个是语气词"的情况不再报。
+    # 这是**刻意的取舍** —— 报出来的 59 组里没有一组是真问题，
+    # 一个永远在误报的 ERROR 级判据只会让人学会忽略质检。
+    #
+    # 判为 ERROR 而不是 WARN：**真**撞词的短标签一定是用户可见的缺陷，
     # 不存在"这样也可以"的解释空间。
     _COLLIDE_MAX_LEN = 4
     by_target: dict[str, set[str]] = defaultdict(set)
@@ -160,13 +194,15 @@ def run_qa(ws: Workspace, ctx: Context) -> dict[str, Any]:
             continue
         if len(src) > _COLLIDE_MAX_LEN or " " in src:
             continue  # 只查 UI 短标签
+        if not _ASCII_LABEL_RE.match(src):
+            continue  # 只查缩写（语气词/短句/简繁变体一律跳过）
         by_target[tgt].add(src)
     collisions = {t: sorted(s) for t, s in by_target.items() if len(s) > 1}
     if collisions:
         sample_c = [{"target": t, "sources": s} for t, s in list(collisions.items())[:10]]
         issues.append(_issue(
             Severity.ERROR, "consistency",
-            f"{len(collisions)} 个译文被多个不同的短标签共用（缩写很可能译错）："
+            f"{len(collisions)} 个译文被多个不同的 UI 缩写共用（很可能译错）："
             + "；".join(f"{t} ← {'/'.join(s)}" for t, s in list(collisions.items())[:5]),
             samples=sample_c,
         ))
