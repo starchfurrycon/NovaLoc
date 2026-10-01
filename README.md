@@ -86,7 +86,7 @@ NovaLoc 把这个环节做成了一道**必须先通过的检查**：
 |---|---|---|
 | **RPG Maker MV / MZ** | ✅ 完整 | `data/*.json` 全库（角色/道具/技能/敌人/状态/图块/系统术语）+ 地图事件指令（对白、选项、说话人名） |
 | **Ren'Py** | ✅ 完整 | `.rpy` 对白、菜单选项、角色名、`config.name` 等 |
-| **Unity** | ⚠️ 部分 | `StreamingAssets` 与 `*_Data` 下的明文 json/csv/txt/xml/po/ini。**序列化资源与 AssetBundle 不支持**（见下） |
+| **Unity** | ⚠️ 部分 | 明文文本资源；序列化资源里的文案**只读提取**（`unity-strings`）。**改写序列化资源与 AssetBundle 不支持**（见下） |
 | **散装文件** | ✅ 完整 | 一个文件夹里的图片或文本 —— 任何引擎的兜底方案 |
 
 ### 关于 Unity 的诚实说明
@@ -96,11 +96,58 @@ AssetBundle，甚至编译进 `Assembly-CSharp.dll`。
 **我们不会去盲写这些二进制格式** —— 盲写几乎必然破坏资源，
 而且失败时表现为"游戏打不开"，用户根本查不出原因。
 
+#### 但"不写"不等于"什么都做不了"
+
+```bash
+novaloc unity-strings "D:\Games\SomeUnityGame"
+```
+
+这条命令**只读**扫描 `*_Data` 下的序列化资源（`level*`、`*.assets`），
+把里面的候选文案连**文件名和偏移量**一起导成 CSV：
+
+```csv
+file,offset,confidence,reason,source,target
+level0,1006896,0.85,多词文本,Would you like to save?,
+level0,1103064,0.85,多词文本,"Quit to the Main Menu. \nAny unsaved progress will be lost.",
+```
+
+你拿着这份清单去 [UABEA](https://github.com/nesrak1/UABEA) 或
+[AssetStudio](https://github.com/Perfare/AssetStudio) **按偏移量精确定位**
+并改写，或者把那两个工具导出的 TextAsset 交给 NovaLoc 的
+**散装文件模式**处理。
+
+**全程不修改游戏目录里任何一个字节**（只读契约有测试守着）。
+
+实测一个真实 Unity 游戏（1329 MB 资源）：提出 **281 条**去重候选，
+包含全部 UI 文案（`Would you like to save?`、
+`Select Location to Teleport.`、`THANK YOU FOR YOUR SUPPORT!`）、
+菜单/状态词（`Options`、`Status`）和贴图上的日文技能名。
+
+**精度是有限的、而且是刻意偏保守的。** 同一个游戏里还有大量
+动画状态名和资源名（`AdvanceFront`、`Tile_4_Bottom`），
+它们**不在**清单里 —— 但清单里仍有约三成是引擎符号。
+理由见下一节。
+
+#### 为什么宁可混进噪音，也不从严
+
+早先的版本判据很严，只报 28 条 —— **看着干净，但把
+`Options`、`Game Over`、`Save Game` 这类最常见的菜单文案全漏了**。
+
+这件事的代价不对称：
+
+* 多收几条噪音 ⇒ 人扫一眼就能剔掉；
+* 漏掉按钮文案 ⇒ 用户以为"这工具没找到东西"，然后放弃。
+
+所以判据**偏保守**：先保证真实文案不漏，再尽量减少噪音。
+排掉噪音的手段是**形态判据**（资源名分隔符 `--`/`__`、
+PascalCase 的类名），不是"猜哪些词不算文案" ——
+形态判据对**没见过的**资源名同样有效，黑名单不行。
+
 正确做法是：用 [UABEA](https://github.com/nesrak1/UABEA) 或
 [AssetStudio](https://github.com/Perfare/AssetStudio) 把 TextAsset
 **导出**成普通文件，然后用 NovaLoc 的**散装文件模式**处理。
 NovaLoc 在扫描 Unity 工程时会明确告诉你检测到了多少个未处理的
-序列化资源，并给出这个建议 —— 而不是假装全都翻好了。
+序列化资源、以及里面大约有多少条候选文案 —— 而不是假装全都翻好了。
 
 #### Unity 的字体这道坎（必须知道）
 
@@ -291,7 +338,16 @@ novaloc run <id> --stage apply
   OCR 会失败；这种情况下工具会保留原图并在报告里标出来，不会乱画。
 - **复杂背景的去字依赖 LaMa**（可选，需要 torch）。没装 torch 时
   退化为纯色填充 / Telea 修补，在渐变或照片背景上会留痕。
-- **Unity 序列化资源不支持**（见上文）。
+- **Unity 序列化资源只能"只读提取"，不能改写**（见上文）。
+  `novaloc unity-strings` 会给出候选文案的文件名与偏移量清单，
+  但改写必须用 UABEA / AssetStudio —— 盲写会让游戏打不开。
+- **Unity 的候选清单精度有限，且刻意偏保守。** 实测 281 条里
+  约七成是真实文案，其余是引擎符号（动画状态名、资源名），
+  需要人工扫一眼。这是**有意的取舍**：从严会让
+  `Options`/`Game Over` 这类最常见的菜单文案一起消失，
+  而漏掉按钮文案比混进噪音代价大得多。
+- **`Assembly-CSharp.dll` 里的字符串常量不支持** —— 那是编译产物，
+  要改得反编译重打包，超出本工具范围。
 - **只有 `.rpyc` 没有 `.rpy` 的 Ren'Py 发行版无法处理** —— 编译产物
   改了游戏也不认。工具会明确报告而不是假装成功。
 - OCR 会把紧凑的英文标题切碎（例如 `NEW GAME` 可能被切成 `NEW` 和 `V GAME`）。
@@ -317,7 +373,7 @@ novaloc run <id> --stage apply
 ```powershell
 pip install -e ".[dev]"
 
-# 全量测试（63 个套件 / 907 个 pytest 项，约 4 分钟）
+# 全量测试（65 个套件 / 992 个 pytest 项，约 4 分钟）
 pytest tests -q
 
 # 单个套件也能直接当脚本跑，输出带实测数字的分节报告
