@@ -153,7 +153,23 @@ class OllamaVisionEngine:
 
         prompt = VISION_READ_PROMPT
         if hint:
-            prompt = f"{prompt}\n\n补充线索：{hint}"
+            # ▲ `hint` 只作**信息**补充，绝不能重复/覆盖输出格式要求。
+            #
+            # 贴图兜底传的是 `"这是游戏贴图里的文字，请只输出文字本身"` ——
+            # 它和 `VISION_READ_PROMPT` 的"逐行原样列出"是**两条互斥的
+            # 指令**。本机实测（`qwen3-vl:4b`，同一张 `Loading.png`）：
+            #
+            #   * 不带 hint ⇒ 8.1 秒、441 token、`done_reason=stop`、
+            #     正确读出 `'Now Loading...\\n-Demons Roots-'`；
+            #   * 带 hint   ⇒ **17.9 秒**、**1024 token 全部耗在 thinking 里**、
+            #     `done_reason=length`、`content` 是**空串**（三次重复完全一致）。
+            #
+            # 配上 `ocr.vlm_timeout_s` 默认 20 秒 ⇒ 每次都在超时边缘 ⇒
+            # 只要稍慢一点就返回空 ⇒ 连续 3 次熔断整个视觉兜底。
+            # **这才是"视觉兜底超时"的真正原因**（不是模型慢）。
+            #
+            # 所以把"要什么格式"交给提示词本身，hint 只做场景说明。
+            prompt = f"{prompt}\n\n（场景：{hint}）"
 
         try:
             raw = self._chat_vision(prompt, image, read_timeout=timeout_s)
@@ -205,7 +221,12 @@ class OllamaVisionEngine:
             "model": self._model,
             "messages": [{"role": "user", "content": prompt, "images": [_png_b64(image)]}],
             "stream": False,
-            "options": {"temperature": 0.0},
+            # ▲ 必须关掉思考。`qwen3-vl:4b` 是推理模型，会把推理过程
+            #   放进 `message.thinking`，而 `message.content` 一直是空串。
+            #   实测同一张图：不设 `think` ⇒ 生成到 `num_ctx`(8192) 才停，
+            #   耗时 **55 秒**且 `content=''`；设 `think: false` ⇒ 正常出结果。
+            "think": False,
+            "options": {"temperature": 0.0, "num_predict": self._vision_max_tokens()},
         }
         timeout = httpx.Timeout(
             connect=5.0,
@@ -219,6 +240,40 @@ class OllamaVisionEngine:
             data = r.json()
         msg = data.get("message") or {}
         return str(msg.get("content") or "")
+
+    def _vision_max_tokens(self) -> int:
+        """视觉读字的输出上限。
+
+        ## 为什么必须设上限
+
+        `ollama.num_predict` 对本地模型默认**不设上限**，于是推理模型会一路
+        生成到 `num_ctx`。实测 `qwen3-vl:4b` 读一张 389x57 的小裁剪：
+        生成 3009 个 token、`done_reason='length'`、**55 秒**、
+        而且 `content` 是**空串**（全在 `thinking` 里）。
+
+        配上 `ocr.vlm_timeout_s` 默认 20 秒，结果就是**每个低置信块都超时**、
+        每次都返回空 ⇒ 连续 3 次触发熔断 ⇒ 整个视觉兜底被静默关闭。
+        日志里只说"视觉兜底连续失败 3 次"，看不出真正原因是"没设上限"。
+
+        ## 为什么是 1024
+
+        纯文本提示词实测 3～4 秒出结果、`done_reason='stop'`，输出本身只有
+        几十个 token；余量留给"文字确实很多"的贴图（`IconSet` 那种
+        一屏几十个词的）。上限的作用是**兜住异常**，不是限制正常输出。
+        """
+        # 配置项在 `OcrConfig` 里（和 `vlm_timeout_s` / `vlm_max_per_image`
+        # 这些"视觉兜底预算"放一起），不在 `OllamaConfig` 里 ——
+        # 这是**调用侧**预算，不是 Ollama 客户端的属性。
+        for section in (getattr(self.cfg, "ocr", None), getattr(self.cfg, "ollama", None)):
+            if section is None:
+                continue
+            try:
+                v = int(getattr(section, "vision_max_tokens", 0) or 0)
+            except Exception:  # noqa: BLE001
+                v = 0
+            if v > 0:
+                return v
+        return 1024
 
 
 def _extract_text(raw: str) -> str:

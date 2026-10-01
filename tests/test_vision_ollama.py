@@ -130,6 +130,185 @@ def test_timeout_field_name_is_right() -> None:
 
 
 # ----------------------------------------------------------------------
+# ★ 视觉兜底"每次都超时"的真正原因：三条互相冲突的指令
+# ----------------------------------------------------------------------
+
+
+def test_hint_does_not_impose_an_output_format() -> None:
+    r"""★ `hint` 只能补充**场景**，不能规定**输出格式**。
+
+    ## 实测证据（`qwen3-vl:4b`，同一张 `Loading.png`）
+
+    ====================== ========= ======== ============ ==================
+    调用方式                耗时      eval      done_reason  content
+    ====================== ========= ======== ============ ==================
+    不带 hint               **8.1s**  441      stop         ``'Now Loading…'``
+    带 hint（旧行为）        **17.9s** **1024** length       **``''``**
+    ====================== ========= ======== ============ ==================
+
+    三次重复完全一致。旧 hint 是
+    ``"这是游戏贴图里的文字，请只输出文字本身"``，而提示词要求
+    "逐行原样列出" —— 两条互斥的指令让模型陷入思考循环，
+    `num_predict` 全部烧在 `thinking` 里，`content` 是空串。
+
+    而 `ocr.vlm_timeout_s` 默认 20 秒 ⇒ 每次都在超时边缘 ⇒
+    连续 3 次失败即熔断 ⇒ **整个视觉兜底被静默关闭**，
+    日志只说"连续失败 3 次"，看不出真正原因。
+
+    所以这里钉住的是**形状**：hint 被包在场景说明里，
+    而不是用"补充线索：<命令>"直接追加。
+    """
+    src = inspect.getsource(sys.modules["novaloc.translate.vision_ollama"])
+    # 旧写法（把 hint 当成追加的命令）不许回来
+    assert "补充线索：" not in src, (
+        "hint 又被当成了一条规定输出格式的命令 —— 这会让模型陷入"
+        "思考循环、content 变空串，实测 17.9 秒零结果"
+    )
+    # 新写法必须把 hint 明确标成"场景"
+    assert "（场景：" in src
+
+    # 调用方传来的 hint 也不许再规定输出格式。
+    # 注意：注释里会引用那句旧 hint 作为反例，所以只看**代码行**，
+    # 不能对整份源码做子串匹配（第一版就是这么误报的）。
+    from novaloc.images import service as img_service
+
+    code_lines = [
+        ln.split("#", 1)[0]
+        for ln in inspect.getsource(img_service).splitlines()
+    ]
+    code_only = "\n".join(code_lines)
+    assert "请只输出文字本身" not in code_only, (
+        "贴图兜底的 hint 又不能规定输出格式了（见本测试的实测数据）"
+    )
+
+
+def test_vision_call_caps_num_predict_and_disables_thinking() -> None:
+    r"""★ 视觉调用必须有 ``num_predict`` 上限并关掉思考。
+
+    不设上限时，推理模型会一路生成到 ``num_ctx``：实测
+    **55 秒 / 3009 token / ``done_reason='length'`` / ``content`` 是空串**。
+    配上 20 秒超时 ⇒ 必然超时 ⇒ 熔断。
+    """
+    from novaloc.translate.vision_ollama import OllamaVisionEngine
+
+    src = inspect.getsource(OllamaVisionEngine._chat_vision)
+    assert '"num_predict"' in src, "视觉调用没有 num_predict 上限"
+    assert '"think": False' in src, "视觉调用没有关掉思考"
+
+    # 上限可配，且默认值必须**存在**（0/负数回落到内置默认）
+    cfg = Config()
+    assert hasattr(cfg.ocr, "vision_max_tokens"), "缺少 ocr.vision_max_tokens 配置项"
+    assert cfg.ocr.vision_max_tokens > 0
+    engine = OllamaVisionEngine(Context(config=Config(), events=EventBus()))
+    assert engine._vision_max_tokens() == cfg.ocr.vision_max_tokens
+
+    # 显式设 0 时回落到内置默认（不能变成"无上限"）
+    bad = Config()
+    bad.ocr.vision_max_tokens = 0
+    e2 = OllamaVisionEngine(Context(config=bad, events=EventBus()))
+    assert e2._vision_max_tokens() == 1024
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "（图片中无文字，按要求输出空）",
+        "图片中没有显示任何文字内容",
+        "There is no text in the image.",
+        "（无文字）",
+        "no text",
+        "[]",
+    ],
+)
+def test_no_text_meta_answers_are_rejected(answer: str) -> None:
+    r"""★ 模型"图里没文字"时的元回答**不能**写进贴图。
+
+    模型不会老实输出空串，而会回一句"（图片中无文字…）"。危险在于
+    这句的**字母数字占比 0.67、长度 15 字符**，
+    前三条判据（控制字符 / 字母数字占比 / 长度暴涨）**全部放行** ——
+    于是会被当成"更可信的读数"覆盖掉原本正确的 OCR 结果。
+    """
+    from novaloc.images.service import TextureTranslator, _is_no_text_marker
+
+    assert _is_no_text_marker(answer), f"没认出元回答：{answer!r}"
+    t = TextureTranslator(Context(config=Config(), events=EventBus()))
+    assert not t._vlm_answer_is_usable("Now Loading...", answer)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Now Loading...\n-Demons Roots-",
+        "NEW GAME",
+        "Level 3: HP!",
+        "Continue",
+    ],
+)
+def test_real_text_answers_are_still_accepted(answer: str) -> None:
+    """反向：真的贴图文字不许被元回答过滤器误杀。"""
+    from novaloc.images.service import _is_no_text_marker
+
+    assert not _is_no_text_marker(answer), f"误杀了真实文字：{answer!r}"
+
+
+def test_no_text_marker_only_fires_on_short_answers() -> None:
+    """长回答里出现 "no text" 多半是在**解释**，不该整个丢掉。"""
+    from novaloc.images.service import _is_no_text_marker
+
+    long_one = (
+        "There is no text in the image itself, but the small print at "
+        "the bottom reads Game Over and the button says Continue."
+    )
+    assert not _is_no_text_marker(long_one)
+
+
+def test_vlm_fallback_stays_off_by_default() -> None:
+    r"""★ 视觉兜底默认**关**，理由必须留在配置文档里。
+
+    ## 这条测试守的是"结论"，不是"代码"
+
+    这个默认值被改过两次，每次都因为**测量工具本身坏了**：
+
+    * 第一次的结论是"0 变好 / 1 持平 / 2 更差 / 其余读不出，每次 20～48 秒"
+      —— 但那次调用链有三个缺陷（JSON+bbox 提示词、互斥 hint、
+      没有 ``num_predict`` 上限），实测旧组合 **21.9 秒**已经超过
+      默认超时 20 秒 ⇒ **必然**返回空串。"读不出"是测量伪影。
+    * 修好工具后重测（真实 DemonsRoots，40 张 / 295 块）：
+      低置信块占 **26.4%**（``<0.8``），对 30 个块逐块重读得到
+      **变好 0 / 变差 0 / 持平 3 / 闸门拒 16 / 空 11**，平均 13.4 秒/块。
+
+    **真正的理由是它会编造**：对照实验里，纯白 200x60、近白噪声、
+    极小 34x12 纯白都稳定输出 ``'Now Loading...\n-Demons Roots-'``
+    —— 那是本游戏加载画面上的字，**输入里根本没有**。只有真的写了
+    ``GAME OVER`` 的那张读对了。
+
+    所以：默认关，且文档里必须留着"它会编造"这个理由，
+    不能只留一句"效果不好"（那会让人以为调调参数就能救）。
+    """
+    from novaloc.core.config import Config
+
+    cfg = Config()
+    assert cfg.ocr.vlm_fallback is False, "视觉兜底被默认打开了"
+
+    # 理由必须写在**源码文档**里。
+    # 注意不能用 `model_fields[...].description` —— pydantic 不会把
+    # 字段的 docstring 搬进 description（实测拿到的是空串），
+    # 所以直接读源码。
+    from novaloc.core import config as config_mod
+
+    src = inspect.getsource(config_mod)
+    seg = src[src.index("vlm_fallback: bool") : src.index("vlm_threshold: float")]
+    assert "编造" in seg, "配置文档里没写清真正原因（它会编造文字）"
+    assert "Now Loading" in seg, "配置文档里没有留下那条关键对照实验"
+    # 也要留下"第一次测量不可信"的记录，避免以后又照着旧数据下结论
+    assert "不可信" in seg or "测量伪影" in seg
+    # 预算类配置必须都在（它们和 vlm_timeout_s 是一组）
+    for field in ("vlm_threshold", "vlm_timeout_s", "vlm_max_per_image",
+                  "vlm_fail_limit", "vision_max_tokens"):
+        assert field in type(cfg.ocr).model_fields, f"缺少 {field}"
+
+
+# ----------------------------------------------------------------------
 # 输出解析
 # ----------------------------------------------------------------------
 

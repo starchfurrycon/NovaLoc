@@ -186,6 +186,57 @@ def _norm(s: str) -> str:
     return unicodedata.normalize("NFKC", str(s or "")).replace(" ", "").replace("\n", "").strip()
 
 
+#: VLM 在被问"图里有什么字"而图里**没字**时的元回答特征。
+#:
+#: 模型不会老老实实输出空串，而会回一句"（图片中无文字，按要求输出空）"
+#: 之类的话。本机实测（`qwen3-vl:4b`，一张纯装饰性的窗口皮肤）：
+#:
+#: * 中文提示词 ⇒ ``'（图片中无文字，按要求输出空）'``
+#: * 英文提示词 ⇒ ``'There is no text in the image.'``
+#:
+#: 危险在于句子的**字母数字占比高达 0.67、长度只有 15 个字符**，
+#: 于是 `_vlm_answer_is_usable` 的前三条判据（控制字符 / 字母数字占比 /
+#: 长度暴涨）**全部放行** —— 这句废话会被当成"更可信的读数"
+#: 覆盖掉原本正确的 OCR 结果，写进贴图里。
+_VLM_NO_TEXT_MARKERS = (
+    "无文字", "没有文字", "无任何文字", "不含文字", "未检测到文字",
+    "无文本", "没有文本", "图片中无", "图中无", "无法识别", "没有可识别",
+    # 实测 `qwen3-vl:4b` 在第 3 条提示词下回的是这一句 ——
+    # 它不含上面任何一个字串，所以必须单独列出。
+    "没有显示任何文字", "没有显示文字", "没有任何文字", "文字内容",
+    "no text", "no visible text", "there is no text", "contains no text",
+    "no readable text", "empty", "n/a", "none",
+)
+
+
+def _is_no_text_marker(answer: str) -> bool:
+    """这句回答是不是"图里没文字"的元回答？
+
+    刻意做得**保守**：只在回答很短（≤ 40 字符）且命中标记词时为真。
+    不能只看"包含 no text" —— 真实贴图上完全可能有 ``"NO TEXT"``
+    这样的按钮文字，长回答里出现这些词也多半是在解释而不是在报空。
+    """
+    import unicodedata
+
+    a = unicodedata.normalize("NFKC", str(answer or "")).strip()
+    if not a or len(a) > 40:
+        return False
+    low = a.lower()
+    for m in _VLM_NO_TEXT_MARKERS:
+        if m.isascii():
+            if m in low:
+                return True
+        elif m in a:
+            return True
+    # 纯包裹在括号/方括号里、且不含任何实义字符的短回答
+    return a[0] in "（(【[" and a[-1] in "）)】]" and not _has_alnum(a)
+
+
+def _has_alnum(s: str) -> bool:
+    """含 CJK 或拉丁字母/数字？"""
+    return any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in s)
+
+
 def _content(s: str) -> str:
     """只留"实义字符"：丢掉标点、空白、括号、符号。
 
@@ -388,7 +439,15 @@ class TextureTranslator:
         协议实现。所以先探测签名，别把协议外的关键字硬塞给所有实现
         （那样会让所有替身报 ``unexpected keyword argument``）。
         """
-        hint = "这是游戏贴图里的文字，请只输出文字本身"
+        # ▲ hint 必须**不指定输出格式** —— 输出格式由提示词管。
+        #
+        # 这里原来传的是 `"这是游戏贴图里的文字，请只输出文字本身"`，
+        # 而提示词里的要求是"逐行原样列出"。两条互相冲突的指令会让
+        # `qwen3-vl:4b` 陷入思考循环：实测同一张图，不带 hint 时
+        # 8.1 秒正常出结果，带 hint 时 **17.9 秒**、1024 token 全烧在
+        # thinking 里、`content` 是**空串**（三次重复完全一致）。
+        # 这正是"视觉兜底超时"的真正原因。现在只做**场景说明**。
+        hint = "这是一张游戏贴图的局部裁剪"
         if self._vlm_accepts_timeout(vlm):
             return str(vlm.read_text(crop, hint=hint, timeout_s=self._vlm_timeout_s()) or "")
         return str(vlm.read_text(crop, hint=hint) or "")
@@ -949,9 +1008,16 @@ class TextureTranslator:
            是 0.67），所以不会误杀像样的结果。
         3. 长度暴涨（超过原结果 3 倍且多于 6 字符）→ 不要。
            VLM 在"解释这张图"时会写整句话，那不是贴图上的文字。
+        4. **"图里没文字"这种元回答** → 不要。见 `_VLM_NO_TEXT_MARKERS`。
         """
         a = (answer or "").strip()
         if not a:
+            return False
+        # 判据 4（最先查）：元回答。
+        # 这一条必须**先**查 —— `'（图片中无文字，按要求输出空）'` 的
+        # 字母数字占比高达 0.67，长度也只有 15 个字符，前三条判据**全部放行**。
+        # 而它不是图里的文字，写进贴图就是一句废话盖住原本正确的 OCR 结果。
+        if _is_no_text_marker(a):
             return False
         # 判据 1：控制字符（换行除外）。
         # 注意：别用 `ch.isspace()` 来放行"空白" —— 制表符也是空白，
