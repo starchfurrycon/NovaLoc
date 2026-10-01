@@ -564,8 +564,37 @@ class RpgMakerAdapter(EngineAdapter):
 
         ``CommonEvents.json`` 是 ``list[dict]``（每个 dict 自带 ``list`` 键），
         而这里是 ``dict[场景名, list[指令]]`` —— **指令列表直接在顶层**，
-        没有中间的 ``"list"`` 包装。所以这里自己包一层再交给
-        :meth:`_commands_text`，复用同一套指令解析与指针规则。
+        没有中间的 ``"list"`` 包装。所以这里把指令列表**直接**交给
+        :meth:`_commands_text`，并告诉它"没有 list 那一层"
+        （``list_key=""``），复用同一套指令解析与指针规则。
+
+        ## ⚠️ 这里曾经生成过**回写不了的指针**（最严重的静默失效）
+
+        早先的写法是包一层再交出去：
+
+        .. code-block:: python
+
+            self._commands_text({"list": cmds}, fname, f"/{key}/list")
+
+        于是每条指针都带上了 `/list/`：
+
+            /1/list/0/parameters/0
+
+        但 `Scenario.json` 的真实结构里**没有 `list` 这个键**：
+
+        .. code-block:: javascript
+
+            {"1": [ {"code": 401, ...}, ... ]}     // 指令直接在数组里
+
+        `_set_pointer` 走到 `list` 这一段就找不到键、返回 False ⇒
+        **两万多条剧情对白一条都写不回去**。
+
+        更坏的是它**不报错**：`apply` 的 `files_written` 只在 `n > 0` 时
+        才自增，所以结果是"回写成功 0 个文件"，而阶段本身照样报完成。
+        玩家打开游戏：**菜单是中文，剧情全是原文。**
+
+        现在有一条硬闸门（`apply` 结尾）把这种情况直接判死，
+        不再让它以"成功"的面目流出去。
 
         场景名本身**不是文案**（实测是 `'1'`、`'00boheA_deai1'`、
         `'EV22'` 这类内部标识），所以**不**抽取，否则会多出上千条噪音。
@@ -577,7 +606,9 @@ class RpgMakerAdapter(EngineAdapter):
             if not isinstance(cmds, list):
                 continue
             # 场景名不抽（内部标识，不是文案）
-            out.extend(self._commands_text({"list": cmds}, fname, f"/{key}/list"))
+            # ★ `list_key=""`：这里没有 `list` 那一层，指针必须直接从
+            #   场景名接指令下标 —— 带上 `/list/` 就永远写不回去。
+            out.extend(self._commands_text(cmds, fname, f"/{key}", list_key=""))
         return out
 
     def _extract_common_events(self, obj: Any, fname: str) -> list[TextUnit]:
@@ -626,8 +657,20 @@ class RpgMakerAdapter(EngineAdapter):
                         )
         return out
 
-    def _commands_text(self, holder: Any, fname: str, base: str) -> list[TextUnit]:
+    def _commands_text(
+        self, holder: Any, fname: str, base: str, *, list_key: str = "list"
+    ) -> list[TextUnit]:
         """解析事件指令列表里的文本。
+
+        ``holder`` 是**装着指令的那个对象**，有两种形态：
+
+        * ``list[dict]`` —— 每个元素自带 ``"list"`` 键
+          （`Map*.json` 的 page、`CommonEvents.json` 的元素）；
+        * ``dict`` —— 指令直接挂在 ``"list"`` 键下。
+
+        ``list_key`` 指示"指令列表挂在哪"。默认 ``"list"``；
+        `Scenario.json` 的场景值是**裸数组**，既不是上面两种，
+        于是调用方直接传数组、并传 ``list_key=""``。
 
         RPG Maker 的指令列表有**两种**序列化形式，必须都认：
 
@@ -660,11 +703,15 @@ class RpgMakerAdapter(EngineAdapter):
         这是"静默失效"最严重的形态 —— 报告全绿，核心功能等于没做。
 
         字典形式下 ``parameters`` 是**具名键**，所以指针写成
-        ``.../list/{ci}/parameters/0``；:meth:`_set_pointer` 本来就支持
+        ``.../{ci}/parameters/0``；:meth:`_set_pointer` 本来就支持
         数字段当数组下标、非数字段当字典键，所以回写不需要改。
         """
         out: list[TextUnit] = []
-        lst = holder.get("list") if isinstance(holder, dict) else None
+        if list_key:
+            lst = holder.get(list_key) if isinstance(holder, dict) else None
+        else:
+            # 没有 `list` 那一层：holder 自己就是指令数组
+            lst = holder if isinstance(holder, list) else None
         if not isinstance(lst, list):
             return out
 
@@ -1125,6 +1172,17 @@ class RpgMakerAdapter(EngineAdapter):
             if u.uid in translations:
                 by_file.setdefault(u.location.file, []).append(u)
 
+        # ★ 硬闸门：有文件"想写但一条都没写进去"就判死。
+        #
+        # 真实事故：`Scenario.json` 的指针多了一层 `/list/`，而真实
+        # 结构里没有这个键，`_set_pointer` 全部返回 False。但
+        # `files_written` 只在 `n > 0` 时自增，于是结果是
+        # **"回写完成、写了 0 个文件"** —— 阶段报成功，游戏里剧情全是原文。
+        #
+        # 这种"全绿但什么都没做"的形态必须直接判死，不能只留 warning
+        # （warning 在几百行日志里没人会看）。
+        files_all_failed: list[str] = []
+
         # 写入目标必须落在**资源根**下（NW.js 布局是 out/www/data）。
         # `units` 是上一步从同一个根抽出来的，这里必须用同一套判定，
         # 否则每个文件都会"目标不存在，跳过" —— 那是最糟的失败方式：
@@ -1144,10 +1202,12 @@ class RpgMakerAdapter(EngineAdapter):
                 continue
 
             n = 0
+            attempted = 0
             for u in us:
                 text = translations[u.uid]
                 if not text:
                     continue
+                attempted += 1
                 pointers = [u.location.pointer, *u.location.siblings]
                 if len(pointers) > 1:
                     pieces = _split_across_slots(text, len(pointers))
@@ -1165,6 +1225,8 @@ class RpgMakerAdapter(EngineAdapter):
                 else:
                     res.warnings.append(f"定位失败：{fname}{u.location.pointer}")
 
+            if attempted and not n:
+                files_all_failed.append(fname)
             if n:
                 try:
                     target.write_text(
@@ -1176,6 +1238,18 @@ class RpgMakerAdapter(EngineAdapter):
                 except Exception as exc:  # noqa: BLE001
                     res.warnings.append(f"{fname} 写入失败：{exc}")
                     res.files_skipped += 1
+
+        if files_all_failed and res.files_written == 0:
+            shown = "、".join(files_all_failed[:5])
+            more = f" 等 {len(files_all_failed)} 个文件" if len(files_all_failed) > 5 else ""
+            res.error = (
+                f"回写全部失败：{shown}{more} 里的译文一条都没能定位到原文位置。"
+                f"这通常意味着**指针与文件真实结构不匹配**"
+                f"（例如多了一层不存在的键），不是数据问题。"
+                f"已中止，避免产出「看起来成功、剧情却全是原文」的游戏。"
+            )
+            res.ok = False
+            return res
 
         # 贴图：把重绘结果覆盖到 out 目录
         if rebuilt_images:

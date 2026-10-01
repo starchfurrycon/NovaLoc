@@ -329,6 +329,130 @@ def test_single_slot_returns_text_unchanged() -> None:
 
 
 # ----------------------------------------------------------------------
+# 二c、回写：合成后的译文必须**真的**落到每一个槽位
+# ----------------------------------------------------------------------
+
+
+def _game_with_scenario(tmp_path: Path, cmds: list) -> Path:
+    """造一个最小的 MV 游戏目录（只要有 www/data/Scenario.json）。"""
+    game = tmp_path / "game"
+    (game / "www" / "data").mkdir(parents=True)
+    (game / "www" / "data" / "Scenario.json").write_text(
+        json.dumps({"1": cmds}, ensure_ascii=False), encoding="utf-8"
+    )
+    return game
+
+
+def _apply_and_read(game: Path, tmp_path: Path) -> list:
+    """跑一次 apply，读回写后的 Scenario.json 命令列表。"""
+    ad = _adapter()
+    units, _rep = ad.extract_text(game)
+    assert units, "没抽出条目，测试夹具本身有问题"
+    # 说话人名等"不该被动"的位置，假译文原样返回原文 ——
+    # 这样"回写动了它们"就一定会被断言抓到。
+    tr = {
+        u.uid: _FAKE_TRANSLATION.get(
+            u.source,
+            u.source if u.kind.value == "character_name" else f"【译】{u.source}",
+        )
+        for u in units
+    }
+    res = ad.apply(game, tmp_path / "out", units, tr)
+    assert res.ok, res.error
+    assert res.files_written == 1, f"回写文件数应为 1，实际 {res.files_written}"
+    obj = json.loads(
+        (tmp_path / "out" / "www" / "data" / "Scenario.json").read_text(encoding="utf-8")
+    )
+    return obj["1"]
+
+
+_FAKE_TRANSLATION = {
+    "A magic device displays the \nsuffering of the slaves.": "一个魔法装置播放着\n奴隶们受苦的影像。",
+}
+
+
+def test_apply_writes_split_translation_to_every_slot(tmp_path: Path) -> None:
+    r"""★ 回写的**核心不变量**：合并后的译文要拆回每一个 401 槽位。
+
+    这是整个改动里风险最高的一步。如果只写了第一格，玩家会看到：
+
+        一个魔法装置播放着        ← 中文
+        suffering of the slaves.  ← 原文（没被替换）
+
+    比逐条翻译还糟（原来是两段中文，现在是一中一英）。
+    """
+    cmds = [
+        {"code": 401, "indent": 0, "parameters": ["A magic device displays the "]},
+        {"code": 401, "indent": 0, "parameters": ["suffering of the slaves."]},
+    ]
+    game = _game_with_scenario(tmp_path, cmds)
+    out_cmds = _apply_and_read(game, tmp_path)
+    got = [c["parameters"][0] for c in out_cmds]
+    assert got == ["一个魔法装置播放着", "奴隶们受苦的影像。"], got
+    # 原文一个字都不能留
+    assert "suffering" not in "".join(got), got
+
+
+def test_apply_never_duplicates_text_across_slots(tmp_path: Path) -> None:
+    r"""★ 反向：不能把整段译文往每一格都写一遍。
+
+    那会让消息框显示两遍同样的话。这个失败方式很隐蔽 ——
+    "每个槽位都有中文"看起来是成功的。
+    """
+    cmds = [
+        {"code": 401, "indent": 0, "parameters": ["A magic device displays the "]},
+        {"code": 401, "indent": 0, "parameters": ["suffering of the slaves."]},
+    ]
+    game = _game_with_scenario(tmp_path, cmds)
+    out_cmds = _apply_and_read(game, tmp_path)
+    got = [c["parameters"][0] for c in out_cmds]
+    joined = "".join(got)
+    assert joined.count("一个魔法装置播放着") == 1, f"译文被写了两遍：{got}"
+    assert joined.count("奴隶们受苦的影像。") == 1, f"译文被写了两遍：{got}"
+
+
+def test_apply_keeps_commands_it_does_not_touch(tmp_path: Path) -> None:
+    """★ 回写不能动别的指令（插件指令、脚本、分支……）。"""
+    cmds = [
+        {"code": 356, "indent": 0, "parameters": ["Tachie showName"]},
+        {"code": 401, "indent": 0, "parameters": ["A magic device displays the "]},
+        {"code": 101, "indent": 0, "parameters": ["", 0, 0, 2, "Naho"]},
+        {"code": 355, "indent": 0, "parameters": ["var x = 1;"]},
+        {"code": 401, "indent": 0, "parameters": ["suffering of the slaves."]},
+    ]
+    game = _game_with_scenario(tmp_path, cmds)
+    out_cmds = _apply_and_read(game, tmp_path)
+    assert out_cmds[0] == cmds[0], "插件指令被改了"
+    assert out_cmds[3] == cmds[3], "脚本被改了"
+    assert out_cmds[2]["parameters"][4] == "Naho", "说话人名被改了"
+
+
+def test_apply_leaves_untracked_slots_empty(tmp_path: Path) -> None:
+    r"""★ 槽位比译文行数多时，多余的格子写空串而不是重复内容。
+
+    宁可显示的短一点，也不要同一句话显示两遍。
+    """
+    cmds = [
+        {"code": 401, "indent": 0, "parameters": ["One."]},
+        {"code": 401, "indent": 0, "parameters": ["Two."]},
+        {"code": 401, "indent": 0, "parameters": ["Three."]},
+    ]
+    game = _game_with_scenario(tmp_path, cmds)
+    ad = _adapter()
+    units, _rep = ad.extract_text(game)
+    # 给一条**没有换行**的译文：行数(1) < 槽位数(3)，会走均分分支
+    tr = {u.uid: "一二三四五六" for u in units}
+    res = ad.apply(game, tmp_path / "out", units, tr)
+    assert res.ok, res.error
+    obj = json.loads(
+        (tmp_path / "out" / "www" / "data" / "Scenario.json").read_text(encoding="utf-8")
+    )
+    got = [c["parameters"][0] for c in obj["1"]]
+    assert "".join(got) == "一二三四五六", f"均分丢了字：{got}"
+    assert all("\n" not in g for g in got), f"均分后残留换行：{got}"
+
+
+# ----------------------------------------------------------------------
 # 三、回写：字典形式的指针必须能定位
 # ----------------------------------------------------------------------
 
@@ -422,3 +546,90 @@ def test_real_game_dialogue_is_extracted() -> None:
         f"只提取到 {dialogue} 句台词 —— 真实游戏有约 19000 句；"
         "指令格式解析很可能又退化了"
     )
+
+
+# ----------------------------------------------------------------------
+# 四、指针必须真的能写回去（否则回写"成功 0 个文件"）
+# ----------------------------------------------------------------------
+
+
+def test_scenario_pointer_matches_real_structure() -> None:
+    r"""★ 提取出的指针必须能**在不改任何东西的前提下**定位到原文。
+
+    这是 `Scenario.json` 那个 `/list/` bug 的回归测试。真实结构是：
+
+    .. code-block:: javascript
+
+        {"1": [ {"code": 401, ...}, ... ]}      // 指令直接在数组里
+
+    所以指针必须是 `/1/0/parameters/0`。一旦又写成
+    `/1/list/0/parameters/0`，`_set_pointer` 会找不到 `list` 键 ⇒
+    **几万条剧情对白一条都写不回去**，而回写阶段只报"写了 0 个文件"。
+
+    断言方式：把每个指针**读**一遍（用 `_set_pointer` 写回原值），
+    全部必须成功。这比检查字符串前缀更强 —— 它真的走了一遍定位逻辑。
+    """
+    obj = {
+        "1": [
+            {"code": 401, "indent": 0, "parameters": ["First line."]},
+            {"code": 356, "indent": 0, "parameters": ["Tachie showName"]},
+            {"code": 401, "indent": 0, "parameters": ["Second line."]},
+        ]
+    }
+    ad = _adapter()
+    units = ad._extract_scenarios(obj, "Scenario.json")
+    assert units, "没抽出条目"
+    for u in units:
+        ptrs = [u.location.pointer, *u.location.siblings]
+        for ptr in ptrs:
+            segs = [s for s in ptr.split("/") if s]
+            assert "list" not in segs, (
+                f"指针里不该有 `list` 这一层（真实结构没有该键）：{ptr}"
+            )
+            assert segs[0] == "1", f"指针第一段应该是场景名：{ptr}"
+            # 真的走一遍定位：把原值写回去，必须成功
+            assert ad._set_pointer(obj, ptr, "PROBE"), (
+                f"指针定位失败：{ptr} —— 回写会静默丢掉这条译文"
+            )
+
+
+def test_apply_hard_fails_when_nothing_can_be_written(tmp_path: Path) -> None:
+    r"""★ 硬闸门：全部定位失败时**必须报错**，不能报"成功、写了 0 个文件"。
+
+    ## 为什么值得单独一条闸门
+
+    `files_written` 只在 `n > 0` 时自增，所以"一条都没写进去"和
+    "没有需要写的东西"在结果对象上**长得一模一样**。而后者是正常的、
+    前者是灾难性的（游戏里剧情全是原文）。
+
+    这个失败方式在本项目里真实发生过（`Scenario.json` 的 `/list/` bug），
+    而且流水线报的是完成。所以这里必须有一条**显式**判据把它区分开。
+    """
+    game = _game_with_scenario(
+        tmp_path,
+        [{"code": 401, "indent": 0, "parameters": ["Hello world."]}],
+    )
+    ad = _adapter()
+    units, _rep = ad.extract_text(game)
+    assert units
+    # 人为把指针弄坏，模拟"指针与结构不匹配"
+    units[0].location.pointer = "/1/list/0/parameters/0"
+    res = ad.apply(game, tmp_path / "out", units, {units[0].uid: "你好世界。"})
+    assert not res.ok, "全部定位失败却报了成功"
+    assert res.error and "回写全部失败" in res.error, res.error
+    assert res.files_written == 0
+
+
+def test_apply_does_not_hard_fail_on_empty_translations(tmp_path: Path) -> None:
+    r"""★ 反向：**没有**译文要写时不算失败（不要误判）。
+
+    空项目 / 空译文是正常情况，报错会让用户以为坏了。
+    """
+    game = _game_with_scenario(
+        tmp_path,
+        [{"code": 401, "indent": 0, "parameters": ["Hello world."]}],
+    )
+    ad = _adapter()
+    units, _rep = ad.extract_text(game)
+    res = ad.apply(game, tmp_path / "out", units, {})
+    assert res.ok, f"空译文被误判成失败：{res.error}"
