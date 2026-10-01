@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 from . import loose as _loose  # noqa: E402,F401
 from . import renpy as _renpy  # noqa: E402,F401
 from . import rpgmaker as _rpgmaker  # noqa: E402,F401
+from . import rpgvx as _rpgvx  # noqa: E402,F401
 from . import unity as _unity  # noqa: E402,F401
 
 _ALL: list[type[EngineAdapter]] = []
@@ -38,6 +39,7 @@ def _resolve(name: str) -> type[EngineAdapter] | None:
     """把注册名映射到类。"""
     mapping: dict[str, type[EngineAdapter]] = {
         "rpgmaker": _rpgmaker.RpgMakerAdapter,
+        "rpgvx": _rpgvx.RpgVxAdapter,
         "renpy": _renpy.RenPyAdapter,
         "unity": _unity.UnityAdapter,
         "loose": _loose.LooseFilesAdapter,
@@ -49,6 +51,7 @@ def _resolve(name: str) -> type[EngineAdapter] | None:
 #: 是因为注册中心在包导入期可能还没被填满，显式更可靠也更好读。
 _CLASSES: tuple[type[EngineAdapter] | None, ...] = (
     _rpgmaker.RpgMakerAdapter,
+    _rpgvx.RpgVxAdapter,
     _renpy.RenPyAdapter,
     _unity.UnityAdapter,
     _loose.LooseFilesAdapter,

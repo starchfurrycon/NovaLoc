@@ -105,7 +105,14 @@ def main() -> int:
         print(f"    version={h['version']} directml={h['gpu']['directml']} "
               f"engines={[e['id'] for e in h['engines']]}")
         print(f"    阶段：{[s['label'] for s in h['stages']]}")
-        check("health 报告了引擎列表", len(h["engines"]) == 4, str(h["engines"]))
+        # 引擎数量会随新引擎增加而变，所以断言"包含这些"而不是写死个数 ——
+        # 以前写死 == 4，加了 rpgvx（VX Ace/XP）就红了。
+        _engine_ids = {e["id"] for e in h["engines"]}
+        check(
+            "health 报告了引擎列表",
+            {"rpgmaker", "rpgvx", "renpy", "unity", "loose"} <= _engine_ids,
+            str(h["engines"]),
+        )
         check(
             f"health 报告了全部 {len(EXPECTED_STAGES)} 个阶段",
             [s["id"] for s in h["stages"]] == EXPECTED_STAGES,
