@@ -462,6 +462,35 @@ def guard(
     return GuardResult(text=target, warnings=warnings, fatal=fatal)
 
 
+#: **写回前的硬门禁** —— 一套判据，多处执行。
+#:
+#: ## 为什么必须是一个具名函数，而不是把两个调用抄三遍
+#:
+#: 这两条判据目前在**三个地方**执行：
+#:
+#: 1. `translate` 的强制重译判定（"已完成"也要能被推翻）；
+#: 2. `translate` 开头的重查入口（作废旧译文）；
+#: 3. `apply` 的回写闸门（最后一道）。
+#:
+#: 曾经它们是**各写各的**，代价很具体：`%n` 判据上线时只加进了
+#: 第 2 处，于是 **120 条**丢了消息变量的译文在 1 和 3 处被放行 ——
+#: 重查作废它们，下一轮又按同样方式写回来（还标成"已翻译"），
+#: 每轮空跑一次，坏数据一条没少。
+#:
+#: **判据有多个执行点时，它们必须指向同一份定义。**
+#: 加新判据只需要改这里，三处同时生效。
+def is_unsafe_writeback(source: str, target: str) -> bool:
+    """这条译文**绝对不能写回游戏**吗？
+
+    与 :func:`guard` 的 `fatal` 不同：`guard` 是在翻译**过程中**做全量校验
+    （还管占位符、复读、长度），这里只抽查那两条**"产物已经写下去了才发现"**
+    的判据 —— 它们要么让玩家看到乱码，要么让玩家看不到是谁做了什么。
+    """
+    return bool(
+        check_foreign_script(target, source=source) or check_percent_vars(source, target)
+    )
+
+
 def summarize_warnings(entries_warnings: list[list[str]]) -> dict[str, int]:
     """统计告警分布，用于质检报告。"""
     out: dict[str, int] = {}

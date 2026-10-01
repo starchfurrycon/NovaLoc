@@ -646,6 +646,94 @@ def _ollama_hint_text(ol: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 
+@app.command("unity-strings")
+def unity_strings_cmd(
+    game_dir: str = typer.Argument(..., help="Unity 游戏根目录（含 *_Data 的那一层）。"),
+    output: str = typer.Option(
+        "", "--out", "-o", help="清单输出路径（CSV）。默认写到数据根目录下的 exports/。"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
+) -> None:
+    """从 Unity 的**二进制序列化资源**里只读提取候选文案。
+
+    Unity 的策划文案大多在 `.assets` / `level*` 里，而不是明文 txt。
+    本工具**不会**改写这些文件 —— 它们是二进制序列化格式，里面有大量
+    指向别处的偏移量，改一个字符串的长度会让后面所有偏移量失效，
+    结果通常是**游戏打不开**，而错误信息毫无线索。
+
+    但它能把"有哪些文本、在哪个文件、原文是什么"精确列出来，
+    让你用 UABEA / AssetStudio 这类实现了完整序列化格式的专业工具
+    去定位和改写。**全程只读。**
+
+    实测：某个真实 Unity 游戏里，原来的抽取流程会报 53 万条"文本"
+    （其实是 33 MB 的播放器日志）；加上过滤后，从 716 MB 资源里
+    提出 **28 条**候选，其中 22 条是真正的 UI 文案
+    （`Would you like to save?`、`Quit to the Main Menu. …`）。
+
+    **宁可少报，不可乱报** —— 一份混着几万条噪音的清单等于没有清单。
+    """
+    global _JSON_MODE
+    _JSON_MODE = json_output
+
+    root = Path(game_dir).expanduser()
+    if not root.is_dir():
+        _fail(f"游戏目录不存在或不是目录：{root}")
+
+    from .engines.unity_strings import scan_game, write_csv  # noqa: PLC0415
+
+    with console.status("只读扫描 Unity 序列化资源…", spinner="dots"):
+        rep = scan_game(root)
+
+    if not rep.candidates:
+        if json_output:
+            _echo_json({"ok": False, "total": 0, "errors": rep.errors})
+        else:
+            console.print("[yellow]没有找到候选文案。[/yellow]")
+            for e in rep.errors:
+                console.print(f"  [yellow]! {e}[/yellow]")
+            console.print(
+                "[dim]可能原因：文本编译进了 Assembly-CSharp.dll（IL2CPP 尤甚）、"
+                "或在 AssetBundle 里、或本扫描器的长度前缀判据没覆盖到该变体。[/dim]"
+            )
+        return
+
+    uniq = len({c.text for c in rep.candidates})
+    dest = (
+        Path(output).expanduser()
+        if output
+        else paths.data_root() / "exports" / "unity_strings.csv"
+    )
+    write_csv(rep, dest)
+
+    if json_output:
+        _echo_json(
+            {
+                "ok": True,
+                "files_scanned": rep.files_scanned,
+                "bytes_scanned": rep.bytes_scanned,
+                "occurrences": rep.total,
+                "unique": uniq,
+                "csv": str(dest),
+                "errors": rep.errors,
+            }
+        )
+        return
+
+    console.print(
+        f"[green]✅ 从 {rep.files_scanned} 个序列化资源"
+        f"（{rep.bytes_scanned / 1024 / 1024:.0f} MB）里提取到 "
+        f"[bold]{uniq}[/bold] 条去重候选（{rep.total} 处出现）[/green]"
+    )
+    console.print(f"清单已写到 [bold]{dest}[/bold]")
+    console.print(
+        "[yellow]⚠️ 这些文本**没有**被改写[/yellow]"
+        "（`.assets` 是二进制序列化格式，盲写会让游戏打不开）。"
+    )
+    console.print("[dim]用 UABEA / AssetStudio 打开清单里的文件，按 offset 定位后改写。[/dim]")
+    for e in rep.errors[:5]:
+        console.print(f"  [yellow]! {e}[/yellow]")
+
+
 @app.command("scan")
 def scan(
     game_dir: str = typer.Argument(..., help="游戏根目录（不是 data/ ，是包含 data/ 的那一层）。"),

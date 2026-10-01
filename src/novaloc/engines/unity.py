@@ -40,6 +40,137 @@ log = logging.getLogger(__name__)
 #: 明文的、可以直接安全改写的文本文件后缀
 TEXT_SUFFIXES = (".txt", ".json", ".csv", ".tsv", ".xml", ".po", ".properties", ".ini", ".lang")
 
+#: ⛔ **绝不是游戏文本**的文件名 —— 引擎/运行时的日志与调试输出。
+#:
+#: ## 事故：`output_log.txt` 让抽取出来 53 万条"文本"
+#:
+#: 实测一个真实 Unity 游戏（Mono 后端），`<Game>_Data/output_log.txt`
+#: 有 **33 MB**，是 Unity 播放器的**运行日志**：
+#:
+#:     Initialize engine version: 4.6.7f1 (bb67e21913cc)
+#:     GfxDevice: creating device client; threaded=1
+#:     Direct3D:
+#:     Begin MonoManager ReloadAssembly
+#:     Platform assembly: D:\...\Managed\UnityEngine.dll
+#:
+#: 后缀是 `.txt`、内容大部分是可读英文，所以它**完全符合**
+#: "明文文本文件"的判据，被抽成 **530,507 条** `system` 类文本单元
+#: （占该游戏全部单元的 98%）。
+#:
+#: 后果不是"多花了点时间"，而是三件更糟的事：
+#:
+#: 1. **翻译预算被垃圾吃掉** —— 53 万条要跑几十小时，用户以为工具卡死；
+#: 2. **回写会把游戏目录塞满译文日志** —— 日志里掺进中文，
+#:    以后排查问题的人读不懂它；
+#: 3. **质检报告完全失真** —— 99.9% 的"文本"是日志行，
+#:    任何覆盖率数字都不再有意义。
+#:
+#: 日志是**运行时产物**，不是**游戏内容**。判据必须按**文件名**排除，
+#: 而不能只按后缀 —— 后缀和"是不是游戏文本"没有关系。
+_NOT_GAME_TEXT = {
+    "output_log.txt",       # Unity 播放器日志（最常见）
+    "player.log",           # Unity 另一常见名
+    "player-prev.log",
+    "editor.log",
+    "build.log",
+    "buildreport.txt",
+    "unity.log",
+    "crashreport.txt",
+    "error.log",
+    "stdout.txt",
+    "stderr.txt",
+    "readme.txt",           # 说明文件：翻它没有意义，还会污染统计
+    "readme.md",
+    "changelog.txt",
+    "license.txt",
+    "credits.txt",
+}
+
+#: 名字**模式**（不能穷举时用）：`*_log.txt`、`crash_*.txt` 这类。
+_NOT_GAME_TEXT_RE = re.compile(
+    r"^(?:output|player|editor|build|unity|crash|error|debug|trace)[-_]?"
+    r"(?:log|report|dump)?(?:[-_]?\d+)?\.(?:txt|log)$",
+    re.IGNORECASE,
+)
+
+#: 明显的日志/调试**行**内容 —— 命中太多行时整份文件都判为日志。
+#:
+#: 按**行**兜底还有一层意义：日志文件可能被改名（用户自己改、
+#: 打包工具改），文件名判据会失效，但内容特征不会。
+_LOG_LINE_RE = re.compile(
+    r"^(?:Initialize engine version|GfxDevice:|Begin MonoManager|"
+    r"Platform assembly:|Loading \d+|\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|"
+    r"\[.*?\]\s*(?:Info|Warning|Error)\b|UnloadTime:|"
+    r"Fallback handler could not load|Non platform assembly:)",
+    re.MULTILINE,
+)
+
+
+def _looks_like_runtime_log(path: Path, sample: str) -> bool:
+    """这份文件是不是引擎的运行日志（而不是游戏文本）？
+
+    两道判据，任一命中即排除：
+
+    1. **文件名**命中 `_NOT_GAME_TEXT` 或 `_NOT_GAME_TEXT_RE`；
+    2. **内容**里日志行占比过高（改名也躲不过）。
+    """
+    if path.name.lower() in _NOT_GAME_TEXT or _NOT_GAME_TEXT_RE.match(path.name):
+        return True
+    lines = [ln for ln in sample.splitlines() if ln.strip()]
+    if len(lines) < 5:
+        return False
+    hits = len(_LOG_LINE_RE.findall(sample))
+    return hits >= max(3, len(lines) * 0.02)
+
+
+#: ⛔ **运行时基础设施目录** —— 引擎自带的、与游戏内容无关的目录树。
+#:
+#: ## 事故：`Mono/etc/` 让抽取结果 100% 是垃圾
+#:
+#: 排掉 `output_log.txt` 之后，同一个游戏还剩 **9,586 条**单元，
+#: 而它们**全部**来自这两个文件：
+#:
+#:     AlienQuest-EVE_Data/Mono/etc/mono/browscap.ini     → 9,073 条
+#:     AlienQuest-EVE_Data/Mono/etc/mono/mconfig/config.xml →   513 条
+#:
+#: 这是 Unity 内嵌 Mono 运行时的**基础设施**：
+#:
+#: * `browscap.ini` 是**浏览器能力数据库**（用户代理字符串模式表），
+#:   2009 年生成的，里面全是 `Mozilla/4.0 (compatible; MSIE 6.0…)` 之类的行；
+#: * `mconfig/config.xml` 是 Mono 自己的**配置**（`<handler section="…">`、
+#:   `type="Mono.MonoConfig.FeatureNodeHandler, mconfig, Version=…"`）。
+#:
+#: 换句话说：**这个游戏一个可处理的明文文本文件都没有**，
+#: 而工具报了 9,586 条"待翻译文本"，全是运行时噪音。
+#:
+#: 这比 `output_log.txt` 那个事故更隐蔽 —— 数量小了三个数量级，
+#: 看起来"挺像一个正常的小游戏"，于是没有触发任何怀疑。
+#: **判据不能按"看起来像不像文本"来定，要按"属不属于游戏内容"来定。**
+_RUNTIME_INFRA_DIRS = (
+    "mono/etc",         # Unity 内嵌 Mono 的运行时配置与数据
+    "mono/2.0",         # 旧版 Mono 的 BCL
+    "mono/4.0",
+    "il2cpp_data/etc",  # IL2CPP 的同类基础设施
+    "resources",        # Unity 内建资源（图标、默认材质）—— 不是策划文案
+)
+
+
+def _in_runtime_infra(path: Path) -> bool:
+    """路径是否落在引擎的运行时基础设施目录里。
+
+    ⚠️ **必须用 `as_posix()` 归一化分隔符。**
+    在 Windows 上 `Path("Mono/etc/mono/x.ini").parts` 是
+    `('Mono','etc','mono','x.ini')`，用 `"/".join(parts)` 拼出来
+    仍然是反斜杠 —— 于是 `"/mono/etc/" in low` **永远为假**，
+    排除规则静默失效（实测：改完之后数字一条没变，才发现是这个）。
+
+    这类"路径匹配看起来对、实际因分隔符而永不命中"的 bug 不会报错，
+    只会让功能**静默不生效**。所以这里统一 `as_posix()`。
+    """
+    low = path.as_posix().lower()
+    return any(f"/{d}/" in f"/{low}/" for d in _RUNTIME_INFRA_DIRS)
+
+
 #: 明显不该翻的键名（Unity 工程里常见的配置键）
 _SKIP_KEYS = {
     "id", "uuid", "guid", "path", "file", "url", "key", "type", "class",
@@ -57,6 +188,28 @@ class UnityAdapter(EngineAdapter):
     priority = 30
 
     # ------------------------------------------------------------------
+
+    def _workspace_dir(self) -> Path | None:
+        """当前工作区目录（用于放只读扫描的清单）。
+
+        取不到就返回 ``None`` —— 调用方**只报数、不落盘**。
+        这里刻意不做"退回到游戏目录"的兜底：往游戏目录写文件
+        违反只读契约，而"没生成清单"只是少个便利，
+        两者的严重性完全不对等。
+        """
+        for attr in ("workspace_dir", "workspace", "ws_dir"):
+            v = getattr(self.ctx, attr, None)
+            if isinstance(v, Path):
+                return v
+            if isinstance(v, str) and v:
+                return Path(v)
+        cfg = getattr(self.ctx, "config", None)
+        if cfg is not None:
+            for attr in ("workspace_dir", "data_root"):
+                v = getattr(cfg, attr, None)
+                if isinstance(v, Path):
+                    return v
+        return None
 
     def detect(self, game_dir: Path) -> EngineInfo:
         info = EngineInfo(engine_id=self.id, display_name=self.display_name, root=game_dir)
@@ -124,20 +277,55 @@ class UnityAdapter(EngineAdapter):
             roots.append(r)
 
         files: list[Path] = []
+        skipped_logs: list[str] = []
+        skipped_infra: list[str] = []
         for r in roots:
             for p in r.rglob("*"):
-                if p.is_file() and p.suffix.lower() in TEXT_SUFFIXES:
-                    files.append(p)
+                if not p.is_file() or p.suffix.lower() not in TEXT_SUFFIXES:
+                    continue
+                # 1) 运行时基础设施目录（Mono 配置、BCL、内建资源）
+                if _in_runtime_infra(p.relative_to(r)):
+                    skipped_infra.append(str(p.relative_to(r)))
+                    continue
+                # 2) 按**文件名**排掉已知的运行时日志（省钱：不用读 33 MB）
+                if p.name.lower() in _NOT_GAME_TEXT or _NOT_GAME_TEXT_RE.match(p.name):
+                    skipped_logs.append(p.name)
+                    continue
+                files.append(p)
         report.files_scanned = len(files)
 
         for f in files:
             before = len(units)
             try:
+                # 按**内容**再排一次：改名后的日志靠这一步拦住。
+                # 只读开头 64 KB 做判断，不把 33 MB 全读进来。
+                head = f.read_bytes()[:65536].decode("utf-8", errors="replace")
+                if _looks_like_runtime_log(f, head):
+                    skipped_logs.append(f.name)
+                    continue
                 units.extend(self._extract_file(f, game_dir))
             except Exception as exc:  # noqa: BLE001
                 report.errors.append(f"{f.name} 解析失败：{exc}")
             if len(units) > before:
                 report.files_matched += 1
+
+        if skipped_infra:
+            report.skipped["runtime_infra_files"] = len(skipped_infra)
+            report.errors.append(
+                f"已排除 {len(skipped_infra)} 个引擎运行时基础设施文件"
+                "（`Mono/etc/`、`il2cpp_data/etc/`、`Resources/`）—— "
+                "这些是 Mono/IL2CPP 自己的配置与内建资源，"
+                "不是游戏文本（实测某个游戏 100% 的'待翻译文本'都来自这里）。"
+            )
+        if skipped_logs:
+            # 明确报告排除了什么 —— 静默排除会让用户以为"日志里的字也翻了"
+            report.skipped["runtime_logs"] = len(skipped_logs)
+            report.errors.append(
+                f"已排除 {len(skipped_logs)} 个运行时日志/说明文件"
+                f"（{[*dict.fromkeys(skipped_logs)][:3]} 等）—— "
+                "这些是引擎和打包器生成的调试输出，不是游戏内容；"
+                "翻译它们会白烧几小时并把质检统计冲垮。"
+            )
 
         # 明确报告**没处理**的部分，避免用户误以为全都翻好了
         serialized = []
@@ -154,12 +342,52 @@ class UnityAdapter(EngineAdapter):
         bundles += [p.name for p in game_dir.rglob("*.bundle")]
 
         if serialized or bundles:
+            # 与其只说"没处理"，不如告诉用户**里面有多少文本**。
+            # 只读扫描序列化资源，把候选字符串数与清单文件路径报出来 ——
+            # 用户拿到清单才能去 UABEA/AssetStudio 里定位，
+            # 否则"检测到 12 个序列化资源文件"这句话是无从下手的。
+            scan_note = ""
+            try:
+                from .unity_strings import scan_game
+
+                rep_u = scan_game(game_dir)
+                if rep_u.total:
+                    uniq = len({c.text for c in rep_u.candidates})
+                    scan_note = (
+                        f"只读扫描发现其中约 **{uniq}** 条候选文案"
+                        f"（{rep_u.total} 处出现）。"
+                        "这些是**只读**结果：本工具不会改写 `.assets`"
+                        "（改长度会让内部偏移量失效、游戏打不开）。"
+                    )
+                    report.skipped["unity_serialized_strings"] = uniq
+                    # ⚠️ **清单写到工作区，绝不写进游戏目录。**
+                    # 游戏目录是只读契约（`apply` 只写 `workspaces/<id>/out`），
+                    # 往里丢一个 CSV 就是破坏它 —— 哪怕这个文件无害，
+                    # "工具会在我的游戏里新建文件"本身就是用户不该担心的事。
+                    #
+                    # 工作区从 `ctx` 取；取不到就**只报数、不落盘**
+                    # （宁可少一个便利文件，也不能往游戏目录写东西）。
+                    out_dir = self._workspace_dir()
+                    if out_dir is not None:
+                        try:
+                            from .unity_strings import write_csv
+
+                            out_csv = out_dir / "qa" / "unity_strings.csv"
+                            write_csv(rep_u, out_csv)
+                            scan_note += f" 清单已写到工作区的 `qa/{out_csv.name}`。"
+                        except OSError as exc:
+                            log.debug("写 Unity 字符串清单失败：%s", exc)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("序列化资源只读扫描失败：%s", exc)
+
             note = (
                 f"⚠️ 检测到 {len(set(serialized))} 个序列化资源文件"
                 + (f"与 {len(bundles)} 个 AssetBundle" if bundles else "")
                 + "，其中的文本**未被处理**。这些文件是二进制序列化格式，"
-                "盲写极易破坏资源导致游戏无法启动。建议先用 UABEA / AssetStudio "
-                "导出其中的 TextAsset，再用本工具的「散装文件」模式处理。"
+                "盲写极易破坏资源导致游戏无法启动。"
+                + (scan_note if scan_note else "")
+                + "建议用 UABEA / AssetStudio 按清单定位并改写，"
+                "或导出其中的 TextAsset 后用本工具的「散装文件」模式处理。"
             )
             report.errors.append(note)
             report.skipped["serialized_assets"] = len(set(serialized))

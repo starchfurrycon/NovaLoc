@@ -44,7 +44,7 @@ from ..models import (
     TranslationEntry,
 )
 from ..translate.glossary import engine_label_target, merge_engine_labels
-from ..translate.guards import check_foreign_script, check_percent_vars
+from ..translate.guards import check_foreign_script, is_unsafe_writeback
 
 log = logging.getLogger(__name__)
 
@@ -488,17 +488,14 @@ class Pipeline:
                     # 但**限制次数**（最多 2 次）：模型可能反复给出同样的错答案，
                     # 不限次数就会每次重跑都白烧时间。
                     #
-                    # ⚠️ **判据必须和 `revalidate_foreign_script` 用同一套。**
+                    # ⚠️ **判据必须和重查入口、apply 闸门用同一套。**
                     # 实测踩过：这里只查了 `foreign_script`，
                     # 而 `%n` 消息变量那条上线后有 **120 条**坏译文
                     # 卡在"已完成"里 —— 重查入口作废它们，下一次
                     # translate 又把同样的坏答案写回来（还标成"已翻译"），
                     # 于是每轮都要空跑一次 revalidate。
-                    # 两处判据不一致 = 两边互相打架。
-                    bad_prev = check_foreign_script(prev.target, source=prev.source) or (
-                        check_percent_vars(prev.source, prev.target)
-                    )
-                    if bad_prev:
+                    # 现在三处统一走 `is_unsafe_writeback`。
+                    if is_unsafe_writeback(prev.source, prev.target):
                         tries = int((prev.meta or {}).get("drift_retry", 0))
                         if tries < 2:
                             prev.meta = {**(prev.meta or {}), "drift_retry": tries + 1}
@@ -1308,12 +1305,14 @@ class Pipeline:
         for e in entries:
             if not e.target.strip():
                 continue
-            if check_foreign_script(e.target, source=e.source):
-                bad.add(e.uid)
-                n_foreign += 1
+            # 用同一份判据（`guards.is_unsafe_writeback`），只是分开计数
+            # 以便日志能说清"作废的原因分别是什么"。
+            if not is_unsafe_writeback(e.source, e.target):
                 continue
-            if check_percent_vars(e.source, e.target):
-                bad.add(e.uid)
+            bad.add(e.uid)
+            if check_foreign_script(e.target, source=e.source):
+                n_foreign += 1
+            else:
                 n_pct += 1
         if not bad:
             return 0
@@ -1395,9 +1394,7 @@ class Pipeline:
                 # 于是"修好了代码、重跑了、坏数据还在"。
                 #
                 # 回写阶段是**最后一道**能拦住它的地方，所以这里必须再查一次。
-                if check_foreign_script(e.target, source=e.source) or check_percent_vars(
-                    e.source, e.target
-                ):
+                if is_unsafe_writeback(e.source, e.target):
                     drifted.append(u.uid)
                     continue
                 translations[u.uid] = e.target
