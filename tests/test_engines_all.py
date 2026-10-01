@@ -206,6 +206,55 @@ def main() -> int:
     check("转义引号未被破坏", '\\"Do not go there.\\"' in out_script
           or '\\"〔译〕She said' in out_script,
           out_script[out_script.find("She said") - 30: out_script.find("She said") + 80])
+
+    # ---------- 3b. ★ 逐行验证：**只有文本单元内的行**允许变化 ----------
+    #
+    # 上面那些 `in` 断言只抽查了若干处。`.rpy` 是**可执行代码**，
+    # 伤到缩进、`python:` 块、`$` 行或文档字符串会让游戏**直接起不来** ——
+    # 而"起不来"和"翻译没做完"是两种完全不同的故障，必须能区分。
+    #
+    # 所以这里做**逐行**对比：除了被列为文本单元的行，
+    # 其余每一行必须与原文**完全相等**（含缩进、空行、注释）。
+    print("\n[3b] Ren'Py 逐行验证（越界改动必须为 0）")
+    src_lines = (renpy / "game" / "script.rpy").read_text(encoding="utf-8").splitlines()
+    out_lines = (out / "game" / "script.rpy").read_text(encoding="utf-8").splitlines()
+    check("行数一致", len(src_lines) == len(out_lines),
+          f"{len(src_lines)} vs {len(out_lines)}")
+
+    # 哪些行**允许**变化：从抽取结果反查行号
+    editable: set[int] = set()
+    for u in units:
+        loc = getattr(u, "location", None)
+        for attr in ("line", "line_no", "lineno"):
+            v = getattr(loc, attr, None) if loc is not None else None
+            if isinstance(v, int):
+                editable.add(v)
+        # 指针形如 `/game/script.rpy:12:say`
+        ptr = getattr(loc, "pointer", "") if loc is not None else ""
+        for part in str(ptr).split(":"):
+            if part.isdigit():
+                editable.add(int(part))
+
+    changed = [
+        i
+        for i, (a, b) in enumerate(zip(src_lines, out_lines, strict=False), 1)
+        if a != b
+    ]
+    print(f"    文本单元行号: {sorted(editable)}")
+    print(f"    实际变化行:   {changed}")
+    if editable:
+        out_of_range = [i for i in changed if i not in editable]
+        check("★ 变化全部落在文本单元内（越界改动为 0）", not out_of_range,
+              f"越界 {out_of_range}"
+              + (f"  例如第 {out_of_range[0]} 行："
+                 f"{src_lines[out_of_range[0]-1]!r} → {out_lines[out_of_range[0]-1]!r}"
+                 if out_of_range else ""))
+        check("★ 至少有一行真的被翻译了（否则上面那条是空转）",
+              bool(changed), "一行都没变 —— 逐行断言没有意义")
+    else:
+        check("文本单元带行号（否则逐行验证退化成空转）", False,
+              "抽取结果里没有行号信息")
+
     print("    回写后的对白行：")
     for ln in out_script.splitlines():
         if "〔译〕" in ln:
