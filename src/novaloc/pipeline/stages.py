@@ -484,10 +484,21 @@ class Pipeline:
                     # 改了代码、重跑了，坏数据照样留着。
                     # 实测留下 12 条夹着泰文/阿拉伯文/西里尔的乱码句。
                     #
-                    # 这里对"含外来文字系统"的条目**强制重译**，
+                    # 这里对"按**当前**守卫判定为坏"的条目**强制重译**，
                     # 但**限制次数**（最多 2 次）：模型可能反复给出同样的错答案，
                     # 不限次数就会每次重跑都白烧时间。
-                    if check_foreign_script(prev.target, source=prev.source):
+                    #
+                    # ⚠️ **判据必须和 `revalidate_foreign_script` 用同一套。**
+                    # 实测踩过：这里只查了 `foreign_script`，
+                    # 而 `%n` 消息变量那条上线后有 **120 条**坏译文
+                    # 卡在"已完成"里 —— 重查入口作废它们，下一次
+                    # translate 又把同样的坏答案写回来（还标成"已翻译"），
+                    # 于是每轮都要空跑一次 revalidate。
+                    # 两处判据不一致 = 两边互相打架。
+                    bad_prev = check_foreign_script(prev.target, source=prev.source) or (
+                        check_percent_vars(prev.source, prev.target)
+                    )
+                    if bad_prev:
                         tries = int((prev.meta or {}).get("drift_retry", 0))
                         if tries < 2:
                             prev.meta = {**(prev.meta or {}), "drift_retry": tries + 1}
@@ -499,8 +510,8 @@ class Pipeline:
 
             if drift_retried:
                 self.bus.log(
-                    f"{drift_retried} 条旧译文里混着别的文字系统，"
-                    "已强制重译（最多重试 2 次）",
+                    f"{drift_retried} 条旧译文在当前守卫下不合格（混了别的文字系统 /"
+                    " 丢了 %1 消息变量），已强制重译（最多重试 2 次）",
                     stage="translate",
                     severity=Severity.WARN,
                 )
@@ -1384,17 +1395,21 @@ class Pipeline:
                 # 于是"修好了代码、重跑了、坏数据还在"。
                 #
                 # 回写阶段是**最后一道**能拦住它的地方，所以这里必须再查一次。
-                if check_foreign_script(e.target, source=e.source):
+                if check_foreign_script(e.target, source=e.source) or check_percent_vars(
+                    e.source, e.target
+                ):
                     drifted.append(u.uid)
                     continue
                 translations[u.uid] = e.target
 
             if drifted:
                 self.bus.log(
-                    f"{len(drifted)} 条译文里混进了别的文字系统"
-                    f"（阿拉伯/泰/天城…），已**拒绝回写**："
-                    "这些是模型不翻译、改成按发音硬凑的乱码。"
-                    "已在翻译记忆里作废，下次重跑会自动重译它们。",
+                    f"{len(drifted)} 条译文在当前守卫下不合格"
+                    "（混进了别的文字系统，或丢了 `%1` 消息变量），"
+                    "已**拒绝回写**：混文字系统的那些是模型不翻译、"
+                    "改成按发音硬凑的乱码；丢消息变量的那些会让玩家"
+                    "看不到是谁做了什么。已在翻译记忆里作废，"
+                    "下次重跑会自动重译它们。",
                     stage="apply",
                     severity=Severity.WARN,
                 )
