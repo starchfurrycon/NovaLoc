@@ -55,7 +55,12 @@ from .charset import (
 )
 from .coverage import load_font_info
 from .downloader import DownloadError, download
-from .merge import MergeReport, merge_fonts_multi, subset_font_for_chars
+from .merge import (
+    MergeReport,
+    merge_fonts_multi,
+    replace_with_font,
+    subset_font_for_chars,
+)
 from .qa import FontQAReport, verify_font
 
 log = logging.getLogger(__name__)
@@ -504,11 +509,19 @@ class FontService:
         ``optional``：**可放弃**的字符（工具猜界面会渲染的装饰符号）。
         它们能补就补，补不上只记警告，**不导致失败** ——
         详见 :func:`novaloc.fonts.charset.plan_charset`。
+
+        ## ★ 空白字形的自动重试（``force_chars`` 由内部推导）
+
+        见 :func:`_blank_glyph_retry` —— 基础字体 cmap 里有码点、
+        但字形是空的那种情况（日文手写体常见）。
         """
         t0 = time.time()
         res = PatchResult()
         strat = strategy or getattr(self.cfg.font, "strategy", "merge")
         min_cov = float(getattr(self.cfg.font, "min_glyph_coverage", 0.999))
+        #: 「顺带」那一侧的字符：能补就补，补不上**不该**让整份字体失败。
+        #: 缺字判定与 QA 校验都必须把这一侧排除在外，否则分两层就白分了。
+        opt_set = {c for c in optional if c}
 
         if not base_font.is_file():
             res.error = f"基础字体不存在：{base_font}"
@@ -640,8 +653,37 @@ class FontService:
         except CharsetCoverageError:
             raise
         except Exception as exc:  # noqa: BLE001
-            res.error = f"字体合并失败：{exc}"
-            return res
+            # ★ CFF（`.otf`）字体无法走合并 —— 退化为"整体替换"。
+            #
+            # 合并器要求两边都有 `glyf`/`loca`（TrueType 轮廓），
+            # 而 CFF 字体的轮廓在 `CFF ` 表里，于是报
+            # 「表集合归一化失败：字体缺少合并必需的表：['glyf', 'loca']」。
+            # 实测 DemonsRoots 的 `ship.otf` 就是这样（4.7 MB，CFF）。
+            #
+            # 原先是**直接失败**，后果是这条字体原样留着：它只有 77.2%
+            # 的中文覆盖 ⇒ 游戏里凡是用到它的地方就是一片口口口。
+            # 而"整份字体换成一个完整中文字体"至少**不会缺字** ——
+            # 代价是那个字体的字形风格不再保留，但缺字是"坏"，
+            # 换风格是"不同"，两害相权取轻。
+            #
+            # 只在**确实是 CFF 轮廓**时才退化，别的合并失败原因照旧上报 ——
+            # 否则一个真正的规划错误会被"替换"悄悄掩盖过去。
+            if "glyf" in str(exc) and "loca" in str(exc):
+                fallback = self._cff_replace_fallback(
+                    base_font, required, dest, cands, opt_set, min_cov
+                )
+                if fallback is not None:
+                    res.merge = fallback
+                    res.warnings.append(
+                        "该字体是 CFF（`.otf`）轮廓，无法与中文 TrueType 字体合并；"
+                        "已按「整体替换」处理（不保留原字形风格，但不缺字）。"
+                    )
+                else:
+                    res.error = f"字体合并失败：{exc}"
+                    return res
+            else:
+                res.error = f"字体合并失败：{exc}"
+                return res
 
         if res.merge is None or not res.merge.ok or res.merge.out_path is None:
             # 合并阶段就失败了。最常见的原因是"规划阶段就没找到能覆盖全部
@@ -661,12 +703,69 @@ class FontService:
         res.warnings.extend(res.merge.warnings)
 
         # ---- QA 硬校验 ----
+        #
+        # ★ 只校验 `required`（**真实文本**需要的字符），不校验 `optional`。
+        #
+        # 这是"分两层"契约在 QA 这一侧的对应实现，缺了它就会出现
+        # **自相矛盾**：规划器按 `optional` 放行了那几个补不上的装饰符号
+        # （`¢¥µ·¿í ※ ‥ ′ ″`），QA 却把它们算成"空白字形"而硬失败 ——
+        # 实测 DemonsRoots 的 `koin.ttf` 因此报"空白 1259"，
+        # 而其中**真实文本需要的字符已经全部有字形**。
+        #
+        # 症状极具误导性：日志说"空白 1259"，看起来字体烂得不能用，
+        # 实际那 1259 个里绝大多数是**玩家永远看不到的**装饰符号
+        # （在 45943 条文本里出现 0 次）。
+        req_only = "".join(c for c in required if c not in opt_set)
         res.audit_after = self.audit(dest, required)
         if verify:
             try:
-                res.qa = verify_font(dest, required, render_size=40)
+                res.qa = verify_font(dest, req_only, render_size=40)
             except Exception as exc:  # noqa: BLE001
                 res.warnings.append(f"QA 执行异常：{exc}")
+            # optional 侧的空白单独记一条警告，别让它悄悄消失 ——
+            # 用户需要知道"哪些猜出来的符号没补上"。
+            self._warn_optional_blanks(dest, required, opt_set, res)
+
+        # ★ 空白字形重试：base 的 cmap 里有这个码点、但字形是空的。
+        # 详见 `_blank_glyph_retry` 的说明。只在"确实因此失败"时才做，
+        # 且**只做一次**，避免把一次失败放大成多轮合并。
+        if (
+            strat == "merge"
+            and res.qa is not None
+            and not res.qa.ok
+            and res.qa.blank
+        ):
+            retry = self._blank_glyph_retry(
+                base_font=base_font,
+                required=required,
+                opt_set=opt_set,
+                dest=dest,
+                base_face_index=base_face_index,
+                # ★ 传**全部候选**，不能只传 `plan.source_paths`。
+                #
+                # 摘 cmap 会把那些字符从"基础字体已覆盖"里拿掉，
+                # 于是它们**重新**变成需要补充字体提供的字符 ——
+                # 而规划器当初把它们算作"基础字体有"，
+                # 所以 `plan.source_paths` 里可能根本没有能提供它们的字体。
+                #
+                # 实测 DemonsRoots `koin_nocut.ttf`：摘掉 2217 个空字形后，
+                # `✔✕✖✘❤` 变成缺字，而规划器只选了一个
+                # `lxgw-wenkai-screen.ttf`（它没有这 5 个符号）⇒
+                # `merge_multi` 报"仍缺 5 个字符" ⇒ ok=False ⇒
+                # 重试被丢弃、第一次的 2217 个空白原样保留。
+                # 换成全部候选后 `seguisym.ttf` 正好能补上。
+                sources=cands,
+                blank=list(res.qa.blank),
+                min_cov=min_cov,
+            )
+            if retry is not None:
+                res.merge = retry
+                res.audit_after = self.audit(dest, required)
+                if verify:
+                    try:
+                        res.qa = verify_font(dest, req_only, render_size=40)
+                    except Exception as exc:  # noqa: BLE001
+                        res.warnings.append(f"QA 执行异常：{exc}")
 
         # ---- 达标判定：这是"防口口口"的最后一道闸 ----
         if res.audit_after.coverage < min_cov:
@@ -710,6 +809,177 @@ class FontService:
         return res
 
     # ------------------------------------------------------------------
+
+    def _cff_replace_fallback(
+        self,
+        base_font: Path,
+        required: str,
+        dest: Path,
+        cands: list[Path],
+        opt_set: set[str],
+        min_cov: float,
+    ) -> MergeReport | None:
+        """CFF 字体合并不了时的退路：整体换成覆盖最好的那个中文字体。
+
+        返回 ``None`` 表示"换也就那样"（覆盖率不达标，或找不到候选）——
+        调用方据此照旧上报原始的合并失败原因。
+        """
+        req_only = "".join(c for c in required if c not in opt_set)
+        best, cov = self._best_single_font(cands, req_only)
+        if best is None or cov < min_cov:
+            log.warning(
+                "CFF 字体替换退路不可用：最佳候选覆盖 %.1f%%（要求 %.1f%%）",
+                cov * 100, min_cov * 100,
+            )
+            return None
+        try:
+            rep = replace_with_font(
+                base_font, best, dest, required,
+                optional_chars="".join(opt_set), min_coverage=min_cov,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("CFF 字体替换失败：%s", exc)
+            return None
+        if not rep.ok:
+            return None
+        log.info("CFF 字体 %s 已整体替换为 %s（覆盖 %.1f%%）",
+                 base_font.name, best.name, rep.coverage_after * 100)
+        return rep
+
+    # ------------------------------------------------------------------
+
+    def _warn_optional_blanks(
+        self,
+        dest: Path,
+        required: str,
+        opt_set: set[str],
+        res: PatchResult,
+    ) -> None:
+        """把「顺带」那一侧渲染不出来的字符记成一条**警告**（不判失败）。
+
+        这些是工具从 `UI_SAFE_CHARS` 猜"界面可能会渲染"的装饰符号
+        （`¢¥µ·¿í ※ ‥ ′ ″ ‰` 之类）。实测它们在本机**任何**中文字体里
+        都没有字形，而在 45943 条真实文本里出现 **0 次**。
+
+        单独记一条是为了不让它们**悄悄消失**：用户需要知道
+        "这几个猜出来的符号没补上"，同时又不该因此让整份字体判失败。
+        """
+        if not opt_set:
+            return
+        opt_req = [c for c in required if c in opt_set]
+        if not opt_req:
+            return
+        try:
+            qa = verify_font(dest, "".join(opt_req), render_size=40)
+        except Exception:  # noqa: BLE001
+            return
+        blank = list(qa.blank or [])
+        if not blank:
+            return
+        res.warnings.append(
+            f"{len(blank)} 个**界面装饰符号**没有字形（不影响译文）"
+            f"：{''.join(blank[:24])}"
+            "。它们在真实文本里出现 0 次，只是工具猜界面可能会用到；"
+            "本机字体都没有这些字形，属正常情况。"
+        )
+
+    # ------------------------------------------------------------------
+
+    def _blank_glyph_retry(
+        self,
+        *,
+        base_font: Path,
+        required: str,
+        opt_set: set[str],
+        dest: Path,
+        base_face_index: int,
+        sources: list[Path],
+        blank: list[str],
+        min_cov: float,
+    ) -> MergeReport | None:
+        r"""合并后 QA 报"空白字形"时，**强制**让补充字体覆盖那些字符再合一次。
+
+        ## 为什么会有"空白字形"这种状态
+
+        默认的合并判据是 ``needed = required - base.cmap``：只要基础字体的
+        cmap 里有这个码点，就认为它"已经有字形"、跳过注入。
+
+        日文手写体**不满足**这个假设。实测 DemonsRoots 的 ``koin.ttf``：
+
+        * cmap 里 21363 个码点，含大量汉字；
+        * 抽样 400 个常用汉字，**264 个有字形、39 个字形是空的**
+          （``到你而那之如没些她但只从`` 全空）；
+        * 于是合并"成功"、覆盖率报 **100%**，QA 却数出 **1258 个空白字** ——
+          字体看着补好了，游戏里那 1258 个字仍是一片空白。
+
+        ## 为什么要重试而不是一开始就强制
+
+        "base 的这个字形是不是空的"**只有渲染验证（QA）才知道**，
+        合并器不该自己猜：把 cmap 里已有的字全部强制覆盖，等于把基础字体的
+        字形全部换成补充字体的 —— 那就不再是"保留原字体风格"了，
+        而"保留原风格"正是 ``merge`` 策略存在的理由。
+
+        所以顺序是：先按原判据合一次 → QA 渲染验证 → **只有 QA 报出空白**，
+        才把那些具体的字符强制覆盖、重合一次。这样风格该保留的地方保留，
+        真正渲染不出来的才换掉。
+
+        返回重试后的 :class:`MergeReport`；重试没意义或失败时返回 ``None``
+        （调用方沿用第一次的结果，错误信息也还是第一次的 —— 那才是真相）。
+        """
+        # 只强制覆盖"确实需要渲染、且 base 的 cmap 里本来就有"的那些。
+        # 不在 base cmap 里的字符本来就会走补充字体，force 它们没有意义。
+        #
+        # ⚠️ **`optional` 侧的字符排除在外**：它们本来就不该影响成败，
+        # 把它们塞进 `force_chars` 只会让合并报"原字体 cmap 摘掉了 N 个字符"
+        # 这种听起来很严重的警告，而结果是"猜出来的装饰符号还是补不上"。
+        forced = [c for c in blank if c and c in required and c not in opt_set]
+        if not forced:
+            return None
+        try:
+            info = load_font_info(base_font, base_face_index)
+        except Exception:  # noqa: BLE001
+            return None
+        if info is None or not info.cmap:
+            return None
+        forced = [c for c in forced if ord(c) in info.cmap]
+        if not forced:
+            return None
+
+        log.info(
+            "QA 报出 %d 个空白字形且它们本来就在原字体 cmap 里，"
+            "强制让补充字体覆盖后重试合并", len(forced),
+        )
+        try:
+            retry = merge_fonts_multi(
+                base_font,
+                sources,
+                dest,
+                required,
+                base_face_index=base_face_index,
+                force_chars="".join(forced),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("空白字形重试合并失败，沿用第一次的结果：%s", exc)
+            return None
+        if not retry.ok or retry.out_path is None:
+            log.warning(
+                "空白字形重试未产出结果（强制 %d 字，%s），沿用第一次的结果",
+                len(forced), (retry.warnings or ["无告警"])[0],
+            )
+            return None
+        # 只有重试**真的更好**才替换结果，避免"重试之后反而更差"。
+        # 同样只看 `required` 侧 —— optional 缺字本来就不算失败。
+        try:
+            after = self.audit(dest, "".join(c for c in required if c not in opt_set))
+        except Exception:  # noqa: BLE001
+            return None
+        if after.coverage < min_cov:
+            log.warning(
+                "空白字形重试后必需字符覆盖率只有 %.3f%%，沿用第一次的结果",
+                after.coverage * 100,
+            )
+            return None
+        return retry
 
     def ensure_charset_plannable(self, required: str, base_font: Path | None = None,
                                  candidates: list[Path] | None = None,

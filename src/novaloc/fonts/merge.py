@@ -716,6 +716,30 @@ def merge_fonts(
     return report
 
 
+def _drop_from_cmap(font: TTFont, cps: set[int]) -> int:
+    """把 ``cps`` 从字体的**所有** cmap 子表里摘掉，返回摘掉了几条。
+
+    只动 cmap，不动 glyf/loca —— 字形留在那里没人引用是无害的，
+    而重建 glyph order 会牵动 GID（`:func:`subset_font` 刚刚用
+    ``retain_gids=True`` 把它固定下来）。
+
+    为什么要遍历**所有**子表（`font["cmap"].tables`）而不是用
+    `getBestCmap()`：后者只返回"最佳"那一张。游戏引擎、浏览器、
+    Pillow **各自**会挑不同的子表（format 4 / format 12 / symbol），
+    只改一张就会出现"我们测着好了、游戏里还是空的"。
+    """
+    cmap = font.get("cmap")
+    if cmap is None:
+        return 0
+    n = 0
+    for sub in cmap.tables:
+        hit = [cp for cp in cps if cp in sub.cmap]
+        for cp in hit:
+            del sub.cmap[cp]
+        n = max(n, len(hit))
+    return n
+
+
 def merge_fonts_multi(
     base_path: Path,
     sources: list[Path],
@@ -725,6 +749,7 @@ def merge_fonts_multi(
     base_face_index: int = 0,
     prefix: str = "nvCJK",
     extra_symbols: str = " ",
+    force_chars: str = "",
 ) -> MergeReport:
     """把**多个**中文字体的字形按优先级依次并入 ``base_path``。
 
@@ -736,10 +761,29 @@ def merge_fonts_multi(
 
     **产物会保持基础字体的包装格式**（``.woff`` 仍是 ``wOFF`` 头），
     理由见 :func:`_detect_flavor`。
+
+    ## ★ ``force_chars``：cmap 里有、但字形是**空的**那些字
+
+    默认行为是 ``needed = required - base.cmap``：**基础字体的 cmap 里已经有
+    这个码点，就当它"有字形"，跳过注入**。
+
+    这个假设在日文手写体上**不成立**。实测 DemonsRoots 的 ``koin.ttf``：
+
+    * cmap 里有 21363 个码点，含大量汉字；
+    * 抽样 400 个常用汉字：**264 个有字形、39 个字形是空的**
+      （``到你而那之如没些她但只从`` 这些字形全空）；
+    * 于是合并"成功"、覆盖率报 **100%**，QA 却数出 **1258 个空白字** ——
+      字体看着补好了，游戏里那 1258 个字仍是一片空白。
+
+    `force_chars` 里的字符**无条件**交给补充字体去覆盖（即使 base 的 cmap
+    里已经有它）。要不要传、传哪些，由调用方决定 —— 因为"base 的这个字形
+    是不是空的"只有渲染验证（QA）才知道，合并器不该自己猜。
     """
     report = MergeReport(ok=False, method="merge_multi")
     required = set(required_chars) | set(extra_symbols)
     required_cps = {ord(c) for c in required}
+    # 强制覆盖的字符：把它们从"base 已有"里摘出来，让它们走补充字体那条路。
+    forced_cps = {ord(c) for c in force_chars if c}
     base_flavor = _detect_flavor(base_path)
 
     base_info = load_font_info(base_path, base_face_index)
@@ -748,7 +792,7 @@ def merge_fonts_multi(
     report.coverage_before = base_info.coverage_ratio("".join(sorted(required)))
 
     have = set(base_info.cmap.keys())
-    needed = required_cps - have
+    needed = (required_cps - have) | (forced_cps & required_cps)
     if not needed:
         report.out_path = _as_ttf_path(out_path)
         report.out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -769,6 +813,25 @@ def merge_fonts_multi(
 
         base = open_font(base_path, base_face_index)
         subset_font(base, have | needed, retain_gids=True, drop_layout=True)
+
+        # ★ 强制覆盖的字符必须**从基础字体的 cmap 里摘掉**。
+        #
+        # 光把它们放进 `needed` 是不够的：`Merger` 对两边都有的码点
+        # **保留基础字体那一条**，于是基础字体那个空字形原样留下 ——
+        # 实测「强制」和不强制产出**完全一样**（`¢` 的两个字形名都是
+        # 基础字体的 `cent`，不是补充字体重命名后的 `nvCJK0_0012C`）。
+        #
+        # 摘掉 cmap 条目之后，合并器在基础字体里找不到这个码点，
+        # 只能从补充字体取 —— 也就拿到了真正的字形。
+        # 字形本身留在 glyf 里不影响（`subset_font` 已经把 glyph order
+        # 固定成 `retain_gids=True`，摘 cmap 不动 GID）。
+        if forced_cps:
+            dropped = _drop_from_cmap(base, forced_cps)
+            if dropped:
+                report.warnings.append(
+                    f"{dropped} 个字符原字体有码点但字形为空，"
+                    "已从原字体 cmap 摘除，改由补充字体提供"
+                )
         fonts: list[TTFont] = [base]
 
         metrics_snap: dict[str, dict[str, int]] = {}
@@ -927,8 +990,22 @@ def replace_with_font(
     cjk_font: Path,
     out_path: Path,
     required_chars: str,
+    *,
+    optional_chars: str = "",
+    min_coverage: float = 0.999,
 ) -> MergeReport:
-    """直接用中文字体替换。"""
+    """直接用中文字体替换。
+
+    ``optional_chars``：**可放弃**的字符（工具猜界面会渲染的装饰符号）。
+    它们算进 `coverage_after`（那是"这份字体到底覆盖了多少"的完整答案），
+    但**不参与成败判定** —— 与 `patch_font` 里"分两层"的契约一致。
+
+    不加这个参数就会出现自相矛盾：规划器按 `optional` 放行了那几个
+    补不上的装饰符号（`¢¥µ·¿í ※ ‥ ′ ″`），成败判定却因为它们判失败。
+    实测 DemonsRoots 的 `ship.otf`：`lxgw-wenkai-screen.ttf` 覆盖
+    **99.88%**，缺的正是那几个符号，于是替换被判失败、退回"合并失败"，
+    字体原样留着（77.2% 中文覆盖）⇒ 游戏里一片口口口。
+    """
     report = MergeReport(ok=False, method="replace")
     if src_font is not None:
         info_before = load_font_info(src_font)
@@ -940,9 +1017,15 @@ def replace_with_font(
         raise MergeError("替换后的字体无法读取")
     report.coverage_after = after.coverage_ratio(required_chars)
     report.out_path = out_path
-    report.ok = report.coverage_after >= 0.999
+    opt = {c for c in optional_chars if c}
+    strict = "".join(c for c in required_chars if c not in opt)
+    coverage_strict = after.coverage_ratio(strict) if strict else 1.0
+    report.ok = coverage_strict >= min_coverage
     if not report.ok:
-        report.warnings.append(f"替换字体覆盖不足：{report.coverage_after:.4%}")
+        report.warnings.append(
+            f"替换字体覆盖不足：必需字符 {coverage_strict:.4%}"
+            f"（含可放弃字符 {report.coverage_after:.4%}）"
+        )
     return report
 
 

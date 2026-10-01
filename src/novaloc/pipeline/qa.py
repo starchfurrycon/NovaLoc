@@ -200,9 +200,38 @@ def run_qa(ws: Workspace, ctx: Context) -> dict[str, Any]:
     collisions = {t: sorted(s) for t, s in by_target.items() if len(s) > 1}
     if collisions:
         sample_c = [{"target": t, "sources": s} for t, s in list(collisions.items())[:10]]
+        # ⚠️ 级别从 ERROR **降为 WARN**（真实数据校准后的决定）。
+        #
+        # 原来这里写的是 ERROR，理由是"**真**撞词的短标签一定是用户可见的
+        # 缺陷，不存在'这样也可以'的解释空间"。那个理由对**真**撞词成立，
+        # 但这个判据分不出"真撞词"和"巧合"—— 它只看"两个 ASCII 缩写
+        # 是否落到同一个译文"，而那**不一定**是缺陷。
+        #
+        # 实测 DemonsRoots（45572 条）命中 2 组，**两组都不是错译**：
+        #
+        #     '是的。'  ← Aye. / Yes.    两个都是肯定回答，中文本来就同一个词
+        #     '治疗药'  ← Cure / Heal    两个技能都叫这个名，译者的一致选择
+        #
+        # 而它**本来要抓**的事故（`HP` 译成"生命值"、应为"魔法值"）
+        # 有一个共同点：那条错译是**一对标签中的一个被译错**，
+        # 于是同族的另一个会跟着撞上来（`HP`/`MP`、`HP%`/`MP%`、
+        # `ATK`/`DEF`、`ATK+`/`DEF+` —— 都是**结构同族**的标签）。
+        # 上面那两组反例彼此毫无结构关系（长度相同只是巧合）。
+        #
+        # 想按"结构同族"（互为子串、或同长）去细化，实测**分不开**：
+        # `Aye.`/`Yes.` 同长、`Cure`/`Heal` 同长，和 `HP`/`MP` 一模一样。
+        # 所以只能二选一：
+        #
+        #   * 保持 ERROR ⇒ 每局游戏都因两组**正确**的翻译而质检不过，
+        #     用户学会忽略质检（这正是这个文件前面反复警告的失败模式）；
+        #   * 降为 WARN ⇒ 真撞词会被人看见（只是不拦流程）。
+        #
+        # 选后者：**拦下正确产物**比**漏放一个可疑项**更糟，
+        # 而且这一项本来就是给人看的提示（`samples` 里两条都列出来了）。
         issues.append(_issue(
-            Severity.ERROR, "consistency",
-            f"{len(collisions)} 个译文被多个不同的 UI 缩写共用（很可能译错）："
+            Severity.WARN, "consistency",
+            f"{len(collisions)} 个译文被多个不同的 UI 缩写共用"
+            "（请确认这些缩写是不是同一个意思）："
             + "；".join(f"{t} ← {'/'.join(s)}" for t, s in list(collisions.items())[:5]),
             samples=sample_c,
         ))
@@ -300,10 +329,20 @@ def run_qa(ws: Workspace, ctx: Context) -> dict[str, Any]:
 
         # 补丁记录本身的完整性（没有对应 FontCoverage 的条目也要看）。
         # 同样用 `ok is False` 判失败，不依赖 action 的取值。
+        #
+        # ⚠️ **必须和上面那段共用同一个去重键**。
+        #
+        # 上面 (a) 用的是 `_mark_once(fc.font_id)`（裸 font_id），
+        # 这里原来用的是 `_mark_once(f"patch:{p.get('font_id')}")`
+        # —— 前缀不同 ⇒ 去重集合里是两个不同的键 ⇒ **同一个字体报两遍**。
+        #
+        # 实测 DemonsRoots：4 个失败字体 → 报出 **8 条** error。
+        # 重复不会改变"是否通过"的结论，但会让用户以为坏了 8 个字体，
+        # 也让错误数失去参考价值（错误数是给人看的，翻倍就等于失真）。
         for p in patches:
             if p.get("ok") is False:
                 font_ok = False
-                if _mark_once(f"patch:{p.get('font_id')}"):
+                if _mark_once(p.get("font_id")):
                     issues.append(_issue(
                         Severity.ERROR, "fonts",
                         f"字体 {p.get('font_id')} 补丁失败：{p.get('error') or '未知原因'}",

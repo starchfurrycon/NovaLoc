@@ -92,9 +92,25 @@ def _consistency_issues(tmp_path: Path, pairs: list[tuple[str, str]]) -> list[di
 
 
 def test_short_labels_sharing_one_translation_is_flagged(tmp_path: Path) -> None:
-    """HP/MP 都译成"生命值" —— 必须报出来，且是 ERROR。
+    """HP/MP 都译成"生命值" —— 必须报出来。
 
     这是本文件的**核心用例**，对应实测发现的真实错译。
+
+    ## 级别是 WARN，不是 ERROR（真实数据校准后的决定）
+
+    原来这里断言 ERROR，理由是"**真**撞词的短标签一定是用户可见的缺陷"。
+    那个理由对真撞词成立，但**这个判据分不出真撞词和巧合** ——
+    它只看"两个 ASCII 缩写是否落到同一个译文"。
+
+    实测 DemonsRoots（45572 条）命中 2 组，**两组都不是错译**：
+
+        '是的。'  ← Aye. / Yes.    两个都是肯定回答，中文本来就同一个词
+        '治疗药'  ← Cure / Heal    两个技能都叫这个名
+
+    于是级别降为 WARN：真撞词仍会被列出来（含 `samples`），只是不拦流程。
+    理由见 `qa.py` 里那段说明 —— **拦下正确产物**比**漏放一个可疑项**更糟。
+
+    这条测试仍然钉住"HP/MP 必须被报出来"，只是不再要求它拦流程。
     """
     issues = _consistency_issues(tmp_path, [
         ("HP", "生命值"),
@@ -102,11 +118,38 @@ def test_short_labels_sharing_one_translation_is_flagged(tmp_path: Path) -> None
         ("Attack", "攻击"),
     ])
     assert issues, "不同的短标签共用一个译文，质检却没报"
-    assert any(i.get("severity") == "error" for i in issues), (
-        f"这必须是 ERROR（用户可见缺陷，不存在'也可以'的解释空间）：{issues}"
-    )
     msg = " ".join(i.get("message", "") for i in issues)
     assert "MP" in msg and "HP" in msg, f"报错信息里应能看出是哪两条撞了：{msg}"
+
+
+#: 真实数据（DemonsRoots）上命中的 **2 组，全都不是错译**。
+#:
+#: 这两条是"降级别"这个决定的事实依据，所以必须钉在测试里 ——
+#: 否则日后有人把它改回 ERROR，测试全绿而真实项目又开始被误拦。
+REAL_DATA_NON_DEFECT_COLLISIONS: list[tuple[str, str]] = [
+    # 两个都是肯定回答，中文本来就同一个词
+    ("Aye.", "是的。"), ("Yes.", "是的。"),
+    # 两个技能都叫这个名，是译者的一致选择
+    ("Cure", "治疗药"), ("Heal", "治疗药"),
+]
+
+
+def test_real_data_collisions_are_warn_not_error(tmp_path: Path) -> None:
+    r"""真实数据命中的撞词组**不能拦流程**（它们不是错译）。
+
+    这一条同时钉住两件事：
+
+    1. 它们仍然被**报出来**（人得能看见、能确认）；
+    2. 级别是 WARN，不是 ERROR（否则项目质检永远不过）。
+    """
+    issues = _consistency_issues(tmp_path, REAL_DATA_NON_DEFECT_COLLISIONS)
+    coll = [i for i in issues if "缩写共用" in (i.get("message") or "")]
+    assert coll, "撞词组应该被报出来（供人确认）"
+    assert all(i.get("severity") == "warn" for i in coll), (
+        f"这 2 组是真实数据里**正确**的翻译，不该拦流程：{coll}"
+    )
+    errors = [i for i in issues if i.get("severity") == "error"]
+    assert not errors, f"它们不该产生 ERROR：{[i.get('message') for i in errors]}"
 
 
 def test_distinct_short_labels_are_not_flagged(tmp_path: Path) -> None:
@@ -239,9 +282,12 @@ def test_ascii_abbreviations_are_still_flagged(tmp_path: Path) -> None:
         ("DEF", "攻击力"),         # 缩写撞词 → 必须报
         ("EXP", "经验值"),
     ])
-    errors = [i for i in issues if i.get("severity") == "error"]
-    assert errors, "真缩写碰撞被放宽掉了，判据等于失效"
-    msg = " ".join(i.get("message", "") for i in errors)
+    # 级别是 WARN（见 `test_short_labels_sharing_one_translation_is_flagged`
+    # 里"降级别"的依据）。这里钉的是**判据没被彻底关掉**：
+    # 报出来就行，不要求它拦流程。
+    coll = [i for i in issues if "缩写共用" in (i.get("message") or "")]
+    assert coll, "真缩写碰撞被放宽掉了，判据等于失效"
+    msg = " ".join(i.get("message", "") for i in coll)
     assert "MP" in msg and "HP" in msg, f"应报出 HP/MP：{msg}"
     assert "DEF" in msg and "ATK" in msg, f"应报出 ATK/DEF：{msg}"
 
@@ -255,7 +301,7 @@ def test_abbreviation_with_punctuation_counts(tmp_path: Path) -> None:
         ("HP%", "生命值%"),
         ("MP%", "生命值%"),
     ])
-    assert any(i.get("severity") == "error" for i in issues), (
+    assert any("缩写共用" in (i.get("message") or "") for i in issues), (
         "带 % 的缩写应该照旧算缩写"
     )
 
