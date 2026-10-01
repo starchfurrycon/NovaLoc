@@ -2085,6 +2085,78 @@ def qa(
 
 
 # --------------------------------------------------------------------------
+# review：接触印样（把待复核的贴图拼成一张大图）
+# --------------------------------------------------------------------------
+
+
+@app.command("review")
+def review(
+    project_id: str = typer.Argument(..., help="项目 id。"),
+    all_images: bool = typer.Option(
+        False, "--all", help="拼**所有**处理过的贴图，而不只是待复核的。"
+    ),
+    limit: int = typer.Option(0, "--limit", help="最多拼多少张（0 = 全部）。"),
+    per_sheet: int = typer.Option(24, "--per-sheet", help="每张印样放几格。"),
+    cols: int = typer.Option(4, "--cols", help="网格列数（最多 4）。"),
+    cell: int = typer.Option(400, "--cell", help="单元格边长（像素）。"),
+    after_only: bool = typer.Option(
+        False, "--after-only", help="只放产物，不做“原图 | 产物”对照。"
+    ),
+    no_boxes: bool = typer.Option(False, "--no-boxes", help="不画文字框。"),
+    json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
+) -> None:
+    """生成接触印样：把需要人工复核的贴图拼成一张大图，一眼看完。"""
+    global _JSON_MODE
+    _JSON_MODE = json_output
+
+    from .review import contact_sheet
+
+    ws = _open_ws(project_id)
+    res = contact_sheet(
+        ws,
+        only_flagged=not all_images,
+        limit=limit or None,
+        per_sheet=per_sheet,
+        cols=cols,
+        cell=cell,
+        before_after=not after_only,
+        draw_boxes=not no_boxes,
+    )
+
+    if json_output:
+        _echo_json(
+            {
+                "ok": res.ok,
+                "items": res.items,
+                "sheets": res.sheets,
+                "drawn_boxes": res.drawn_boxes,
+                "missing_geometry": res.missing_geometry,
+                "unreadable": res.unreadable,
+                "files": [str(p) for p in res.out_paths],
+            }
+        )
+        raise typer.Exit(code=0 if res.ok else 1)
+
+    if not res.items:
+        console.print(
+            "[yellow]没有需要复核的贴图[/yellow]"
+            f"（{'--all 也没找到记录' if all_images else '用 --all 可以拼全部'}）。"
+        )
+        raise typer.Exit(code=0)
+
+    for p in res.out_paths:
+        console.print(f"[green]✓[/green] {p}")
+    console.print(res.summary())
+    if res.missing_geometry:
+        console.print(
+            "[yellow]提示[/yellow]：这些记录来自旧版流水线（没存坐标）。"
+            "重跑 [b]novaloc run "
+            f"{project_id} --stage images_localize --force[/b] 后即可画框。"
+        )
+    raise typer.Exit(code=0 if res.ok else 1)
+
+
+# --------------------------------------------------------------------------
 # serve：起 Web 后端
 # --------------------------------------------------------------------------
 

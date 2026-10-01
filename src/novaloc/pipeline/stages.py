@@ -1236,6 +1236,8 @@ class Pipeline:
                 results.append({
                     "uid": asset.uid,
                     "path": asset.path,
+                    "width": res.asset.width,
+                    "height": res.asset.height,
                     "ok": bool(res.ok and written),
                     "translated": res.translated,
                     "needs_review": len(res.needs_review),
@@ -1256,6 +1258,27 @@ class Pipeline:
                             "ok": o.ok,
                             "overflow": o.overflow,
                             "too_small": o.too_small,
+                            # ▲ 几何信息**必须落盘**，否则审校无法进行。
+                            #
+                            # 以前这里只存 id/source/target/ok/overflow/too_small，
+                            # 于是 `localize.json` 里**一个坐标都没有**：
+                            #   * 「标注图」端点只能现场重跑 OCR 才画得出框；
+                            #   * 接触印样（`review.py`）根本做不了 ——
+                            #     它要的正是"哪块文字在哪"。
+                            # 而这两个功能存在的唯一理由就是"让人能看"。
+                            #
+                            # 实测代价：DemonsRoots 的 1,141 条记录里
+                            # 带坐标的 block **0 个**，标注图端点实际不可用。
+                            #
+                            # box 是 `(x0, y0, x1, y1)`，quad 是四点（斜排文字）。
+                            # quad 缺省不写（省体积），box 一定要写。
+                            "box": list(o.box),
+                            **(
+                                {"quad": [[float(x), float(y)] for x, y in o.quad]}
+                                if o.quad
+                                else {}
+                            ),
+                            "confidence": round(float(getattr(o, "confidence", 0.0)), 4),
                             "warnings": list(o.warnings),
                         }
                         for o in res.outcomes

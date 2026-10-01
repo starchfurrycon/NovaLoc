@@ -35,11 +35,12 @@
 
 每个阶段幂等，可通过工作区文件断点续跑。
 
-### 1.2 四个引擎适配器
+### 1.2 五个引擎适配器
 
 | 引擎 | 状态 | 覆盖内容 | `wire_fonts` |
 |---|---|---|---|
 | RPG Maker MV / MZ | ✅ 完整 | `data/*.json` 全库（角色/道具/技能/敌人/状态/图块/系统术语）+ 地图事件指令（对白、选项、说话人名） | ✅ 改写 `fonts/gamefont.css` 的 `@font-face` |
+| RPG Maker VX Ace / VX / XP | ✅ 完整 | `.rxdata`（Marshal 4.9 / UTF-8）与 `.rvdata`（Marshal 4.8 / CP932）全库 + `@events` 地图事件（含 `401` 组槽位拆分、`102` 选项、`105` 滚动文本） | ✅ 引擎无需字体补丁（见 `fonts` 阶段说明） |
 | Ren'Py | ✅ 完整 | `.rpy` 对白、菜单选项、角色名、`config.name` 等 | ✅ 生成 `game/novaloc_fonts.rpy` 覆盖文件 |
 | Unity | ⚠️ 部分 | `StreamingAssets` 与 `*_Data` 下的明文 json/csv/txt/xml/po/ini | ❌ **未覆写**（需要处理 TMP，见第 2.3 节） |
 | 散装文件 | ✅ 完整 | 任意目录下的图片或文本，任何引擎的兜底方案 | ❌ 未覆写（按相对路径复制） |
@@ -466,7 +467,7 @@ apply 末尾    repack(changes_from=out/) 把改动打回原归档，原文件�
 | 引擎 | 状态 | 难度 | 理由 |
 |---|---|---|---|
 | **Godot** | 🔜 规划中 | 中 | `.tscn` / `.tres` 是**纯文本**，解析风险低；`.pck` 需要解包。变现路径清楚 |
-| **RPG Maker 旧版本**（VX / VX Ace / XP） | 🔜 规划中 | **低** | 与 MV/MZ 的 `data/` JSON 结构高度相似，`RPG Maker VX Ace` 用 `.rxdata`（Ruby Marshal 格式），需要额外解析器；XP 更老。**投入产出比最高的一项** |
+| **RPG Maker 旧版本**（VX / VX Ace / XP） | ✅ **已完成** | — | `engines/rpgvx.py`。Ruby Marshal 4.8/4.9 编解码器 `engines/rubymarshal.py`（按官方格式规范实现，94 项测试）。实测合成夹具 260 unit / 13 文件，回写**精确**（槽位切片逐条核对 0 处不符、13 个 `.rxdata` 全部读回） |
 | **Wolf RPG** | 🔍 调研中 | 中 | `.wolf` / 数据文件是私有二进制格式；社区有工具但格式未完全文档化 |
 | **KiriKiri**（`.xp3`） | 🔍 调研中 | 中高 | `.ks` 脚本是纯文本（容易），但 `.xp3` 容器与加密变体是难点。且这个生态的文本量大、翻译价值高 |
 | **NScripter / ONScripter** | 🔍 调研中 | 低 | `.txt` / `.dat` 格式简单，但生态老旧 |
@@ -478,34 +479,35 @@ apply 末尾    repack(changes_from=out/) 把改动打回原归档，原文件�
 需要动的只有两处：新建 `src/novaloc/engines/<name>.py`，以及在
 `engines/__init__.py` 的 `_CLASSES` 与 `_resolve()` 里登记。
 
-### 2.6 `review.py` 接触印样 —— 🔜 规划中
+### 2.6 `review.py` 接触印样 —— ✅ 已完成
 
-**现状**：不存在这个模块。
+**现状**：`src/novaloc/review.py` 已实现，CLI 为 `novaloc review <id>`，
+API 为 `GET /api/projects/{pid}/review/contact_sheet`。
 
-**需求**：批量贴图审校时，逐张打开图片效率很低。需要生成"接触印样"
-（contact sheet）—— 把 N 张重绘后的贴图拼成一张大图（带编号），
-让用户一眼看出哪几张需要处理。
+**做了什么**：把需要人工复核的贴图缩放到统一单元格、拼成网格大图，
+每格标编号 + 文件名 + 状态。默认**两列对照**（左原图右产物）——
+判断"翻得对不对、有没有残留外文"必须两图对照；`--after-only` 可切单列。
 
-**已有的基础**：`images/annotate.py` 已经有 `annotate_blocks()`，
-能在图上画出文字框、角标与序号，产出"带标注的可视化图"；
-API 也已经有 `GET /api/projects/{pid}/images/{uid}/annotated`。
-所以 `review.py` 要做的是**在它之上做拼版**：
+**顺带修了一个前置缺口**：`localize.json` **一个坐标都没存** ——
+`stages.py` 只写了 `id/source/target/ok/overflow/too_small/warnings`。
+于是：
 
-```
-读 images/localize.json 找 needs_review 的图
-  → 逐张 annotate_blocks()
-  → 缩放到统一单元格尺寸
-  → 按网格拼成一张大图
-  → 每格左上角写编号 + 文件名
-  → 输出到 images/analyzed/contact_sheet_N.png
-```
+* 「标注图」端点（`annotate_blocks`）**拿不到框**，实际不可用；
+* 接触印样根本做不了（它要的正是"哪块文字在哪"）。
 
-**为什么要做**：当前 `needs_review` 的判定已经存在
-（`overflow` / `too_small` / `warnings`），QA 报告也会统计
-`images_review` 的数量，但**用户没有高效的方式去看这些图**。
-缺口不在检测，在呈现。
+实测 DemonsRoots 的 1,141 条记录里带坐标的 block **0 个**。
+现已补上 `box`（必写）、`quad`（斜排文字，缺省不写）、
+`confidence`，以及整图的 `width`/`height`（审校页以前显示 `0x0`）。
 
-**优先级**：中。它不增加能力，只提升可用性，所以排在第 2.1–2.5 之后。
+**如实报告的两个点**（都有测试守住）：
+
+* 读不出来的原图进 `unreadable` 并让 `ok=False` ——
+  印样少一张而没人知道，比不生成印样更危险；
+* 旧工作区没有坐标时 `missing_geometry` 计数并给出"重跑
+  `images_localize`"的可执行指引 —— 否则用户会以为"这张图确实没文字"。
+
+**旧工作区需要重跑一次 `images_localize` 才有坐标**（这不会改变图片产物，
+只是把坐标补进 `localize.json`）。
 
 ---
 

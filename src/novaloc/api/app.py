@@ -558,6 +558,38 @@ def create_app() -> FastAPI:
             ws.save_images(images)
         return {"updated": updated}
 
+    @app.get("/api/projects/{pid}/review/contact_sheet")
+    def get_contact_sheet(
+        pid: str,
+        all_images: bool = False,
+        limit: int = 0,
+        per_sheet: int = 24,
+        cols: int = 4,
+        cell: int = 400,
+        after_only: bool = False,
+    ) -> FileResponse:
+        """生成接触印样并返回第一个文件（供审校页直接显示）。
+
+        为什么要这个端点：`needs_review` 的判定早就有了，但没有**高效看**
+        这些图的方式 —— 逐张打开非常低效。接触印样把 N 张拼成一张网格大图。
+        """
+        ws = get_ws(pid)
+
+        from ..review import contact_sheet
+
+        res = contact_sheet(
+            ws,
+            only_flagged=not all_images,
+            limit=limit or None,
+            per_sheet=per_sheet,
+            cols=cols,
+            cell=cell,
+            before_after=not after_only,
+        )
+        if not res.out_paths:
+            raise HTTPException(404, res.summary() or "没有需要复核的贴图")
+        return FileResponse(res.out_paths[0])
+
     @app.get("/api/projects/{pid}/images/{uid}/annotated")
     def get_annotated(pid: str, uid: str) -> FileResponse:
         """把该贴图的文字框画出来，供人工复核。"""
