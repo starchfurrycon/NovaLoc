@@ -297,7 +297,10 @@ def build_single_user_prompt(
         parts.append(glossary_block)
     if extra_context:
         parts.append(f"背景信息：{extra_context}")
-    parts.append("原文（⟦n⟧ 是必须原样保留的占位符）：")
+    parts.append(
+        # ★ 记号必须**原样写进译文**，且用**一个具体例子**说明。
+        "原文（⟦n⟧ 是图标/变量占位符，必须原样抄进译文，一个都不能删；它们在译文里的位置可以随中文语序调整。例：'⟦0⟧: Confirm' 要译成 '⟦0⟧：确认'）："
+    )
     parts.append(text)
     parts.append('\n只返回 JSON：{"t": "中文译文"}')
     return "\n".join(parts)

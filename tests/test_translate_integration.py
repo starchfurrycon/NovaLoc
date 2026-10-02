@@ -54,11 +54,23 @@ def _parse_prompt(prompt: str) -> tuple[list[tuple[int, str]], bool]:
     single = "只返回 JSON" in prompt
     pairs: list[tuple[int, str]] = []
     if single:
-        marker = "原文（⟦n⟧ 是必须原样保留的占位符）："
-        if marker in prompt:
-            body = prompt.split(marker, 1)[1].split("只返回 JSON", 1)[0].strip()
-            if body:
-                pairs = [(0, body)]
+        # ⚠️ 不要写死整句提示词文案 —— 那会把"假 Ollama"和真实提示词的
+        # 措辞绑死，改一个词就整个测试乱套（实测：提示词里加了一句
+        # 关于记号的正例说明后，这里抽不到 body，这个测试直接红）。
+        # 按**结构**定位：正文在"原文…："那一行之后、"只返回 JSON"之前。
+        body = ""
+        for ln in prompt.splitlines():
+            if ln.startswith("原文（") and ln.rstrip().endswith("："):
+                body = prompt.split(ln, 1)[1].split("只返回 JSON", 1)[0]
+                break
+        if not body:
+            # 兜底：老格式
+            marker = "原文（⟦n⟧ 是必须原样保留的占位符）："
+            if marker in prompt:
+                body = prompt.split(marker, 1)[1].split("只返回 JSON", 1)[0]
+        body = body.strip()
+        if body:
+            pairs = [(0, body)]
         return pairs, True
     for ln in prompt.splitlines():
         if " → " not in ln or ln.lstrip().startswith("·"):
