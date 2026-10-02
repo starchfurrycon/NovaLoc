@@ -167,6 +167,81 @@ def _loose_fix(text: str) -> str:
     return out
 
 
+def _salvage_numbered_map(text: str) -> list[dict[str, Any]]:
+    r"""抢救**被截断的"编号 → 译文"对象**。
+
+    ## 实测（Round 10，真实端到端 stderr）
+
+    ```
+    批 0（1 条）第 2 次失败：单条翻译失败（所有解析策略均失败，
+        原始输出前 200 字符：'{"1": "在接下来的 1 个回合内，自动保护生命值较低的队友。",
+                             "2": "自动防御生命值较小的同伴。",
+                             "3": "在 1 回合内，自动保护生命值低的队友。",
+                             "4": "在接下方的 1 回合内，自动保护生命值较低的队友。",
+                             "5": "在 1 轮内，自动保护生命值较少的队友。",
+                             "6": "在接下来的 1 轮内，自动保护生命值较低的'）
+    ```
+
+    **`{"1": …, "2": …, … "6": …` 前面 6 对全是完整的**，只是第 7 项被
+    `num_predict` 截断、末尾少了 `}`。而 `json.loads` 一失败，
+    **这 6 条完整译文全部被丢弃** ⇒ 该条目内容丢失。
+
+    ## 与既有 `_salvage_items` 的区别
+
+    `_salvage_items` 只认 `{"i": n, "t": …}` 这种**数组项**形态；
+    这里的形态是**数字键对象**（`{"1": …, "2": …}`），它匹配不到。
+
+    ## 为什么要卡"连续且从 0 或 1 开始"
+
+    正则捞 `"N": "…"` 对**任何**含这种文本的响应都会命中。若不加限制，
+    一段恰好包含 `"1": "…"` 的**正文**也会被当成译文映射 —— 那是
+    **凭空造出结构**，比丢一条更糟。
+
+    真实截断只可能发生在**尾部**，所以"完整项"必然是**从 0 或 1 开始
+    的一段连续编号**。要求连续，就把"正文里偶然出现一个编号"挡在外面。
+    """
+    pairs: list[tuple[int, str]] = []
+    pat = re.compile(r'"(\d+)"\s*:\s*("(?:[^"\\]|\\.)*")', re.DOTALL)
+    for m in pat.finditer(text):
+        try:
+            val = json.loads(m.group(2))
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(val, str) and val.strip():
+            pairs.append((int(m.group(1)), val))
+    if not pairs:
+        return []
+
+    # 去重（同一编号出现多次时保留第一次）并按编号排序
+    seen: set[int] = set()
+    uniq: list[tuple[int, str]] = []
+    for idx, val in pairs:
+        if idx not in seen:
+            seen.add(idx)
+            uniq.append((idx, val))
+    uniq.sort(key=lambda x: x[0])
+
+    keys = [i for i, _ in uniq]
+    # 从 0 或 1 开始，且**连续** —— 否则不认（见上面的理由）
+    start = keys[0]
+    if start not in (0, 1):
+        return []
+    if keys != list(range(start, start + len(keys))):
+        return []
+    # ★ 一律**重编号为 0 基准**。
+    #
+    # 为什么安全：截断只可能发生在**尾部**，所以"完整项"必然是
+    # **从编号起点开始的一段前缀** —— 编号不会从中间开始缺。
+    # 因此 `{1: …, 2: …}` 就是"原来 6 项里的前 5 项"，
+    # 重编号成 `{0: …, 1: …}` 不改变任何一项的含义。
+    #
+    # 为什么必须重编号：`to_translation_map` 只认从 0 开始的键
+    # （这正是 #30 的形状假设问题）。实测过：不重编号时
+    # `to_translation_map` 给出的映射是 `{1:…, 5:…}`、`get(0)` 为 `None`，
+    # 于是在 `_call_single` 里仍然等价于"没有译文"。
+    return [{"i": n, "t": v} for n, (_, v) in enumerate(uniq)]
+
+
 def _salvage_items(text: str) -> list[dict[str, Any]]:
     """正则逐项抠出 ``{"i": n, "t": "..."}``。
 
@@ -369,6 +444,19 @@ def parse_json_loose(text: str) -> ParseResult:
                 continue
     except ImportError:
         pass
+
+    # 级别 5.5：抢救**被截断的"编号 → 译文"对象**
+    #
+    # 必须排在 `_salvage_items` **之前**：后者只认 `{"i": n, "t": …}`
+    # 数组项形态，对 `{"1": "…", "2": "…"` 这种数字键对象返回空，
+    # 于是会一路掉到"所有解析策略均失败"，把**前面已完整的几对全丢掉**。
+    numbered = _salvage_numbered_map(text)
+    if numbered:
+        res.value = numbered
+        res.method = "numbered-map-salvage"
+        res.ok = True
+        res.notes.append(f"JSON 被截断，按编号抢救出 {len(numbered)} 项")
+        return res
 
     # 级别 6：逐项 salvage
     salvaged = _salvage_items(text)
