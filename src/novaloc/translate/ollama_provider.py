@@ -1094,8 +1094,31 @@ class OllamaTranslationProvider:
             got_lines: list[str] = []
             bad = False
             for one in src_lines:
+                # ★ 这里必须**先屏蔽这一行**，再把掩码文本交给 `_call_single`。
+                #
+                #   `_call_single(item, masked, *, slots=...)` 的第二个参数是
+                #   **掩码后**的文本，`slots` 是它对应的槽位表 ——
+                #   返回时靠 `slots` 把 `⟦n⟧` 还原成原样记号。
+                #
+                #   原先这里传的是**裸源码行** `one`、且**不传 `slots`**，
+                #   于是：
+                #     * `_call_single` 内部拿 `one` 当"掩码文本"，
+                #       而它其实没被掩码，`slots` 为空 ⇒ 模型回什么都不会被还原；
+                #     * 更糟的是 `slots` 缺失后，内部的
+                #       `if ph.remaining_masks(got_one)` 之类的判据失去依据。
+                #   结果这条"逐行救援"路径**几乎救不回任何条目**
+                #   （实测长条目 `perline_recovered = 0`）。
+                #
+                #   逐行送翻时每行**自己就没有换行**了，所以这里
+                #   `newlines=False`（行内没有换行可屏蔽）；
+                #   行内该保护的占位符（`\V[1]`、`\C[0]` 等）仍然照样屏蔽。
+                line_mask = ph.mask(one, newlines=False)
                 try:
-                    got_one = self._call_single(batch_items[local_i], one)
+                    got_one = self._call_single(
+                        batch_items[local_i],
+                        line_mask.text,
+                        slots=line_mask.slots,
+                    )
                 except ProviderError:
                     bad = True
                     break
