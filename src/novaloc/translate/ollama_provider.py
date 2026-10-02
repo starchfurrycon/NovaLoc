@@ -733,6 +733,10 @@ class OllamaTranslationProvider:
             # ---- 2. 调用（带重试与逐条降级） ----
             raw_by_index: dict[int, str] = {}
             err: str | None = None
+            #: 本批里**已经逐条试过且失败**的下标。
+            #: 跨重试轮次保留 —— 否则每次退化成逐条时都会把这些条目
+            #: 再问一遍（实测浪费见下面 `if li in per_item_failed` 处的注释）。
+            per_item_failed: set[int] = set()
             for attempt in range(3):
                 try:
                     if len(batch_items) == 1:
@@ -762,12 +766,32 @@ class OllamaTranslationProvider:
                         singles: dict[int, str] = {}
                         single_err: str | None = None
                         for li, it in enumerate(batch_items):
+                            if li in per_item_failed:
+                                continue
+                            # ★ 已经逐条试过且失败的条目**不再重试**。
+                            #
+                            # 实测浪费（一次真实端到端跑，`Dungeon And
+                            # Darkness-Steam` + `Midnight Exhibitionist DX`）：
+                            #
+                            #   "批 N 条里只回 M 条" 出现 48 次
+                            #   缺的条数合计 **403** ⇒ 额外 403 次单条请求
+                            #   "批 N（M 条）第 K 次失败" 24 次，
+                            #   其中 K≥2 的 8 次
+                            #
+                            # 第 2 次失败（attempt=1）会进这个逐条循环；
+                            # 若它没救回任何条目，外层会**再循环一次**
+                            # （attempt=2），于是同一批的每一条又被逐条问一遍。
+                            # 那些刚刚失败的条目基本不会因为"再问一次"而变好
+                            # —— 触发源是内容（见下），不是偶发抖动。
                             try:
                                 got = self._call_single(it, masked_all[li], slots=slots_all[li])
                                 if got:
                                     singles[li] = got
+                                else:
+                                    per_item_failed.add(li)
                             except _RETRYABLE as exc2:
                                 single_err = str(exc2)
+                                per_item_failed.add(li)
                         if singles:
                             raw_by_index, err = singles, single_err
                             break
@@ -790,18 +814,35 @@ class OllamaTranslationProvider:
                 for li in empty:
                     if raw_by_index.get(li, "").strip():
                         continue
+                    # ★ 刚刚在逐条降级里试过并失败的条目，这里不再补。
+                    #
+                    # 为什么要跳过：走完逐条降级后 `raw_by_index` 只装了
+                    # "救回来的"那些，所以**失败过的条目也在这个 `empty` 里**。
+                    # 不跳过的话，它们会立刻被单独再问一次 —— 而它们刚刚
+                    # 就是单独问过才失败的（触发源是内容，不是偶发抖动）。
+                    # 实测这类重复请求在两次真实端到端跑里量到 400+ 次。
+                    #
+                    # 保留对**其余**空条目的补空：那些是"批量调用成功、
+                    # 但这条返回空串"的情况（`MP: {mp}` 这类短词 + 占位符），
+                    # 它们**没有**被逐条试过，补空对它们确实有效
+                    # （3 次运行 3 次复现，见上方注释）。
+                    if li in per_item_failed:
+                        continue
                     try:
                         got = self._call_single(
                             batch_items[li], masked_all[li], slots=slots_all[li]
                         )
                     except _RETRYABLE as exc:
                         log.debug("补空第 %d 条失败：%s", li, exc)
+                        per_item_failed.add(li)
                         continue
                     if got:
                         raw_by_index[li] = got
                         self.stats["empty_recovered"] = (
                             self.stats.get("empty_recovered", 0) + 1
                         )
+                    else:
+                        per_item_failed.add(li)
 
             # ---- 3. 还原 + 校验 + 守卫 ----
             for local_i, global_i in enumerate(batch):
