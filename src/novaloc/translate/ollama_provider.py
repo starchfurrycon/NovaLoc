@@ -1288,7 +1288,7 @@ class OllamaTranslationProvider:
                         ),
                         slots=slots_all[local_i],
                     )
-                except ProviderError:
+                except _RETRYABLE:
                     continue
                 if not again or again == entry.meta.get("raw_model_output"):
                     continue
@@ -1434,7 +1434,7 @@ class OllamaTranslationProvider:
                             line_mask.text,
                             slots=line_mask.slots,
                         )
-                    except ProviderError as exc:
+                    except _RETRYABLE as exc:
                         bad = True
                         why = f"call:{type(exc).__name__}"
                         break
