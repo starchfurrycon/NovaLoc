@@ -1845,32 +1845,94 @@ class Pipeline:
         更难排查的坏结果，还会白白烧几个小时的 GPU 时间。
         """
         self.results = []
+        #: 每个阶段的实测耗时（秒），按 STAGES 的中文名记录。
+        #: 见 `_log_stage_timing` —— 没有这个，就分不清"谁最贵"，
+        #: 只能靠推算，而推算已经错过一次。
+        self._stage_seconds: dict[str, float] = {}
         self.bus.log("=" * 60, stage="pipeline")
         self.bus.log(f"开始汉化项目：{self.ws.project.name}", stage="pipeline")
         self.bus.log("=" * 60, stage="pipeline")
         t0 = time.time()
 
-        self.stage_unpack()
-        self.stage_detect()
-        self.stage_extract()
-        self.stage_images_scan()
-        self.stage_translate(only_pending=only_pending)
-        self.stage_fonts()
-        self.stage_images_localize()
-        self.stage_qa()
-        self.stage_apply()
+        self._timed("unpack", self.stage_unpack)
+        self._timed("detect", self.stage_detect)
+        self._timed("extract", self.stage_extract)
+        self._timed("images_scan", self.stage_images_scan)
+        self._timed("translate", lambda: self.stage_translate(only_pending=only_pending))
+        self._timed("fonts", self.stage_fonts)
+        self._timed("images_localize", self.stage_images_localize)
+        self._timed("qa", self.stage_qa)
+        self._timed("apply", self.stage_apply)
 
         dur = time.time() - t0
         self.bus.log(f"全部完成，用时 {dur:.1f} 秒", stage="pipeline")
+        self._log_stage_timing(dur)
         self.bus.emit(
             Event(
                 "done",
                 stage="pipeline",
                 message=f"用时 {dur:.1f} 秒",
-                data={"out_dir": str(self.ws.out_dir), "duration_s": dur},
+                data={
+                    "out_dir": str(self.ws.out_dir),
+                    "duration_s": dur,
+                    "stage_seconds": dict(self._stage_seconds),
+                },
             )
         )
         return self.results
+
+    def _timed(self, name: str, fn: Callable[[], Any]) -> Any:
+        r"""跑一个阶段并记下它的耗时。
+
+        ## 为什么要包一层（而不是在每个 stage_* 里各自计时）
+
+        阶段方法自己计时的话，`run_all` 之外的单阶段调用（CLI 的
+        `translate`/`apply` 等子命令）就会各写一套，容易漏、也容易
+        口径不一。包一层只有一个计时点，覆盖所有 `run_all` 路径。
+
+        计时**必须包含失败的情况** —— 一个跑崩的阶段同样消耗时间，
+        而且往往是最该被看见的那一个。所以用 `finally`。
+
+        单位用秒、精度留一位小数（日志里读起来够用）。
+        """
+        t = time.time()
+        try:
+            return fn()
+        finally:
+            self._stage_seconds[name] = time.time() - t
+
+    def _log_stage_timing(self, total_s: float) -> None:
+        r"""把每个阶段的耗时排序列出来。
+
+        ## 为什么必须单独打这个
+
+        实测一次真实 `auto`（`Dungeon And Darkness-Steam`）：
+
+            条目 5457（译 4885）　贴图 243　用时 107 分 18 秒
+
+        **只有总计，没有拆分**。后果是我自己先写下了
+        "模型只占端到端约 1/10" 这种结论 —— 而那个 1/10 是拿
+        **单个阶段的模型往返时间**（0.18 秒/条）去除**全流水线时间**
+        （1.94 秒/条），两个口径混用，**根本不成立**：
+
+        * 纯模型往返：批 40 时 0.18 秒/条；
+        * `translate` 阶段采样：31 条/分钟；
+        * 整个 `auto`：51 条/分钟（含 243 张贴图）。
+
+        这三个数没法互相解释，因为**没有任何按阶段拆分的数据**。
+        打了这个日志，下一次跑就能直接把 107 分钟拆开，
+        不用再靠推算 —— 也就不会再犯上面那个错。
+
+        按耗时降序排（最长的在最前面），因为要看的是"谁最贵"。
+        """
+        if not self._stage_seconds:
+            return
+        rows = sorted(self._stage_seconds.items(), key=lambda kv: -kv[1])
+        parts = []
+        for name, secs in rows:
+            pct = (secs / total_s * 100) if total_s > 0 else 0.0
+            parts.append(f"{name} {secs:.0f}s({pct:.0f}%)")
+        self.bus.log("各阶段耗时：" + "　".join(parts), stage="pipeline")
 
     def summary(self) -> dict[str, Any]:
         return {
