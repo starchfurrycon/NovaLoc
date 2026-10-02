@@ -940,218 +940,218 @@ class OllamaTranslationProvider:
                 entry.retries = 0
                 entry.status = EntryStatus.FAILED if res.fatal else EntryStatus.TRANSLATED
 
-        # ---- 3.5 定向重试：把"整条掩码记号弄丢"的条目重问一次 ----
-        #
-        # ## 为什么值得单独重试
-        #
-        # 实测 `translategemma:4b` 对 Ren'Py 的成对文本标签
-        # （`{color=#ffd700}…{/color}`）会**整条丢掉两个记号**只译文字：
-        #
-        #     源文  {color=#ffd700}The lamp was lit at dawn.{/color}
-        #     掩码  ⟦0⟧The lamp was lit at dawn.⟦1⟧
-        #     输出  '灯在黎明时被点亮了。'          ← 两个 ⟦⟧ 都没了
-        #
-        # `repair_dropped_masks` 对**这种**情况帮不上忙：它擅长补回
-        # 单侧记号（`\C[6]` 只能放开头、`\n` 只能放中间），
-        # 而 `{color…}` / `{/color}` 是**成对**的 —— 丢了开标签时
-        # 谁也不知道作者想让哪几个字变色。硬补一个位置是**猜**，
-        # 猜错了就是"颜色标错"，比不翻更糟。所以它返回 None 是对的。
-        #
-        # 但**不翻**并不是唯一出路：模型丢记号是"没听清要求"，
-        # 不是"做不到"。单独重问一次、并在提示词里明确点出
-        # "必须原样保留 ⟦数字⟧ 记号"，实测能把大部分救回来。
-        #
-        # 代价可控：只对**已经失败的**条目多打一次请求
-        # （失败的本来结果就是空，重试没有下行风险）。
-        retried = 0
-        for local_i, _global_i in enumerate(batch):
-            entry = out[_global_i]
-            if entry.status != EntryStatus.FAILED or not entry.warnings:
-                continue
-            if not any("placeholder" in w for w in entry.warnings):
-                continue
-            if not slots_all[local_i]:
-                continue  # 本来就没有记号，不是这个病因
-            try:
-                again = self._call_single(
-                    batch_items[local_i],
-                    masked_all[local_i],
-                    marker_warning=prompts.marker_retry_hint(
-                        masked_all[local_i], slots_all[local_i]
-                    ),
-                    slots=slots_all[local_i],
-                )
-            except ProviderError:
-                continue
-            if not again or again == entry.meta.get("raw_model_output"):
-                continue
-            restored2, check2 = ph.verify_restored(
-                batch_items[local_i].unit.source,
-                again,
-                slots_all[local_i],
-                masked_source=masked_all[local_i],
-            )
-            if check2.fatal:
-                continue  # 还是不行 —— 保持失败，绝不写回坏译文
-            res2 = guard(
-                batch_items[local_i].unit.source,
-                restored2,
-                max_chars=batch_items[local_i].unit.max_chars,
-                # ▲ 这里原来是 `self.cfg.translate.max_output_chars_factor` ——
-                #   配置里**根本没有这个字段**（只有 `max_chars_ratio`），
-                #   所以一旦走到"记号重试"这条路就 `AttributeError`，
-                #   整批的补救全部作废。
-                #
-                #   极隐蔽：正常路径不经过这里，单元测试与历史实测都没碰到，
-                #   直到换了模型（HY-MT 更容易让首轮解析失败 ⇒ 更常走重试）
-                #   才暴露出来。
-                length_ratio=self.cfg.translate.max_chars_ratio,
-                target_lang=target_lang,
-                hints=self._hints_of(batch_items[local_i]),
-            )
-            if res2.fatal:
-                continue
-            entry.target = res2.text
-            entry.warnings = list(res2.warnings)
-            entry.status = EntryStatus.TRANSLATED
-            entry.meta["marker_retry"] = True
-            entry.meta["raw_model_output"] = again
-            entry.retries = 1
-            retried += 1
-        if retried:
-            self.stats["marker_retry_recovered"] = (
-                self.stats.get("marker_retry_recovered", 0) + retried
-            )
-            log.info("定向重试救回 %d 条丢失掩码记号的译文", retried)
-
-        # ---- 3.6 【已撤回】换行记号丢失时改用不屏蔽换行重问 ----
-        #
-        # 这里曾实现过一条重试路径：换行记号被模型吞掉时，改用
-        # `mask_newlines=False` 重问一次。**实测确认它不可达，已撤回。**
-        #
-        # 撤回原因：`repair_dropped_masks` 会把丢掉的记号**重新插回去**
-        # （包括换行记号 —— 它插在数字/量词后面），所以走到这一步时
-        # `slots` 里永远不缺换行记号。准入条件 `换行 in slots` 与实际
-        # 失败原因（还丢了别的记号）互相排斥，路径永不触发。
-        #
-        # 实测 60 条真实多行条目：`placeholder_fatal` 27 条，其中
-        # 命中这条路径的 **0 条**（加之前与加之后 `stats` 完全一样）。
-        #
-        # ★ 教训：**加分支前先用真实数据确认它可达**。不可达的修复
-        #   和没修一样，但会让人以为已经修了 —— 这比不修更危险。
-        #   真实失败机理与后续方向见 docs/ROADMAP.md §3.21。
-
-        # ---- 3.7 多行条目失败 ⇒ **逐行重译**（实测救回约 23%）----
-        #
-        # ## 为什么是"逐行"，而不是再改判据或换模型
-        #
-        # ROADMAP §3.21 记录了两个已实测否掉的方向：
-        #
-        # * **改判据**（把"丢换行记号"降级为警告）—— 不行：丢换行记号里
-        #   混着"两行并成一行、内容完整"和"真的丢了第二行"两种，
-        #   而 `compare_restored` 对**两者都返回 ok**（它比内容重叠，
-        #   丢掉的第二行在还原前后都没有，于是"相等"）。
-        #   换行记号是目前**唯一**能抓住"少翻一行"的信号。
-        # * **换模型** —— 不行：同一批 24 条真实多行条目上，
-        #   `translategemma:4b` 成功 16/24，两个专精翻译的 7B
-        #   （含腾讯混元翻译）都只有 14/24 且慢 5~12 倍。
-        #
-        # 那剩下的就是**改任务形态**：不要让模型一次面对多行。
-        # 逐行送翻时每行都是独立条文，模型**没有"合并/截断"的机会**。
-        #
-        # ## 实测收益（30 条真实多行条目）
-        #
-        # 合并送翻通过 17、判死 13；对判死的 13 条逐行重译
-        # **救回 7 条**（占全部抽样 **23%**），且原通过的 17 条
-        # **一条都没被改动**。样例：
-        #
-        #     Lifia ↵ 「I have to go.」   →  莉菲娅 ↵ 我得走了。
-        #     Please enter a number between 1 and 15. ↵ (Standard difficulty is 5)
-        #       → 请输入一个 1 到 15 之间的数字。↵（标准难度为 5）
-        #
-        # ## 代价与安全
-        #
-        # * 代价：一条 n 行 → n 次请求。**只对已经失败的条目**做，
-        #   那本来就没有译文，重试没有下行风险。
-        # * **逐行过守卫**（不是把拼好的整条过一次）：
-        #   这样每一行都要自己满足长度/重复/占位符判据。
-        #   实测必须逐行，因为整条判据会漏掉行内的坏产物 ——
-        #   例如 `「邪恶之 bane」`（原词泄漏）在整条校验里看不出来。
-        # * ⚠️ **已知残留限制**：`guards.guard` 抓不住"中文里混进一个
-        #   原文拉丁词"这种泄漏（它既不是 `foreign_script`，也不会
-        #   触发重复/长度判据）。实测 `「邪恶之 bane」` 就是漏过的。
-        #   这属于**质量瑕疵而非静默丢内容**，比"整条保留原文"好，
-        #   但仍需人工审校；后续方向见 ROADMAP §3.21。
-        perline_saved = 0
-        for local_i, _global_i in enumerate(batch):
-            entry = out[_global_i]
-            if entry.status != EntryStatus.FAILED:
-                continue
-            unit = batch_items[local_i].unit
-            src_lines = [x for x in (unit.source or "").split("\n") if x.strip()]
-            if len(src_lines) < 2:
-                continue  # 单行条目不走这条路
-            got_lines: list[str] = []
-            bad = False
-            for one in src_lines:
-                # ★ 这里必须**先屏蔽这一行**，再把掩码文本交给 `_call_single`。
-                #
-                #   `_call_single(item, masked, *, slots=...)` 的第二个参数是
-                #   **掩码后**的文本，`slots` 是它对应的槽位表 ——
-                #   返回时靠 `slots` 把 `⟦n⟧` 还原成原样记号。
-                #
-                #   原先这里传的是**裸源码行** `one`、且**不传 `slots`**，
-                #   于是：
-                #     * `_call_single` 内部拿 `one` 当"掩码文本"，
-                #       而它其实没被掩码，`slots` 为空 ⇒ 模型回什么都不会被还原；
-                #     * 更糟的是 `slots` 缺失后，内部的
-                #       `if ph.remaining_masks(got_one)` 之类的判据失去依据。
-                #   结果这条"逐行救援"路径**几乎救不回任何条目**
-                #   （实测长条目 `perline_recovered = 0`）。
-                #
-                #   逐行送翻时每行**自己就没有换行**了，所以这里
-                #   `newlines=False`（行内没有换行可屏蔽）；
-                #   行内该保护的占位符（`\V[1]`、`\C[0]` 等）仍然照样屏蔽。
-                line_mask = ph.mask(one, newlines=False)
+            # ---- 3.5 定向重试：把"整条掩码记号弄丢"的条目重问一次 ----
+            #
+            # ## 为什么值得单独重试
+            #
+            # 实测 `translategemma:4b` 对 Ren'Py 的成对文本标签
+            # （`{color=#ffd700}…{/color}`）会**整条丢掉两个记号**只译文字：
+            #
+            #     源文  {color=#ffd700}The lamp was lit at dawn.{/color}
+            #     掩码  ⟦0⟧The lamp was lit at dawn.⟦1⟧
+            #     输出  '灯在黎明时被点亮了。'          ← 两个 ⟦⟧ 都没了
+            #
+            # `repair_dropped_masks` 对**这种**情况帮不上忙：它擅长补回
+            # 单侧记号（`\C[6]` 只能放开头、`\n` 只能放中间），
+            # 而 `{color…}` / `{/color}` 是**成对**的 —— 丢了开标签时
+            # 谁也不知道作者想让哪几个字变色。硬补一个位置是**猜**，
+            # 猜错了就是"颜色标错"，比不翻更糟。所以它返回 None 是对的。
+            #
+            # 但**不翻**并不是唯一出路：模型丢记号是"没听清要求"，
+            # 不是"做不到"。单独重问一次、并在提示词里明确点出
+            # "必须原样保留 ⟦数字⟧ 记号"，实测能把大部分救回来。
+            #
+            # 代价可控：只对**已经失败的**条目多打一次请求
+            # （失败的本来结果就是空，重试没有下行风险）。
+            retried = 0
+            for local_i, _global_i in enumerate(batch):
+                entry = out[_global_i]
+                if entry.status != EntryStatus.FAILED or not entry.warnings:
+                    continue
+                if not any("placeholder" in w for w in entry.warnings):
+                    continue
+                if not slots_all[local_i]:
+                    continue  # 本来就没有记号，不是这个病因
                 try:
-                    got_one = self._call_single(
+                    again = self._call_single(
                         batch_items[local_i],
-                        line_mask.text,
-                        slots=line_mask.slots,
+                        masked_all[local_i],
+                        marker_warning=prompts.marker_retry_hint(
+                            masked_all[local_i], slots_all[local_i]
+                        ),
+                        slots=slots_all[local_i],
                     )
                 except ProviderError:
-                    bad = True
-                    break
-                if not got_one or ph.remaining_masks(got_one):
-                    bad = True
-                    break
-                # ★ **逐行**过守卫 —— 见上面"代价与安全"的说明
-                r_one = guard(
-                    one,
-                    got_one,
-                    max_chars=None,
+                    continue
+                if not again or again == entry.meta.get("raw_model_output"):
+                    continue
+                restored2, check2 = ph.verify_restored(
+                    batch_items[local_i].unit.source,
+                    again,
+                    slots_all[local_i],
+                    masked_source=masked_all[local_i],
+                )
+                if check2.fatal:
+                    continue  # 还是不行 —— 保持失败，绝不写回坏译文
+                res2 = guard(
+                    batch_items[local_i].unit.source,
+                    restored2,
+                    max_chars=batch_items[local_i].unit.max_chars,
+                    # ▲ 这里原来是 `self.cfg.translate.max_output_chars_factor` ——
+                    #   配置里**根本没有这个字段**（只有 `max_chars_ratio`），
+                    #   所以一旦走到"记号重试"这条路就 `AttributeError`，
+                    #   整批的补救全部作废。
+                    #
+                    #   极隐蔽：正常路径不经过这里，单元测试与历史实测都没碰到，
+                    #   直到换了模型（HY-MT 更容易让首轮解析失败 ⇒ 更常走重试）
+                    #   才暴露出来。
                     length_ratio=self.cfg.translate.max_chars_ratio,
                     target_lang=target_lang,
                     hints=self._hints_of(batch_items[local_i]),
                 )
-                if r_one.fatal:
-                    bad = True
-                    break
-                got_lines.append(r_one.text.strip())
-            if bad or len(got_lines) != len(src_lines):
-                continue
-            entry.target = "\n".join(got_lines)
-            entry.warnings = []
-            entry.status = EntryStatus.TRANSLATED
-            entry.meta["perline_fallback"] = True
-            entry.meta["raw_model_output"] = entry.target
-            entry.retries = 1
-            perline_saved += 1
-        if perline_saved:
-            self.stats["perline_recovered"] = (
-                self.stats.get("perline_recovered", 0) + perline_saved
-            )
-            log.info("逐行重译救回 %d 条多行译文", perline_saved)
+                if res2.fatal:
+                    continue
+                entry.target = res2.text
+                entry.warnings = list(res2.warnings)
+                entry.status = EntryStatus.TRANSLATED
+                entry.meta["marker_retry"] = True
+                entry.meta["raw_model_output"] = again
+                entry.retries = 1
+                retried += 1
+            if retried:
+                self.stats["marker_retry_recovered"] = (
+                    self.stats.get("marker_retry_recovered", 0) + retried
+                )
+                log.info("定向重试救回 %d 条丢失掩码记号的译文", retried)
+
+            # ---- 3.6 【已撤回】换行记号丢失时改用不屏蔽换行重问 ----
+            #
+            # 这里曾实现过一条重试路径：换行记号被模型吞掉时，改用
+            # `mask_newlines=False` 重问一次。**实测确认它不可达，已撤回。**
+            #
+            # 撤回原因：`repair_dropped_masks` 会把丢掉的记号**重新插回去**
+            # （包括换行记号 —— 它插在数字/量词后面），所以走到这一步时
+            # `slots` 里永远不缺换行记号。准入条件 `换行 in slots` 与实际
+            # 失败原因（还丢了别的记号）互相排斥，路径永不触发。
+            #
+            # 实测 60 条真实多行条目：`placeholder_fatal` 27 条，其中
+            # 命中这条路径的 **0 条**（加之前与加之后 `stats` 完全一样）。
+            #
+            # ★ 教训：**加分支前先用真实数据确认它可达**。不可达的修复
+            #   和没修一样，但会让人以为已经修了 —— 这比不修更危险。
+            #   真实失败机理与后续方向见 docs/ROADMAP.md §3.21。
+
+            # ---- 3.7 多行条目失败 ⇒ **逐行重译**（实测救回约 23%）----
+            #
+            # ## 为什么是"逐行"，而不是再改判据或换模型
+            #
+            # ROADMAP §3.21 记录了两个已实测否掉的方向：
+            #
+            # * **改判据**（把"丢换行记号"降级为警告）—— 不行：丢换行记号里
+            #   混着"两行并成一行、内容完整"和"真的丢了第二行"两种，
+            #   而 `compare_restored` 对**两者都返回 ok**（它比内容重叠，
+            #   丢掉的第二行在还原前后都没有，于是"相等"）。
+            #   换行记号是目前**唯一**能抓住"少翻一行"的信号。
+            # * **换模型** —— 不行：同一批 24 条真实多行条目上，
+            #   `translategemma:4b` 成功 16/24，两个专精翻译的 7B
+            #   （含腾讯混元翻译）都只有 14/24 且慢 5~12 倍。
+            #
+            # 那剩下的就是**改任务形态**：不要让模型一次面对多行。
+            # 逐行送翻时每行都是独立条文，模型**没有"合并/截断"的机会**。
+            #
+            # ## 实测收益（30 条真实多行条目）
+            #
+            # 合并送翻通过 17、判死 13；对判死的 13 条逐行重译
+            # **救回 7 条**（占全部抽样 **23%**），且原通过的 17 条
+            # **一条都没被改动**。样例：
+            #
+            #     Lifia ↵ 「I have to go.」   →  莉菲娅 ↵ 我得走了。
+            #     Please enter a number between 1 and 15. ↵ (Standard difficulty is 5)
+            #       → 请输入一个 1 到 15 之间的数字。↵（标准难度为 5）
+            #
+            # ## 代价与安全
+            #
+            # * 代价：一条 n 行 → n 次请求。**只对已经失败的条目**做，
+            #   那本来就没有译文，重试没有下行风险。
+            # * **逐行过守卫**（不是把拼好的整条过一次）：
+            #   这样每一行都要自己满足长度/重复/占位符判据。
+            #   实测必须逐行，因为整条判据会漏掉行内的坏产物 ——
+            #   例如 `「邪恶之 bane」`（原词泄漏）在整条校验里看不出来。
+            # * ⚠️ **已知残留限制**：`guards.guard` 抓不住"中文里混进一个
+            #   原文拉丁词"这种泄漏（它既不是 `foreign_script`，也不会
+            #   触发重复/长度判据）。实测 `「邪恶之 bane」` 就是漏过的。
+            #   这属于**质量瑕疵而非静默丢内容**，比"整条保留原文"好，
+            #   但仍需人工审校；后续方向见 ROADMAP §3.21。
+            perline_saved = 0
+            for local_i, _global_i in enumerate(batch):
+                entry = out[_global_i]
+                if entry.status != EntryStatus.FAILED:
+                    continue
+                unit = batch_items[local_i].unit
+                src_lines = [x for x in (unit.source or "").split("\n") if x.strip()]
+                if len(src_lines) < 2:
+                    continue  # 单行条目不走这条路
+                got_lines: list[str] = []
+                bad = False
+                for one in src_lines:
+                    # ★ 这里必须**先屏蔽这一行**，再把掩码文本交给 `_call_single`。
+                    #
+                    #   `_call_single(item, masked, *, slots=...)` 的第二个参数是
+                    #   **掩码后**的文本，`slots` 是它对应的槽位表 ——
+                    #   返回时靠 `slots` 把 `⟦n⟧` 还原成原样记号。
+                    #
+                    #   原先这里传的是**裸源码行** `one`、且**不传 `slots`**，
+                    #   于是：
+                    #     * `_call_single` 内部拿 `one` 当"掩码文本"，
+                    #       而它其实没被掩码，`slots` 为空 ⇒ 模型回什么都不会被还原；
+                    #     * 更糟的是 `slots` 缺失后，内部的
+                    #       `if ph.remaining_masks(got_one)` 之类的判据失去依据。
+                    #   结果这条"逐行救援"路径**几乎救不回任何条目**
+                    #   （实测长条目 `perline_recovered = 0`）。
+                    #
+                    #   逐行送翻时每行**自己就没有换行**了，所以这里
+                    #   `newlines=False`（行内没有换行可屏蔽）；
+                    #   行内该保护的占位符（`\V[1]`、`\C[0]` 等）仍然照样屏蔽。
+                    line_mask = ph.mask(one, newlines=False)
+                    try:
+                        got_one = self._call_single(
+                            batch_items[local_i],
+                            line_mask.text,
+                            slots=line_mask.slots,
+                        )
+                    except ProviderError:
+                        bad = True
+                        break
+                    if not got_one or ph.remaining_masks(got_one):
+                        bad = True
+                        break
+                    # ★ **逐行**过守卫 —— 见上面"代价与安全"的说明
+                    r_one = guard(
+                        one,
+                        got_one,
+                        max_chars=None,
+                        length_ratio=self.cfg.translate.max_chars_ratio,
+                        target_lang=target_lang,
+                        hints=self._hints_of(batch_items[local_i]),
+                    )
+                    if r_one.fatal:
+                        bad = True
+                        break
+                    got_lines.append(r_one.text.strip())
+                if bad or len(got_lines) != len(src_lines):
+                    continue
+                entry.target = "\n".join(got_lines)
+                entry.warnings = []
+                entry.status = EntryStatus.TRANSLATED
+                entry.meta["perline_fallback"] = True
+                entry.meta["raw_model_output"] = entry.target
+                entry.retries = 1
+                perline_saved += 1
+            if perline_saved:
+                self.stats["perline_recovered"] = (
+                    self.stats.get("perline_recovered", 0) + perline_saved
+                )
+                log.info("逐行重译救回 %d 条多行译文", perline_saved)
 
         # ---- 4. 把去重后的结果摊回重复项 ----
         # 重复项的 `uid` 各不相同（同一句台词出现在多个事件里，

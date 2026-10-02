@@ -132,3 +132,132 @@ def test_perline_rescue_masks_before_calling() -> None:
         f"逐行救援段里没有 `{REQUIRED_MASK_CALL}` —— "
         "说明这一行没有被掩码就送去翻译了"
     )
+
+
+# ---------------------------------------------------------------------------
+# ★★ 恢复段必须在**批次循环体内**，不能挂在循环之外
+# ---------------------------------------------------------------------------
+#
+# 这是一个比"传参写错"严重得多的缺陷，实测证据：
+#
+# `translate_batch()` 里有三段"补救"逻辑：
+#
+#   * 3.5 定向重试（把整条丢掩码记号的条目重问一次）
+#   * 3.7 逐行救援（多行失败 ⇒ 一行一行重译）
+#   * 4   把去重结果摊回重复项
+#
+# 前两段引用 `batch` / `slots_all` / `masked_all` 这些**每批**变量，
+# 但它们当时写在 `for bi, batch in enumerate(batches)` **之外**（同级缩进）。
+# 后果：**只对最后一批生效**，其余批次的失败条目永远得不到救援。
+#
+# 实测（20 条长条目，各自单独成批）：
+#
+#     batches = 20, placeholder_fatal = 17
+#     但 perline_recovered = 0、诊断计数 dbg_seen = 1
+#     ⇒ 逐行救援只跑了 1 次，应该是 20 次
+#
+# 修好缩进后（同口径重测）：`perline_recovered = 3`、`dbg_seen = 20`；
+# 分层取样的 30 条多行条目从 **9/30 (30%) 提到 25/30 (83%)**。
+#
+# 第 4 段（摊回重复项）本来就是全局的，只用到 `out`/`first_of`，
+# **允许**留在循环外 —— 所以只断言前两段。
+
+
+def _batch_loop(fn: ast.FunctionDef) -> ast.For:
+    """找到 `for bi, batch in enumerate(batches):` 这个循环节点。"""
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.For):
+            continue
+        it = node.iter
+        if (
+            isinstance(it, ast.Call)
+            and isinstance(it.func, ast.Name)
+            and it.func.id == "enumerate"
+            and it.args
+            and isinstance(it.args[0], ast.Name)
+            and it.args[0].id == "batches"
+        ):
+            return node
+    pytest.fail("找不到 `for ... in enumerate(batches):` 循环 —— 结构变了")
+
+
+def _node_span(node: ast.AST) -> tuple[int, int]:
+    return node.lineno, (node.end_lineno or node.lineno)
+
+
+def test_recovery_sections_are_inside_the_batch_loop() -> None:
+    """★ 定向重试 / 逐行救援 必须在**批次循环体**内。
+
+    在旧结构下这条断言**失败**：那两段的循环与 `for batch` **同级**
+    （缩进 8 对缩进 8），所以只对最后一批生效。
+
+    判据用**嵌套结构**而不是行号区间 —— 行号区间在嵌套循环下会误判
+    （外层循环的行区间天然包含内层）。具体说：
+    从 `for batch` 节点出发递归遍历它的后代，
+    那两个恢复循环必须出现在**后代**里；旧结构下它们是兄弟，找不到。
+    """
+    fn = _translate_batch_fn()
+    loop = _batch_loop(fn)
+
+    def loop_defining(marker: str) -> ast.For | None:
+        """找到"体内直接把 `<marker> = 0` 当语句"的那个 `for` 循环。"""
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.For):
+                continue
+            for stmt in node.body:
+                tgt = getattr(stmt, "targets", [])
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and tgt
+                    and isinstance(tgt[0], ast.Name)
+                    and tgt[0].id == marker
+                ):
+                    return node
+        return None
+
+    # `for batch` 的所有后代节点（含深层嵌套）
+    descendants = {id(n) for n in ast.walk(loop)}
+
+    for marker, what in (
+        ("retried", "定向重试（3.5）"),
+        ("perline_saved", "逐行救援（3.7）"),
+    ):
+        rl = loop_defining(marker)
+        assert rl is not None, f"找不到 `{marker} = 0` 所在的循环"
+        assert id(rl) in descendants, (
+            f"★ {what} 的循环在**批次循环之外**"
+            f"（行 {rl.lineno}）。\n"
+            "它引用 `batch` / `slots_all` / `masked_all` 这些**每批**变量，"
+            "放在循环外就只对**最后一批**生效。\n"
+            "实测后果：20 条长条目各自成批时，该段只跑 1 次而不是 20 次，"
+            "分层取样的 30 条多行条目挽救率从 83% 掉到 30%。\n"
+            "修法就是把这两段整体缩进 +4，放进 `for bi, batch` 循环体。"
+        )
+
+
+def test_dedup_spread_stays_outside_the_batch_loop() -> None:
+    """第 4 段「摊回重复项」**允许**留在循环外（它只用到全局的 `out`/`first_of`）。
+
+    这条是防止"矫枉过正"：有人看到上面那条用例后，
+    可能把整段（含摊回重复项）一起塞进循环 —— 那会让重复项被摊回 N 次。
+    """
+    fn = _translate_batch_fn()
+    loop = _batch_loop(fn)
+    descendants = {id(n) for n in ast.walk(loop)}
+
+    spread: ast.For | None = None
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.For):
+            continue
+        for stmt in node.body:
+            seg = ast.unparse(stmt)
+            if "first_positions" in seg:
+                spread = node
+                break
+        if spread is not None:
+            break
+    assert spread is not None, "找不到「摊回重复项」的循环"
+    assert id(spread) not in descendants, (
+        "「摊回重复项」（第 4 段）被放进了批次循环 —— 它应该是全局的，"
+        "否则重复项会被反复摊回。"
+    )
