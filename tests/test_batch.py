@@ -249,6 +249,66 @@ def test_write_back_overwrites_and_backs_up(tmp_path: Path) -> None:
     assert (Path(rep.backup_dir) / "text.json").read_text(encoding="utf-8") == "ENGLISH"
 
 
+def test_backup_dir_is_unique_across_runs_in_same_second(tmp_path: Path) -> None:
+    r"""★ 同一秒内的两次写回必须各有**自己的**备份目录。
+
+    ## 实测的缺陷
+
+    原来备份目录名用 `%Y%m%d-%H%M%S`（只到**秒**），同一秒内两次写回会
+    拿到同一个目录；而目录内 `if not bak.is_file()` 会让第二次**跳过备份**，
+    却**照常覆盖**目标文件。实测：
+
+        # 第一次：V0 -> V1（备份 V0）
+        # 第二次：V1 -> V2（同一秒）—— 备份目录同名
+        备份内容 = V0      ← 中间的 V1 版本**没有**被保存
+
+    回滚到"最初"仍可行，但目录名让人以为这是第二次写回的独立备份 ——
+    真出事时会**少一个可回滚的版本**，而且完全没有提示。
+
+    这条测试就是那个缺陷的哨兵：两次写回必须产出**不同**的备份目录，
+    且各自保存**改写前**的内容。
+
+    ## 为什么要对齐到"刚跨过秒边界"
+
+    缺陷只在**同一秒内**触发。若测试恰好跨过秒边界，旧实现也能通过，
+    这条测试就成了空话。所以先 `sleep` 到刚进入新的一秒，再做两次写回 ——
+    两次写回各自只做一次 `copy2`，远快于 1 秒，必然落在同一秒里。
+    """
+    import time as _time
+
+    # 对齐：等到"刚进入新的一秒"
+    now = _time.time()
+    _time.sleep(max(0.0, 1.0 - (now % 1.0)) + 0.02)
+
+    src = tmp_path / "game"
+    out = tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    (src / "text.json").write_text("V0", encoding="utf-8")
+    bak = tmp_path / "backups"
+
+    # 第一次：V0 -> V1
+    (out / "text.json").write_text("V1", encoding="utf-8")
+    r1 = write_back(src, out, backup_root=bak)
+
+    # 第二次：V1 -> V2（紧接在同一秒内）
+    (out / "text.json").write_text("V2", encoding="utf-8")
+    r2 = write_back(src, out, backup_root=bak)
+
+    assert r1.backup_dir and r2.backup_dir, "两次都应有备份目录"
+    assert r1.backup_dir != r2.backup_dir, (
+        f"同一秒内的两次写回不能共用备份目录：{r1.backup_dir}"
+    )
+    # 各自保存**改写前**的版本
+    assert (Path(r1.backup_dir) / "text.json").read_text(encoding="utf-8") == "V0"
+    assert (Path(r2.backup_dir) / "text.json").read_text(encoding="utf-8") == "V1", (
+        "第二次的备份必须是 V1（它改写前的内容）—— 旧实现会漏掉这一版"
+    )
+    # 最终文件是 V2，而两个历史版本都还在
+    assert (src / "text.json").read_text(encoding="utf-8") == "V2"
+    assert len(list(bak.iterdir())) == 2, "应有两个独立的备份目录"
+
+
 def test_write_back_dry_run_writes_nothing(tmp_path: Path) -> None:
     src = tmp_path / "game"
     out = tmp_path / "out"

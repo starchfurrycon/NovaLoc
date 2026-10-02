@@ -281,6 +281,45 @@ class WriteBackReport:
     failed: list[str] = field(default_factory=list)
 
 
+def _unique_backup_dir(backup_root: Path, game_name: str) -> Path:
+    """给出一个**确实唯一**的备份目录，绝不与已有目录重名。
+
+    ## 为什么需要它（实测的缺陷）
+
+    原来是 ``backup_root / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"`` ——
+    时间戳只精确到**秒**。同一秒内跑两次 :func:`write_back` 就会拿到
+    **同一个**目录，而目录里那句 ``if not bak.is_file()`` 会让第二次
+    **跳过备份**，同时**照常覆盖**目标文件。
+
+    实测复现（`.scratch/_backup_rollback.py`）：
+
+        # 第一次写回：V0 -> V1，备份里是 V0
+        # 第二次写回：V1 -> V2（同一秒），备份目录**同名**
+        backup=Data-20261002-191619 （两次相同）
+        游戏文件 = V2    备份内容 = V0
+
+    结果：**中间的 V1 版本没有被保存**。回滚到"最初"仍然可行
+    （备份里是 V0），但目录名让人以为这是第二次写回的独立备份 ——
+    真出事时"少一个可回滚的版本"，而且**完全没有任何提示**。
+
+    ## 修法
+
+    冲突时加 ``-2``、``-3``… 后缀，直到目录名可用。
+    这样每次写回都有**自己的**备份目录，`if not bak.is_file()`（用于
+    "同一目录内不重复备份同一文件"）也就不会跨次误判。
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate = backup_root / f"{game_name}-{stamp}"
+    if not candidate.exists():
+        return candidate
+    for n in range(2, 1000):
+        candidate = backup_root / f"{game_name}-{stamp}-{n}"
+        if not candidate.exists():
+            return candidate
+    # 极端情况兜底：用微秒，保证不再撞
+    return backup_root / f"{game_name}-{stamp}-{time.time_ns() % 1_000_000_000}"
+
+
 def write_back(
     source_dir: Path,
     out_dir: Path,
@@ -295,8 +334,7 @@ def write_back(
     if not rels:
         return rep
 
-    tag = time.strftime("%Y%m%d-%H%M%S")
-    backup_dir = backup_root / f"{source_dir.name}-{tag}"
+    backup_dir = _unique_backup_dir(backup_root, source_dir.name)
     rep.backup_dir = str(backup_dir)
 
     for rel in rels:
