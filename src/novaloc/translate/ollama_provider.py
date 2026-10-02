@@ -1093,6 +1093,14 @@ class OllamaTranslationProvider:
                     continue  # 单行条目不走这条路
                 got_lines: list[str] = []
                 bad = False
+                # 逐行救援的**失败原因**统计。
+                #
+                # 为什么值得常驻：这条路径以前有真缺陷（传裸源码行、
+                # 不传 slots），修好之后**仍然**只救回一小部分条目，
+                # 而"为什么没救回"必须能一眼看出来 —— 否则又会变成
+                # "看起来在工作、实际没效果"。分类计数能直接指向
+                # 下一步该改哪一层（提示词 / 守卫 / 分批）。
+                why = ""
                 for one in src_lines:
                     # ★ 这里必须**先屏蔽这一行**，再把掩码文本交给 `_call_single`。
                     #
@@ -1119,11 +1127,17 @@ class OllamaTranslationProvider:
                             line_mask.text,
                             slots=line_mask.slots,
                         )
-                    except ProviderError:
+                    except ProviderError as exc:
                         bad = True
+                        why = f"call:{type(exc).__name__}"
                         break
-                    if not got_one or ph.remaining_masks(got_one):
+                    if not got_one:
                         bad = True
+                        why = "empty"
+                        break
+                    if ph.remaining_masks(got_one):
+                        bad = True
+                        why = "mask_left"
                         break
                     # ★ **逐行**过守卫 —— 见上面"代价与安全"的说明
                     r_one = guard(
@@ -1136,9 +1150,14 @@ class OllamaTranslationProvider:
                     )
                     if r_one.fatal:
                         bad = True
+                        why = f"guard:{','.join(r_one.warnings)[:40]}"
                         break
                     got_lines.append(r_one.text.strip())
                 if bad or len(got_lines) != len(src_lines):
+                    if why:
+                        self.stats[f"perline_why_{why.split(':')[0]}"] = (
+                            self.stats.get(f"perline_why_{why.split(':')[0]}", 0) + 1
+                        )
                     continue
                 entry.target = "\n".join(got_lines)
                 entry.warnings = []

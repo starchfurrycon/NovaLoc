@@ -89,6 +89,24 @@ _PLACEHOLDER_PATTERNS: list[tuple[str, str]] = [
     # 必须和 `translate/placeholders.py` 的排列顺序保持一致。
     ("rpgmaker_escape_nested", r"\\[VvNnPpCcIiSs]\[\\[VvNnPpCcIiSs]\[\d+\]\]"),
     ("rpgmaker_escape", r"\\[VvNnPpCcIiSs]\[\d+\]"),
+    # ★ RPG Maker 的**属性显示命令**：`\mhp[3]` `\atk[2]` `\def[2]` …
+    #
+    # 与 `translate/placeholders.py` **必须同步**（见
+    # `tests/test_placeholder_consistency.py` 那道一致性守卫）。
+    #
+    # `[n]` 是小数位数，游戏运行时会替换成实际数值。不认它的后果是
+    # **静默损坏**：实测
+    #
+    #     原文  '【HP】\mhp[3]   【攻撃力】\atk[2]'
+    #     模型回 '生命值：\mhp'        ← 参数被吃掉
+    #     校验  fatal=False            ← 没有任何检查能拦住
+    #
+    # 全库实测 89 条条目含这类命令，只有这 7 种
+    # （`\mhp \atk \def \mag \mdf \agi \exp`，外加同样合法的
+    # `\mmp \mat \luk`），所以用**固定名单**而不是宽松通配 ——
+    # 固定名单不会把普通文本误判成占位符。
+    ("rpgmaker_stat_cmd",
+     r"\\(?:mhp|mmp|atk|def|mat|mag|mdf|agi|luk|exp)\[\d+\]"),
     ("renpy_tag", r"\{/?[a-zA-Z]+(?:=[^{}]*)?\}"),
     ("rich_text_tag", r"</?[a-zA-Z][^>]*>"),
     ("bracket_tag", r"\[/?[a-zA-Z]+(?:=[^\]]*)?\]"),

@@ -68,6 +68,17 @@ REAL_FORMS = [
     "\\S[88]",
     "\\s[110]",   # 小写变体也在真实数据里
     "\\v[122]",   # 同上，32 处
+    # ★ RPG Maker **属性显示命令**（`[n]` 是小数位数）。
+    # 全库实测 89 条条目含这类命令；漏掉是**静默损坏** ——
+    # `【HP】\mhp[3]` 会被模型吃掉参数变成 `生命值：\mhp`，
+    # 而所有检查都报成功（详见下面那组专门用例）。
+    "\\mhp[3]",
+    "\\atk[2]",
+    "\\def[2]",
+    "\\mag[3]",
+    "\\mdf[2]",
+    "\\agi[2]",
+    "\\exp[4]",
 ]
 
 
@@ -311,6 +322,100 @@ def test_plugin_letter_loss_is_detected_by_the_guard() -> None:
         "守卫没发现 `\\D` 丢失 —— 这条坏译文会被写回游戏，"
         "玩家看到的是一个裸字母 D，而所有检查都报成功。"
     )
+
+
+# ----------------------------------------------------------------------
+# ★ RPG Maker 属性显示命令 `\mhp[3]` —— 静默损坏（所有检查都报成功）
+# ----------------------------------------------------------------------
+
+STAT_CMDS = ["\\mhp", "\\atk", "\\def", "\\mag", "\\mdf", "\\agi", "\\exp"]
+
+
+@pytest.mark.parametrize("cmd", STAT_CMDS)
+def test_stat_display_command_is_protected(cmd: str) -> None:
+    r"""★ `\mhp[3]` 这类属性显示命令必须被屏蔽、且守卫也认。
+
+    ## 真实缺陷（实测）
+
+    `072 Project` 的魔物/人物介绍里大量出现属性块：
+
+        原文  '【HP】\mhp[3]   【攻撃力】\atk[2]   【防御力】\def[2] '
+        槽位  []                    ← 屏蔽器完全没认出
+        模型回 '生命值：\mhp'        ← 参数 `[3]` 被吃掉
+        占位符校验 fatal=False        ← 没有任何检查能拦住
+
+    模型把 `\mhp[3]` 读成"一个叫 mhp 的词"，于是只译了标签、
+    把参数丢了。游戏里【HP】后面会显示成裸 `\mhp` 而不是数字，
+    **而且阶段全部报成功** —— 这正是本项目最怕的失败模式。
+
+    全库统计：**89 条**条目含这类命令（7 种命令各 89 次）。
+    """
+    src = f"【HP】{cmd}[3]"
+    masked, slots = ph.mask_batch([src])
+    assert slots[0] == [f"{cmd}[3]"], (
+        f"{cmd}[3] 没被屏蔽：槽位={slots[0]}\n  屏蔽后={masked[0]!r}\n"
+        f"模型会把参数 [3] 吃掉，游戏里显示成裸 {cmd}。"
+    )
+    assert f"{cmd}[3]" not in masked[0], f"明文里还残留：{masked[0]!r}"
+    assert f"{cmd}[3]" in extract_placeholders(src), (
+        "守卫也要认它（两侧必须同步，否则模型丢了也无从修补）"
+    )
+
+
+@pytest.mark.parametrize("cmd", STAT_CMDS)
+def test_stat_command_loss_is_fatal(cmd: str) -> None:
+    r"""★ 模型丢掉 `\mhp[3]` 时，必须判**致命**（而不是静默写回）。
+
+    与"纯样式记号丢了不算坏"形成对照：属性命令是**内容类** ——
+    少了它游戏里就没有数值可显示。没有这条断言，
+    "保护"很容易退化成"屏蔽了但不检查"。
+    """
+    src = f"【HP】{cmd}[3]"
+    broken = "【生命值】"          # 参数整块丢了（实测的坏产物形态）
+    _restored, chk = ph.verify_restored(
+        src, broken, [f"{cmd}[3]"], masked_source="【HP】⟦0⟧"
+    )
+    assert chk.fatal, f"{cmd}[3] 丢了却没判死 —— 判据被废掉了：{chk.describe()}"
+
+
+def test_stat_command_survives_round_trip() -> None:
+    r"""属性块屏蔽 → 还原必须一字不差（真实形态的一整行）。"""
+    src = "【HP】\\mhp[3]   【攻撃力】\\atk[2]   【防御力】\\def[2] "
+    masked, slots = ph.mask_batch([src])
+    assert len(slots[0]) == 3, f"应屏蔽 3 个命令，实际 {slots[0]}"
+    restored, chk = ph.verify_restored(src, masked[0], slots[0], masked_source=masked[0])
+    assert not chk.fatal, chk.describe()
+    assert restored == src, f"{restored!r} != {src!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        r"C:\Users\name",          # Windows 路径，不能误切
+        r"\n",                     # 换行转义（有专门规则处理）
+        r"\d+",                    # 正则字面量，后面的 `[` 不是参数
+        "ATK up",                  # 裸词，没有反斜杠
+        r"\mhp",                   # 没有 [n] —— 不该被当占位符
+        r"\mhpx[3]",               # 命令名不匹配，不该被切
+    ],
+)
+def test_stat_rule_does_not_overmatch(text: str) -> None:
+    r"""**边界**：新规则不能把普通文本误切。
+
+    判据同上面那条：守卫和屏蔽器对"有没有占位符"必须一致。
+    特别是 `\mhp`（**没有** `[n]`）不该被认 —— 我们的规则要求带参数。
+    """
+    masked, slots = ph.mask_batch([text])
+    guard_sees = extract_placeholders(text)
+    masker_sees = slots[0] if slots else []
+    assert bool(masker_sees) == bool(guard_sees), (
+        f"{text!r}: 守卫看到 {guard_sees}，屏蔽器看到 {masker_sees} —— 不一致\n"
+        f"  屏蔽后 = {masked[0]!r}"
+    )
+    if text == r"\mhp":
+        assert not masker_sees, (
+            r"`\mhp`（无参数）被误当占位符了 —— 规则应要求 `[\d+]`"
+        )
 
 
 # ----------------------------------------------------------------------
