@@ -275,6 +275,24 @@ def _looks_useful(value: Any) -> bool:
         for key in ("translations", "result", "results", "data", "items", "output"):
             if key in value:
                 return _looks_useful(value[key])
+        # ★ `t` 的值是**容器**时也当包装键看。
+        #
+        # 实测：模型把单条的多行译文按"批"的格式裹在 `t` 下面 ——
+        #
+        #     {"t": {"0": "使用契约与恶魔签订后制作的盔甲。",
+        #            "1": "提升所有能力，但恢复效果减半。"}}
+        #
+        # 这是**语法完全合法**的 JSON，`json.loads` 能解析；但 `_looks_useful`
+        # 原先只认数字键/包装键，于是返回 False ⇒ 解析器**丢弃**它 ⇒
+        # 掉到正则抢救也救不回来 ⇒ 报"解析得到空映射"、三次重试全败
+        # ⇒ 整条失败。**能解析的 JSON 被判成没用**，这是本缺陷的真正断点。
+        #
+        # ⚠️ 只在值是容器时看 `t`：`{"t": "译文"}` 是**正常形态**
+        # （`_item_text` 与单条路径都依赖它），字符串交给下面的
+        # "有译文但没索引"判定即可，不能把它当包装键展开。
+        inner = value.get("t")
+        if isinstance(inner, (list, dict)):
+            return _looks_useful(inner)
         k_numeric = [k for k in value if _coerce_int(k) is not None]
         if k_numeric:
             return any(_coerce_str(value[k]) not in (None, "") for k in k_numeric)
@@ -410,6 +428,25 @@ def to_translation_map(
             if isinstance(inner, (list, dict)):
                 value = inner
                 break
+        else:
+            # ★ `{"t": {…}}` —— 模型把单条的多行译文按"批"的格式裹在 `t` 下。
+            #
+            # 实测形态（真实 E2E，`Dungeon And Darkness-Steam` 的盔甲说明）：
+            #
+            #     {"t": {"0": "使用契约与恶魔签订后制作的盔甲。",
+            #            "1": "提升所有能力，但恢复效果减半。"}}
+            #
+            # 两处都得认它：
+            #   * `_looks_useful` 认了 ⇒ 解析器才**不丢弃**这段合法 JSON；
+            #   * 这里认了 ⇒ 才真的把它拆成 `{0: …, 1: …}`。
+            # 只改一处都还是空映射（实测：只改 `_looks_useful` 仍是 `{}`）。
+            #
+            # ⚠️ **只在值是容器时**展开：`{"t": "译文"}` 是**正常形态**
+            # （`_item_text` 与单条路径都依赖它），把字符串也当包装键展开
+            # 会让正常译文变成 `{}` —— 这个错我踩过一次，见提交信息。
+            inner = value.get("t")
+            if isinstance(inner, (list, dict)):
+                value = inner
 
     if isinstance(value, list):
         for pos, item in enumerate(value):
@@ -435,12 +472,23 @@ def to_translation_map(
     elif isinstance(value, dict):
         src_index = _build_source_index(sources)
         for k, v in value.items():
-            text = _coerce_str(v)
+            idx = _coerce_int(k)
+            # ★ 把**这条的原文**传下去：数字键 map 的合成需要知道源文有几行
+            #   （见 `_join_by_source_lines`）。`sources` 与 `expect_indices`
+            #   是平行列表，所以用同一个下标取。
+            src_text: str | None = None
+            if sources and expect_indices and idx is not None:
+                try:
+                    src_text = sources[expect_indices.index(idx)]
+                except ValueError:
+                    src_text = None
+            text = _coerce_str(v, source=src_text)
             if text is None and isinstance(v, dict):
-                text = _coerce_str(v.get("t", v.get("text", v.get("translation"))))
+                text = _coerce_str(
+                    v.get("t", v.get("text", v.get("translation"))), source=src_text
+                )
             if text is None:
                 continue
-            idx = _coerce_int(k)
             if idx is None:
                 # 数字键失败 → 当成"原文作键"反查
                 idx = _match_source(str(k), src_index)
@@ -499,10 +547,68 @@ def _coerce_int(v: Any) -> int | None:
     return None
 
 
-def _coerce_str(v: Any) -> str | None:
+def _join_by_source_lines(values: list[str], source: str | None) -> str:
+    r"""把多段译文合成一条，换行**只在源文确实有那么多行时**才插入。
+
+    ## 为什么必须看源文（实测的坑）
+
+    模型有时把**单条**的多行译文按"批"的格式回答：
+
+        {"t": {"0": "使用契约与恶魔签订后制作的盔甲。",
+               "1": "提升所有能力，但恢复效果减半。"}}
+
+    最自然的修法是"把值用 `\n` 拼起来"。但 `guard()` 对行数的判定是
+    **不对称**的（实测，`.scratch/_nested_guard.py`）：
+
+    | 源→译文行数 | guard 结果 |
+    | --- | --- |
+    | 2 → 2 | 正常 |
+    | 2 → 1 | **warn** `sentence_drop:2->1` |
+    | **1 → 2** | **无警告（fatal=False）** |
+
+    也就是说：源文**单行**时用 `\n` 拼，会**悄悄多出一行**且无人报警 ——
+    比"整条失败并保留原文"更糟。所以：
+
+    * 源文行数 == 段数 ⇒ 用 `\n` 拼（还原原本的换行结构）；
+    * 否则 ⇒ 用**空串**拼（绝不凭空引入换行）。
+
+    `source` 为 `None`（拿不到源文）时一律用空串 —— **保守优先**。
+    """
+    if not values:
+        return ""
+    if source is None:
+        return "".join(values)
+    src_lines = source.count("\n") + 1
+    return ("\n" if src_lines == len(values) else "").join(values)
+
+
+def _coerce_str(v: Any, *, source: str | None = None) -> str | None:
     if v is None:
         return None
     if isinstance(v, str):
+        # ★ 字符串里**还是一个数字键 map** 的情形。
+        #
+        # 为什么会有这一层：模型返回 `{"t": {"0": …, "1": …}}` 时
+        # `parse_json_loose` 整体解析失败（嵌套结构 + 正则抢救），
+        # 抢救出来的形态是 `{"t": '{"0": …, "1": …}'}` ——
+        # **内层 map 变成了一个字符串**。实测（`.scratch/_nested_trace.py`）：
+        #
+        #     parse_json_loose('{"t": {"0": "甲。", "1": "乙。"}}')
+        #       -> ok=False, value=None          ← 整体失败
+        #     to_translation_map({"t": {"0":…,"1":…}})
+        #       -> {}                            ← 丢空
+        #
+        # 只在"确实像个数字键 map"时才再解析一次，避免对正常译文动手。
+        s = v.strip()
+        if s.startswith("{") and s.endswith("}") and re.search(r'"\s*\d+\s*"\s*:', s):
+            try:
+                inner = json.loads(s)
+            except (ValueError, TypeError):
+                inner = None
+            if isinstance(inner, dict):
+                got = _coerce_str(inner, source=source)
+                if got is not None:
+                    return got
         return v
     if isinstance(v, (int, float)):
         return str(v)
@@ -512,7 +618,33 @@ def _coerce_str(v: Any) -> str | None:
     if isinstance(v, dict):
         for key in ("t", "text", "translation", "译文"):
             if key in v:
-                return _coerce_str(v[key])
+                inner = _coerce_str(v[key], source=source)
+                if inner is not None:
+                    return inner
+        # ★ 数字键的 map：模型把**一条**的多行文本按"批"的格式回答。
+        #
+        # 实测形态（真实 E2E，`Dungeon And Darkness-Steam` 的盔甲说明）：
+        #     {"t": {"0": "使用契约与恶魔签订后制作的盔甲。",
+        #            "1": "提升所有能力，但恢复效果减半。"}}
+        # 旧实现走到这里就返回 `None` ⇒ `to_translation_map` 丢弃该条
+        # ⇒ `mapping` 为空 ⇒ 报"解析得到空映射"、三次重试全败
+        # ⇒ 整条失败（保留原文）。
+        #
+        # 修的时候**必须**配合源文行数，理由见 `_join_by_source_lines`。
+        #
+        # ⚠️ 按**数字**排序，不能按字符串：`"10" < "2"` 在字符串序下成立，
+        #   段数上两位时会把顺序弄乱。
+        numeric = [k for k in v if _coerce_int(k) is not None]
+        if numeric:
+            numeric.sort(key=lambda k: _coerce_int(k))  # type: ignore[arg-type,return-value]
+            strs = [
+                p
+                for p in (_coerce_str(v[k], source=None) for k in numeric)
+                if isinstance(p, str)
+            ]
+            if strs:
+                return _join_by_source_lines(strs, source)
+        return None
     return None
 
 
