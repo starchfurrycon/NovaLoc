@@ -689,14 +689,41 @@ def unity_strings_cmd(
 
     if not rep.candidates:
         if json_output:
-            _echo_json({"ok": False, "total": 0, "errors": rep.errors})
+            _echo_json(
+                {
+                    "ok": False,
+                    "total": 0,
+                    "errors": rep.errors,
+                    "encrypted": rep.encrypted,
+                }
+            )
         else:
             console.print("[yellow]没有找到候选文案。[/yellow]")
             for e in rep.errors:
                 console.print(f"  [yellow]! {e}[/yellow]")
+            if rep.encrypted:
+                # ★ 这条比"可能原因"有用得多：它不是猜测，是**实测判定**。
+                #
+                # `IC 1.2` 实测抽到 0 条，原因是 93 个 AssetBundle 全部加密
+                # （熵 7.9998，贴满理论上限）。如果不说明，用户会以为是
+                # 自己用法不对、或以为工具坏了 —— 其实是**能力边界**。
+                console.print(
+                    f"[red]其中 {len(rep.encrypted)} 个资源容器**经熵判定为加密**"
+                    f"（熵 ≥ 7.99 且整文件处处均匀）。[/red]"
+                )
+                console.print(
+                    "[dim]加密资源无法读取，需要从 IL2CPP 元数据/主程序里逆出密钥。"
+                    "这属于能力边界，不是用法问题。示例：[/dim]"
+                )
+                for rel, why in list(rep.encrypted.items())[:3]:
+                    console.print(f"  [dim]{rel}[/dim]")
+                    console.print(f"    [dim]{why}[/dim]")
+                if len(rep.encrypted) > 3:
+                    console.print(f"  [dim]…另有 {len(rep.encrypted) - 3} 个[/dim]")
             console.print(
-                "[dim]可能原因：文本编译进了 Assembly-CSharp.dll（IL2CPP 尤甚）、"
-                "或在 AssetBundle 里、或本扫描器的长度前缀判据没覆盖到该变体。[/dim]"
+                "[dim]其它可能原因：文本编译进了 Assembly-CSharp.dll（IL2CPP 尤甚）、"
+                "在**明文** AssetBundle 里（本工具不解包）、"
+                "或本扫描器的长度前缀判据没覆盖到该变体。[/dim]"
             )
         return
 

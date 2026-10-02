@@ -100,7 +100,9 @@ Wolf RPG 的 `Data/*.wolf`（`BasicData.wolf`、`BGM.wolf`…）是加密容器
 | `root.pfs`（Siglus/Artemis） | 1 | 未实现解析 |
 | AssetBundle（`.unity3d`） | — | **有意不做**，见下 |
 
-### 为什么不做 AssetBundle
+### 为什么不做 AssetBundle —— 但必须区分**两种**情况
+
+#### 情况 A：普通（**明文**）AssetBundle —— 数据支撑"不做"
 
 实测三个游戏，包内可翻文本相对于 `.assets` **可以忽略**：
 
@@ -113,6 +115,37 @@ Wolf RPG 的 `Data/*.wolf`（`BasicData.wolf`、`BGM.wolf`…）是加密容器
 技术上可行（`UnityPy.save()` 往返 24→24 对象、0 丢失；
 `catalog.json` 里**没有** `m_BundleHash`/`m_Hash`/`m_Crc`，不会被校验拒绝），
 但**产能应花在 99.97% 上**。结论：**不投入**。
+
+#### 情况 B：**加密** AssetBundle —— 与 `.wolf` 同类，能力上不可解
+
+`IC 1.2`（アイリス☆クロニクル）是**全库唯一**一个如此的游戏，
+而且它正好是那 6 个"抽不到文本"之外的**第 7 个陷阱**：
+
+* `_Data/` 里**没有任何** loose `.assets` / `level*`（所以 novaloc 抽到 0 条）；
+* 255 MB 的 `data.unity3d` 里扫到的 `TextAsset` 只有 **8 个**
+  （全是 `*.physics3` 物理参数，**不是对白**）；
+* 文本在 `StreamingAssets/StandaloneWindows64/` 的 **95 个文件（237 MB）**里，
+  文件名是 CRC32（`-1830081318` 等，即 Unity `Caching` 的命名）；
+* 其中 **93 个是加密的**，只有 `magic aura set` 与 `magic aura set.manifest`
+  这 2 个是明文（且 `UnityPy` 只能读出 0 个对象）。
+
+**加密判据（可证伪，用熵）**：
+
+| 样本 | 熵 | 块熵 min–max | 判定 |
+| --- | --- | --- | --- |
+| `IC 1.2/-1830081318` | **7.9998** | 7.9967–7.9976 | ★ **加密（熵饱和）** |
+| 已知加密 `.wolf` | 7.5364 | 7.4913–7.6709 | 高熵（压缩或加密） |
+| 已知明文 `.assets` | 6.3356 | 2.2090–7.2944 | 明文（有结构） |
+
+加密数据的熵**饱和在 8.0**，且**整文件处处均匀**（块熵几乎不动），
+而明文 `.assets` 的块熵从 2.21 到 7.29 起伏很大 —— 这个对比就是证据。
+
+要解开得从 4.6 MB 的 `global-metadata.dat` / `GameAssembly.dll` 里
+逆出 AES 密钥，**不打算做**。
+
+> ⚠️ 这两条结论**不能混着说**。此前我把"bundle 里只有 1–4 条文本"
+> 和"`IC 1.2` 抽不到"当成同一件事，其实前者是**明文 bundle 性价比低**，
+> 后者是**加密根本打不开** —— 根因不同，投入产出也不同。
 
 ## 结论：这个库的可翻性
 

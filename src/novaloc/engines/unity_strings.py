@@ -53,6 +53,7 @@ Unity 的序列化字符串格式是
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 from dataclasses import dataclass, field
@@ -241,6 +242,92 @@ _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 _LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 
 
+# ---------------------------------------------------------------------------
+# 加密资源的识别（熵判据）
+# ---------------------------------------------------------------------------
+
+#: 熵超过它就判定为"加密"（bits/byte）。
+#:
+#: 为什么是 7.99 而不是 8.0：真实样本实测 `IC 1.2` 的加密 bundle 是
+#: **7.9998**（1 MB 样本），已经贴到理论上限。留一点余量避免浮点边界抖动。
+ENCRYPTED_ENTROPY = 7.99
+
+#: 块熵"几乎不动"的阈值：加密数据处处均匀，明文/压缩数据会起伏。
+ENCRYPTED_BLOCK_SPREAD = 0.05
+
+
+def shannon_entropy(data: bytes) -> float:
+    """字节 Shannon 熵（bits/byte）。全随机 ≈ 8.0，全同 ≈ 0.0。"""
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    n = len(data)
+    total = 0.0
+    for c in counts:
+        if c:
+            p = c / n
+            total -= p * math.log2(p)
+    return total
+
+
+def looks_encrypted(data: bytes, *, block: int = 65536, blocks: int = 8) -> tuple[bool, str]:
+    r"""这段数据是不是**加密**的？返回 ``(是否加密, 依据文字)``。
+
+    ## 为什么需要它（实测教训）
+
+    `IC 1.2`（アイリス☆クロニクル）抽到 **0 条**文本，但它的
+    `_Data/` 里**没有任何** loose `.assets` —— 文本全在那 237 MB 的
+    `StreamingAssets/StandaloneWindows64/` 里，文件名是 CRC32
+    （`-1830081318` 等）。第一反应是"AssetBundle 没实现，所以抽不到"，
+    但实测那 93 个文件**根本打不开**：`UnityPy` 返回 0 个对象、
+    裸扫 0 个槽位、头部是随机字节。
+
+    如果只靠"打不开"来判断，就没法和"格式没支持"区分开 ——
+    而这两件事的**投入产出完全不同**：前者要逆密钥（不做），
+    后者只是没写解析器（可以排期）。
+
+    ## 判据（可证伪，用熵）
+
+    | 样本 | 熵 | 块熵极差 | 判定 |
+    | --- | --- | --- | --- |
+    | `IC 1.2` 加密 bundle | **7.9998** | 0.0009 | ★ 加密 |
+    | 已知加密 `.wolf` | 7.5364 | 0.1796 | 高熵（压缩或加密） |
+    | 已知明文 `.assets` | 6.3356 | 5.0854 | 明文（有结构） |
+
+    两个条件**同时**成立才算加密：
+
+    1. 熵 ≥ :data:`ENCRYPTED_ENTROPY`（7.99）；
+    2. 分块熵的**极差** ≤ :data:`ENCRYPTED_BLOCK_SPREAD`（0.05）
+       —— 即整文件**处处均匀**。
+
+    第 2 条是为了把"加密"与"恰好是高熵的压缩数据"分开：压缩数据
+    虽然整体熵也高，但**块与块之间**会因为局部可压缩性差异而起伏
+    （`.wolf` 的块熵极差 0.18 就落在这一档），加密数据则完全平坦。
+    """
+    if len(data) < block:
+        # 太短的样本熵不可靠（几百字节的随机数据熵也可能只有 6.x）
+        return False, f"样本太短（{len(data)} 字节）不足以下结论"
+    overall = shannon_entropy(data)
+    if overall < ENCRYPTED_ENTROPY:
+        return False, f"熵 {overall:.4f} < {ENCRYPTED_ENTROPY}（有结构，不像加密）"
+    es = [
+        shannon_entropy(data[i : i + block])
+        for i in range(0, min(len(data), blocks * block), block)
+    ]
+    spread = (max(es) - min(es)) if es else 0.0
+    if spread > ENCRYPTED_BLOCK_SPREAD:
+        return False, (
+            f"熵 {overall:.4f} 很高，但块熵极差 {spread:.4f} > "
+            f"{ENCRYPTED_BLOCK_SPREAD}（像压缩而非加密）"
+        )
+    return True, (
+        f"熵 {overall:.4f} ≥ {ENCRYPTED_ENTROPY} 且块熵极差 {spread:.4f} ≤ "
+        f"{ENCRYPTED_BLOCK_SPREAD}（整文件处处均匀 ⇒ 加密）"
+    )
+
+
 @dataclass
 class UnityString:
     """一个从序列化资源里提出的候选字符串。"""
@@ -259,6 +346,12 @@ class UnityScanReport:
     bytes_scanned: int = 0
     candidates: list[UnityString] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    #: 扫到但**判断为加密**的文件（相对路径 -> 判据文字）。
+    #:
+    #: 为什么要单独留一份：`IC 1.2` 抽到 0 条时，报告只说"没找到候选文案"，
+    #: 用户无法区分"这游戏文本在别处"和"这游戏的资源是加密的"。
+    #: 后者是**能力边界**，必须明说，否则用户会一直以为是自己的用法不对。
+    encrypted: dict[str, str] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -523,7 +616,53 @@ def scan_game(game_dir: Path, *, max_bytes: int = 0) -> UnityScanReport:
             rep.bytes_scanned += sub.bytes_scanned
             rep.candidates.extend(sub.candidates)
             rep.errors.extend(sub.errors)
+        # ★ 顺带报告"抽不到文本"的另一种原因：**资源是加密的**。
+        #
+        # 只扫 `StreamingAssets` 下的候选容器（AssetBundle 习惯放那里），
+        # 且**只读前 1 MB**做熵判定 —— 237 MB 全读进来只为算熵不值得。
+        for rel, why in _scan_encrypted_containers(d).items():
+            rep.encrypted[rel] = why
     return rep
+
+
+#: 判定加密时每个文件读多少字节。1 MB 足够让熵稳定（实测 1 MB 样本
+#: 得到 7.9998），又不至于把大目录整个读进内存。
+ENCRYPT_SAMPLE_BYTES = 1024 * 1024
+
+#: 只在 `StreamingAssets` 下找容器 —— 这是 AssetBundle 的惯例位置。
+_CONTAINER_MIN_BYTES = 256 * 1024
+
+
+def _scan_encrypted_containers(data_dir: Path) -> dict[str, str]:
+    """在 ``StreamingAssets`` 下找出**加密**的容器文件。
+
+    判据见 :func:`looks_encrypted`。只挑「不是已知明文格式」
+    （`UnityFS` / `CAB-` 开头）且体积够大的文件，避免对一堆小文件做无谓判定。
+    """
+    out: dict[str, str] = {}
+    sa = data_dir / "StreamingAssets"
+    if not sa.is_dir():
+        return out
+    for p in sorted(sa.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size < _CONTAINER_MIN_BYTES:
+            continue
+        try:
+            with p.open("rb") as fh:
+                head = fh.read(ENCRYPT_SAMPLE_BYTES)
+        except OSError:
+            continue
+        if head.startswith(b"UnityFS") or head.startswith(b"CAB-"):
+            continue  # 明文 Unity 容器，交给正常流程
+        verdict, why = looks_encrypted(head)
+        if verdict:
+            out[str(p.relative_to(data_dir))] = why
+    return out
 
 
 def write_csv(rep: UnityScanReport, dest: Path) -> Path:
