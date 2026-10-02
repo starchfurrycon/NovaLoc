@@ -245,6 +245,185 @@ def check_placeholders(source: str, target: str) -> list[str]:
     return warnings
 
 
+#: 切句前先把缩写里的句点保护起来，否则 ``Mr. Smith`` 会被切成两句，
+#: 让"源句数"虚高 —— 就会误报一大批正常译文。
+_ABBR_RE = re.compile(
+    r"\b(Mr|Mrs|Ms|Dr|St|vs|etc|e\.g|i\.e|No|Fig|approx|Inc|Ltd|Jr|Sr|Prof)\.|"
+    r"\b([A-Z])\.(?=\s*[A-Z])",
+    re.IGNORECASE,
+)
+#: 缩写保护用的哨兵。**必须是 \x00**：它不出现在任何真实文本里，
+#: 而且能让下面的 `[^\x00]` 精确表达"这一段不是缩写"。
+_ABBR_SENTINEL = "\x00"
+
+#: ★ 标点串：连续的句末标点（``.`` ``!`` ``?`` ``;``）加尾随空白。
+#:
+#: ## 为什么标点必须"整段"识别，而不是逐个判句末（实测踩出来的坑）
+#:
+#: 最初的写法是把"句末标点 + 后跟空白"当切割点：``[.!?;]+(?=\s|$)``。
+#: ``+`` 没有上界，对 ``Sigh... Whatever`` 它只吃**第一个点**就满足了，
+#: 于是把一句切成两句：
+#:
+#:     「Sigh... Whatever, let's go...」
+#:       → ["Sigh", " Whatever, let's go"]   ← 2 句，其实只有 1 句
+#:       → 中文译文只用「…」→ 判"缺句"      ← **假阳性**
+#:
+#: 实测这条假阳性占了开火样本的**大多数**，必须修掉。
+_LATIN_PUNCT_RUN_RE = re.compile(r"[.!?;]+\s*")
+#: 中文译文：全角句末标点（``。！？；``）为主，半角 ``.!?;`` 也接受。
+_CJK_PUNCT_RUN_RE = re.compile(r"[。！？；!?;]+\s*")
+
+
+def _terminates_sentence(run: str) -> bool:
+    """这段标点本身能不能收句？
+
+    ## 为什么单靠"标点后跟空白"不够
+
+    ``...`` 是**语气**（对话里到处都是），不是句子边界；但 ``..`` 这种
+    残缺省略号同样不该收句。而 ``?!`` / ``!?`` / ``???`` 是**加强语气**，
+    确实收句。所以按"标点**种类**"区分，而不是按"标点是不是跟在空白前"：
+
+    * 纯点号（``..`` / ``...``）→ **不收句**（省略号/语气）
+    * 单个 ``.`` → 收句
+    * 任何含 ``!``/``?``/``;`` 的串（``?!`` / ``!`` / ``?`` / ``;``）→ 收句
+
+    这条规则让 ``Sigh... Whatever`` 保持 1 句，同时 ``What?! No way!``
+    仍然是 2 句 —— 两者的区别正是"省略号 vs 加强语气"。
+    """
+    marks = run.strip()
+    if not marks:
+        return False
+    if set(marks) == {"."}:
+        # 纯点号：一个点是句末，两个及以上是省略号（语气），不收句
+        return len(marks) == 1
+    return True
+
+
+def _norm_breaks(text: str) -> str:
+    """把换行抹成空格，用于**数句子**。
+
+    ## 为什么必须抹平（实测）
+
+    模型经常把一句话在中间**折行**（``消耗 0\\n 点资源``），也可能把源文的
+    两行并成一行。换行位置一变，句子数就跟着变 —— 源 2 句、译文 1 句，
+    看起来像"丢了一句"，其实内容完整。实测源文含换行的条目占 **72.1%**，
+    不抹平的话守卫会说 11.8% 的条目有问题，绝大多数是噪声。
+
+    抹平后重测，开火率降到约 **3%**，剩下的才值得人看。
+
+    换行**是否被保留**不是这条判据的职责 —— 那由 `ollama_provider` 的
+    逐行兜底和 QA 的 `line_structure` 单独守着。这里只管"内容有没有少"。
+    """
+    return re.sub(r"[\r\n]+", " ", text)
+
+
+def count_sentences(text: str, *, latin: bool) -> int:
+    """数一条文本里有几句话（至少 1 句）。
+
+    调用前请先过 :func:`_norm_breaks` —— 换行是**排版**，不是句子边界。
+
+    ## 判据
+
+    逐段扫描标点串。一段标点算"句末"当且仅当**它本身能收句**
+    （见 :func:`_terminates_sentence`）**且它前面已经出现过实义字符**
+    （否则像 ``... Hello`` 这种开头的省略号会白算一句）。于是：
+
+    * ``One. Two.`` → 2 句 ✅
+    * ``Add 4 cards to hand. Then discard 2.`` → 2 句 ✅
+    * ``Sigh... Whatever, let's go...`` → 1 句 ✅
+    * ``Wait... what?`` → 1 句 ✅
+    * ``What?! No way!`` → 2 句 ✅
+
+    ``latin=True`` 时先做**缩写保护**：``Mr.`` / ``vs.`` / ``e.g.`` / ``J.``
+    里的句点不是句末。不保护会让源句数虚高，把大量正常译文误判成"缺句"。
+    """
+    if latin:
+        text = _ABBR_RE.sub(
+            lambda m: (m.group(0) or "").replace(".", _ABBR_SENTINEL), text
+        )
+        run_re = _LATIN_PUNCT_RUN_RE
+    else:
+        run_re = _CJK_PUNCT_RUN_RE
+
+    sentences = 0
+    #: 上一段标点之后是否已积累了实义字符（决定下一段标点能否收句）
+    has_content = False
+    pos = 0
+    for m in run_re.finditer(text):
+        if text[pos : m.start()].strip():
+            has_content = True
+        if has_content and _terminates_sentence(m.group(0)):
+            sentences += 1
+            has_content = False
+        pos = m.end()
+    # 结尾还有没被标点收掉的残余内容，也算一句
+    if text[pos:].strip():
+        sentences += 1
+    return max(1, sentences)
+
+
+def check_sentence_drop(source: str, target: str) -> list[str]:
+    """源文有几句、译文只剩几句 —— 抓"翻译时丢掉整句"。
+
+    ## 为什么需要这条（实测出来的）
+
+    ``check_length`` 只能查**长度比**，而英→中的正常长度比中位数实测约
+    **0.35**，所以阈值必须放得很低（否则误报正常译文），一低就
+    **抓不住"丢一个从句"**。真实数据 5,224 条已判成功的译文里，
+    按句子数比对有 **480 条（9.2%）**缺句，而旧守卫对它们全部放行：
+
+        Add 4 cards from the deck to hand. Then, randomly discard 2 cards.
+        → 加入 4 张牌。                    ← 丢掉的正是"随机弃 2 张"这条玩法规则
+
+        Guaranteed escape from battle. Cannot be used on Area Bosses.
+        → 保证在战斗中脱离。               ← 丢掉了使用限制
+
+    丢的是**玩法规则**，玩家照着界面文字操作会出错 —— 属于影响体验的
+    严重缺陷，不是措辞瑕疵。
+
+    ## 为什么用句子数而不是长度
+
+    句子数是**结构信号**：源文 3 句、译文 2 句，就值得复核。它不依赖语言对，
+    也不会因为"中文天然更短"而误报；长度比则会。
+
+    ## 已知漏报（**必须如实说明**）
+
+    句子数**相等**不等于内容完整。实测在"句数相等且源文较长"的 283 条里
+    仍能看到错译：
+
+        Halve Damage → 半身防御          ← 词义错，句数一致，本判据抓不住
+        我要填满用我的精液去…             ← 句子破碎，句数一致，抓不住
+
+    所以这条判据只能减少**丢内容**，不能保证**译得对**。
+
+    ## 只对"拉丁字母为主的源文"生效
+
+    中日文源文的句末标点与中文译文的切分习惯差异大，按句数比会大量误报，
+    所以只在源文以拉丁字母为主时才检查。
+    """
+    warnings: list[str] = []
+    # 只对拉丁源文检查（中日文源文误报率高，见 docstring）
+    if len(re.findall(r"[A-Za-z]", source)) < 12:
+        return warnings
+
+    # ★ 换行是**排版**信号，不是句子边界，比对前必须抹平。
+    #
+    # 实测踩出来的：模型经常把一句话在中间**折行**，于是源 2 句、译文 3 句；
+    # 反过来若译文把两行并成一行，就成了"源 2 句、译文 1 句"的**假阳性**。
+    # 源文里 72.1% 的条目含换行，所以这条不抹平的话噪声极大。
+    #
+    # 换行**是否被保留**由 `ollama_provider` 的逐行兜底 + QA 的
+    # `line_structure` 单独守着（那边管"排版有没有坏"），职责不重叠：
+    # 这里只管"内容有没有少"。
+    n_src = count_sentences(_norm_breaks(source), latin=True)
+    if n_src < 2:
+        return warnings
+    n_tgt = count_sentences(_norm_breaks(target), latin=False)
+    if n_tgt < n_src:
+        warnings.append(f"sentence_drop:{n_src}->{n_tgt}")
+    return warnings
+
+
 def check_length(source: str, target: str, max_chars: int | None, ratio: float) -> list[str]:
     warnings: list[str] = []
     stripped_t = strip_placeholders(target).strip()
@@ -638,6 +817,7 @@ def guard(
     warnings += check_placeholders(source, target)
     warnings += check_percent_vars(source, target)
     warnings += check_length(source, target, max_chars, length_ratio)
+    warnings += check_sentence_drop(source, target)
     warnings += check_language_residue(source, target, target_lang)
     warnings += check_foreign_script(target, source=source)
     if check_repeat:
@@ -645,6 +825,21 @@ def guard(
 
     if not allow_untranslated and looks_untranslated(source, target):
         warnings.append("looks_untranslated")
+
+    # ★ ``sentence_drop`` **故意只做警告，不判死** —— 这是量出来的结论，不是保守。
+    #
+    # 实测（5,224 条已判成功的译文）：判据开火 486 条 = 10.7%。人工抽查开火样本
+    # 发现**大部分是假阳性**，全是"语气词被合并"这类风格差异，内容其实完整：
+    #
+    #     「Sigh... Whatever, let's go...」  →  唉… 不管怎样，走吧…      ✅ 完整
+    #     「Nhooooo! ♥ Ogh! ♥ Ooooh! ♥」    →  莉菲亚：「唔……哦！噢……♥」  ✅ 完整
+    #
+    # 也试过用 len_ratio 把真丢与假阳性分开，**分不开**：风格性合并落在
+    # 0.28~0.56，真丢内容落在 0.10~0.22，区间**重叠**。
+    #
+    # 若把它设成 fatal，就会把这几百条**内容完整**的译文退回英文 ——
+    # 那比偶尔少译一句更伤体验。所以：**只报，不拦**，交给审校界面。
+    # 这与「UI 缩写撞词」同一取舍：拦下正确产物比漏放一个可疑项更糟。
 
     # 致命错误分四类：
     #  * 占位符崩掉 —— 写回去游戏会崩或丢变量；

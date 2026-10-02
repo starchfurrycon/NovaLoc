@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import platform
 import sys
@@ -54,6 +55,8 @@ console = Console(highlight=False, emoji=True)
 
 #: 全局 ``--json``：目前只有部分命令支持，但保持一致的名字。
 _JSON_MODE = False
+
+log = logging.getLogger(__name__)
 
 app = typer.Typer(
     name="novaloc",
@@ -2023,6 +2026,292 @@ def pack_extract(
         else:
             console.print(f"[red]✗[/red] {r['name']}：{r['error']}")
     console.print(f"\n解包完成，产物在 {out.resolve()}")
+
+
+@app.command("auto")
+def auto(
+    library: str = typer.Argument(..., help="游戏库根目录（扫描它下面每个游戏）。"),
+    watch: bool = typer.Option(
+        False, "--watch", help="守望模式：处理完现有游戏后继续等新游戏出现。"
+    ),
+    interval: float = typer.Option(
+        60.0, "--interval", help="守望模式的扫描间隔（秒）。"
+    ),
+    limit: int = typer.Option(0, "--limit", help="最多处理几个游戏（0 = 不限）。"),
+    depth: int = typer.Option(2, "--depth", help="向下找游戏的层数。"),
+    force: bool = typer.Option(
+        False, "--force", help="连已判定为中文的游戏也重做。"
+    ),
+    no_write_back: bool = typer.Option(
+        False, "--no-write-back", help="只跑到 out/，不覆盖原游戏目录。"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="只列出将要处理哪些游戏，不做任何写入。"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
+) -> None:
+    """批量汉化整个游戏库；**就地写回**原游戏目录（先自动备份）。
+
+    逐个游戏：识别引擎 → 跳过已是中文的 → 建项目 → 跑完整流水线
+    → 把变了的文件写回原目录。产物与备份路径都会打印出来。
+
+    \\b
+    ⚠️ 写回是**不可逆**的：所以每个游戏写回前，被覆盖的原文件都会
+    先复制到数据根下的 `_novaloc_backup/<游戏>-<时间戳>/` 里。
+    用 `--no-write-back` 可只跑到 `out/` 由你自己验收后再覆盖。
+    """
+    global _JSON_MODE
+    _JSON_MODE = json_output
+
+    root = Path(library).expanduser()
+    if not root.is_dir():
+        _fail(f"游戏库目录不存在或不是目录：{root}")
+
+    from .batch import (
+        BACKUP_DIR_NAME,
+        GameEntry,
+        detect_already_chinese,
+        find_games,
+        write_back,
+    )
+    from .engines import detect_engine  # noqa: PLC0415
+
+    cfg = load_config()
+    # 用 paths.data_root() 而不是 cfg.paths —— 数据根是**派生值**，
+    # 由 paths 模块按环境决定（见 config_path() 与 load_config()）。
+    data_root = paths.data_root()
+
+    def scan_one(g: Path) -> GameEntry:
+        ent = GameEntry(path=g, name=g.name)
+        try:
+            ctx0 = make_ctx()
+            info = detect_engine(g, ctx0)
+            ent.engine_id = info.engine_id
+            ent.display_name = info.display_name
+        except Exception as exc:  # noqa: BLE001
+            ent.message = f"识别引擎失败：{exc}"
+            ent.status = "failed"
+            return ent
+        chinese, why = detect_already_chinese(g, ent.engine_id)
+        ent.already_chinese, ent.chinese_evidence = chinese, why
+        if chinese and not force:
+            ent.status = "skipped"
+            ent.message = f"已是中文（{why}）"
+        return ent
+
+    console.print(f"[bold]扫描游戏库[/bold] {root}")
+    games = find_games(root, max_depth=depth)
+    console.print(f"  找到 {len(games)} 个候选游戏目录，正在识别引擎…\n")
+
+    entries = [scan_one(g) for g in games]
+    todo = [e for e in entries if e.status == "pending"]
+    skipped = [e for e in entries if e.status == "skipped"]
+    failed_scan = [e for e in entries if e.status == "failed"]
+
+    console.print(
+        f"  待处理 [bold]{len(todo)}[/bold]　"
+        f"已是中文 {len(skipped)}　识别失败 {len(failed_scan)}"
+    )
+    by_engine: dict[str, int] = {}
+    for e in todo:
+        by_engine[e.engine_id or "unknown"] = by_engine.get(e.engine_id or "unknown", 0) + 1
+    if by_engine:
+        console.print("  待处理引擎分布：" + "　".join(f"{k} {v}" for k, v in sorted(
+            by_engine.items(), key=lambda kv: -kv[1]
+        )))
+
+    if dry_run:
+        console.print("\n[yellow]试运行：不会写任何文件。将要处理的游戏：[/yellow]")
+        for e in todo[:60]:
+            console.print(f"  · {e.name}  [dim]({e.engine_id})[/dim]")
+        if len(todo) > 60:
+            console.print(f"  … 另有 {len(todo) - 60} 个")
+        if json_output:
+            _echo_json({"library": str(root), "todo": [e.to_dict() for e in todo]})
+        return
+
+    if limit > 0:
+        todo = todo[:limit]
+    if not todo:
+        console.print("[green]没有需要处理的游戏。[/green]")
+        if json_output:
+            _echo_json({"library": str(root), "done": [], "skipped": [e.to_dict() for e in skipped]})
+        return
+
+    # ---------------------------------------------------------------
+    # 逐个游戏：建项目 → 跑流水线 → 写回
+    # ---------------------------------------------------------------
+    from .core.events import EventBus  # noqa: PLC0415
+    from .pipeline.stages import Pipeline  # noqa: PLC0415
+
+    def process(ent: GameEntry) -> None:
+        ent.status = "running"
+        try:
+            ws = Workspace.create(ent.name, ent.path)
+            ws.project.engine = ent.engine_id if ent.engine_id != "unknown" else ""
+            ws.project.stage = "created"
+            ws.save()
+            ent.project_id = ws.project.id
+
+            bus = EventBus()
+            ctx = Context(config=cfg, events=bus, workspace=ws, logger=None)
+            pipe = Pipeline(ws, ctx)
+            with ws.lock(what="auto"):
+                for sid, _label in _stage_order():
+                    if sid == "detect":
+                        pipe.stage_detect()
+                    elif sid == "extract":
+                        pipe.stage_extract()
+                    elif sid == "images_scan":
+                        pipe.stage_images_scan()
+                    elif sid == "translate":
+                        pipe.stage_translate(only_pending=True)
+                    elif sid == "fonts":
+                        pipe.stage_fonts()
+                    elif sid == "images_localize":
+                        pipe.stage_images_localize()
+                    elif sid == "qa":
+                        pipe.stage_qa()
+                    elif sid == "apply":
+                        pipe.stage_apply()
+
+            units = ws.load_units()
+            ent.units = len(units)
+            if units:
+                tr = [e for e in ws.load_entries() if e.status.value == "translated"]
+                ent.translated = len(tr)
+            imgs = ws.load_images()
+            ent.images = len(imgs)
+            cs = ws.load_charset()
+            ent.font_ok = bool(cs and getattr(cs, "total", 0))
+
+            if not units:
+                # 抽不到文本：常见于走 .assets/.pak 的 Unity 游戏。
+                # 不算失败 —— 是"这个引擎的文本不在我能读的地方"，
+                # 需要用户先用 AssetStudio / UABEA 导出。
+                ent.status = "no_text"
+                ent.message = (
+                    f"引擎 {ent.engine_id} 但抽不到可译文本；"
+                    "若文本在 Unity 的 .assets/AssetBundle 里，"
+                    "可先用 UABEA / AssetStudio 导出成散装文件再扫一次"
+                )
+                return
+
+            if not no_write_back:
+                rep = write_back(
+                    ent.path,
+                    ws.out_dir,
+                    backup_root=data_root / BACKUP_DIR_NAME,
+                    exclude_dirs={BACKUP_DIR_NAME},
+                )
+                ent.written_back = len(rep.written)
+                ent.message = (
+                    f"写回 {len(rep.written)} 个文件"
+                    + (f"，备份在 {rep.backup_dir}" if rep.backup_dir else "")
+                )
+                if rep.failed:
+                    ent.message += f"；{len(rep.failed)} 个失败"
+            else:
+                ent.message = f"产物在 {ws.out_dir}（未写回）"
+            ent.status = "done"
+        except Exception as exc:  # noqa: BLE001
+            ent.status = "failed"
+            ent.message = f"{type(exc).__name__}: {exc}"
+            log.debug("批量处理失败", exc_info=True)
+
+    for i, ent in enumerate(todo, 1):
+        console.rule(f"[{i}/{len(todo)}] {ent.name}")
+        console.print(f"  引擎 [cyan]{ent.engine_id or 'unknown'}[/cyan]　{ent.path}")
+        t0 = time.time()
+        process(ent)
+        mark = {
+            "done": "[green]✅[/green]",
+            "no_text": "[yellow]○[/yellow]",
+            "failed": "[red]✗[/red]",
+        }.get(ent.status, "?")
+        console.print(
+            f"  {mark} {ent.status}　"
+            f"条目 {ent.units}（译 {ent.translated}）　贴图 {ent.images}　"
+            f"用时 {_fmt_duration(time.time() - t0)}"
+        )
+        if ent.message:
+            console.print(f"     [dim]{ent.message}[/dim]")
+
+    # ---------------------------------------------------------------
+    # 汇总
+    # ---------------------------------------------------------------
+    n_done = sum(1 for e in entries if e.status == "done")
+    n_notext = sum(1 for e in entries if e.status == "no_text")
+    n_fail = sum(1 for e in entries if e.status == "failed")
+    console.print()
+    t = Table(title="批量汉化结果", box=box.SIMPLE_HEAVY, title_justify="left")
+    t.add_column("结果", style="bold")
+    t.add_column("数量", justify="right")
+    t.add_row("[green]已汉化并写回[/green]", str(n_done))
+    t.add_row("[yellow]无可译文本[/yellow]", str(n_notext))
+    t.add_row("[red]失败[/red]", str(n_fail))
+    t.add_row("已是中文（跳过）", str(len(skipped)))
+    t.add_row("合计", str(len(entries)))
+    console.print(t)
+    console.print(
+        f"备份目录：{data_root / BACKUP_DIR_NAME}"
+        "　[dim]（被覆盖的原文件都在里面，按游戏+时间戳分目录）[/dim]"
+    )
+
+    report = {
+        "library": str(root),
+        "done": [e.to_dict() for e in entries if e.status == "done"],
+        "no_text": [e.to_dict() for e in entries if e.status == "no_text"],
+        "failed": [e.to_dict() for e in entries if e.status == "failed"],
+        "skipped": [e.to_dict() for e in entries if e.status == "skipped"],
+    }
+    rep_path = data_root / f"auto-report-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    try:
+        rep_path.parent.mkdir(parents=True, exist_ok=True)
+        rep_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        console.print(f"清单：[cyan]{rep_path}[/cyan]")
+    except OSError as exc:
+        console.print(f"[yellow]清单写不出去：{exc}[/yellow]")
+
+    if watch:
+        console.print(
+            f"\n[bold]守望模式[/bold]：每 {interval:.0f} 秒扫一次 {root}，"
+            "新出现的游戏会自动处理。按 Ctrl+C 停止。"
+        )
+        seen = {str(g).lower() for g in games}
+        try:
+            while True:
+                time.sleep(max(5.0, interval))
+                fresh = [
+                    g for g in find_games(root, max_depth=depth)
+                    if str(g).lower() not in seen
+                ]
+                if not fresh:
+                    continue
+                for g in fresh:
+                    seen.add(str(g).lower())
+                console.print(f"\n发现 {len(fresh)} 个新游戏：")
+                for g in fresh:
+                    ent = scan_one(g)
+                    console.print(f"  · {ent.name}  [dim]({ent.engine_id})[/dim]")
+                    if ent.status == "pending":
+                        t0 = time.time()
+                        process(ent)
+                        console.print(
+                            f"    → {ent.status}　条目 {ent.units}"
+                            f"（译 {ent.translated}）　"
+                            f"用时 {_fmt_duration(time.time() - t0)}"
+                        )
+                    else:
+                        console.print(f"    → {ent.status}　[dim]{ent.message}[/dim]")
+        except KeyboardInterrupt:
+            console.print("\n[yellow]已停止守望。[/yellow]")
+        return
+
+    if json_output:
+        _echo_json(report)
 
 
 @app.command("qa")

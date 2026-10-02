@@ -1,4 +1,4 @@
-"""NovaLoc 新译 —— 全离线游戏汉化流水线。
+﻿"""NovaLoc 新译 —— 全离线游戏汉化流水线。
 
 设计原则（务必遵守，见 docs/DESIGN.md）:
 
@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __app_name__ = "NovaLoc"
 __app_name_zh__ = "新译"
 
