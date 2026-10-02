@@ -308,7 +308,13 @@ def test_engine_tag_changes_when_tier_changes() -> None:
     （踩过：早先读 ``rapidocr.__version__``，该属性不存在，
     标识永远是 ``rapidocr|?``，等于缓存键里没有版本信息；
     更早的版本还把空串当初值，让 ``is not None`` 短路、返回空标识。）
+
+    ⚠️ **这条需要真的装了 rapidocr**：标识里的包版本直接取自它，
+    没装就必然是 ``rapidocr|?`` —— 那不是 bug，是缺依赖。
+    所以这里显式 skip，而不是让 CI 红（实测 CI 就是这么红的）。
     """
+    pytest.importorskip("rapidocr", reason="引擎标识里的包版本取自 rapidocr")
+
     from novaloc.core.config import Config
     from novaloc.core.events import EventBus
     from novaloc.core.registry import Context

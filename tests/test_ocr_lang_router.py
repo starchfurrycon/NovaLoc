@@ -106,9 +106,14 @@ def _manifest_entries() -> dict[str, dict[str, str]]:
     """把 RapidOCR 的模型清单摊平成 ``{模型名: {model_dir, SHA256}}``。
 
     清单是三层嵌套（引擎 → 版本 → 任务 → 语种 → 模型 → 字段），
-    直接按固定路径取会写错，所以这里递归收集任何带 `model_dir` 的字典。
+    直接按路径取会写错，所以这里递归收集任何带 `model_dir` 的字典。
+
+    没有 rapidocr 时**跳过**而不是让 `import rapidocr` 抛出去：
+    要校验的清单本身就是**跟着 rapidocr 包发布**的，没装包就没有可校验的基准
+    （实测 CI 上这条报的是 `ModuleNotFoundError: No module named 'rapidocr'`，
+    红得让人以为是我们的清单写错了）。
     """
-    import rapidocr
+    rapidocr = pytest.importorskip("rapidocr", reason="模型清单随 rapidocr 包发布")
     import yaml
 
     manifest = yaml.safe_load(

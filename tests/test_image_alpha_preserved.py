@@ -40,6 +40,7 @@ NumPy 的切片给的是视图。`raw` 之后一路流进 `inpaint_boxes()`，
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -119,6 +120,17 @@ requires_real = pytest.mark.skipif(
     reason="需要真实游戏的明文贴图当文字来源（本机没有就跳过）",
 )
 
+#: 任何**真的调用 `TextureTranslator.process()`** 的用例都需要 OCR 引擎。
+#:
+#: 没有 rapidocr 时 `process()` 不会抛异常，而是返回
+#: `image=None, error='未安装 rapidocr'` —— 于是断言表现为
+#: `assert None is not None`，**完全看不出是缺依赖**（实测 CI 就是这么红的）。
+#: 所以这里显式 skip，让原因写在报告里。
+requires_ocr = pytest.mark.skipif(
+    importlib.util.find_spec("rapidocr") is None,
+    reason="需要 rapidocr（否则 process() 返回 image=None、报错信息看不出来）",
+)
+
 
 # ----------------------------------------------------------------------
 # 一、主路径：真的走到重绘
@@ -169,6 +181,7 @@ def test_alpha_survives_disk_round_trip(tmp_path: Path) -> None:
 # 二、早退路径也要保住 alpha
 # ----------------------------------------------------------------------
 
+@requires_ocr
 def test_alpha_survives_no_text_early_return(tmp_path: Path) -> None:
     """**没有文字**的图会走"原图返回"的早退路径，alpha 同样不能丢。"""
     src = tmp_path / "blank.png"
@@ -188,6 +201,7 @@ def test_alpha_survives_no_text_early_return(tmp_path: Path) -> None:
 # 三、边界：不能凭空造出 / 抹掉通道
 # ----------------------------------------------------------------------
 
+@requires_ocr
 def test_rgb_image_stays_rgb(tmp_path: Path) -> None:
     """本来没有 alpha 的图不能凭空多出一个通道。
 
@@ -206,6 +220,7 @@ def test_rgb_image_stays_rgb(tmp_path: Path) -> None:
     )
 
 
+@requires_ocr
 @pytest.mark.parametrize("channels", [3, 4])
 def test_channel_count_is_preserved(tmp_path: Path, channels: int) -> None:
     src = tmp_path / f"ch{channels}.png"
@@ -219,6 +234,7 @@ def test_channel_count_is_preserved(tmp_path: Path, channels: int) -> None:
     )
 
 
+@requires_ocr
 def test_grayscale_input_becomes_three_channels(tmp_path: Path) -> None:
     """灰度图会被升成 3 通道（处理链只吃 3/4 通道），这是预期行为。
 

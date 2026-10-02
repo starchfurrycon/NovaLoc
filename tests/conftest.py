@@ -44,6 +44,40 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "slow: 较慢（字体合并、整条流水线）")
 
 
+def _ollama_reachable(timeout: float = 3.0) -> bool:
+    """本机 Ollama 是否活着（``/api/tags`` 能应答）。
+
+    **为什么用"能不能连上"而不是 marker**：CI 的 pytest 用的是
+    **排除式**过滤（`-m "not needs_models and ..."`），所以一个**忘了
+    打 marker** 的测试会**照常运行然后失败**。实测就是这么发生的：
+    `test_marker_retry.py` / `test_translate_dedup.py` 要真连 Ollama，
+    却没打 marker，于是 CI 上十几条红着。
+
+    marker 描述的是"这条测试**需要什么**"，而"需要什么"是**实现细节**：
+    今天换成 `OllamaTranslationProvider` 注入的假 `_chat`，明天就可能
+    变成真请求。所以判据应当是**此刻能不能真的跑**，而不是作者记得打没打标记。
+
+    想强制跑（例如专门验证"Ollama 挂了时的报错文案"）：
+    设 ``NOVALOC_REQUIRE_OLLAMA=1``。
+    """
+    if os.environ.get("NOVALOC_REQUIRE_OLLAMA"):
+        return True
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=timeout):
+            return True
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+requires_ollama = pytest.mark.skipif(
+    not _ollama_reachable(),
+    reason="本机没有可用的 Ollama 服务（设 NOVALOC_REQUIRE_OLLAMA=1 可强制运行）",
+)
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return ROOT

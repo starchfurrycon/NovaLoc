@@ -26,9 +26,15 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from conftest import requires_ollama  # noqa: E402
+
 from novaloc.translate import placeholders as ph  # noqa: E402
 from novaloc.translate import prompts  # noqa: E402
 from novaloc.translate.ollama_provider import OllamaTranslationProvider  # noqa: E402
+
+# 本文件要真连 Ollama（`OllamaTranslationProvider` 的构造与探活都会走网络）。
+# 没装/没起 Ollama 就整体跳过，而不是在 CI 上红成一片 —— 详见 conftest 里的说明。
+pytestmark = requires_ollama
 
 
 class _FakeUnit:
