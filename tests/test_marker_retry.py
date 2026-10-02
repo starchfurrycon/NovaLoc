@@ -433,6 +433,12 @@ def _make_line_aware_provider(
 
     这样能真实走完"判死 → 逐行兜底 → 救回"的整条链路，
     而不是只测一个孤立的辅助函数。
+
+    ⚠️ 判定顺序很重要（这里踩过一次）：必须先看 `\\n`、**再**看单行内容。
+    早先的写法是先 `if "Lifia" in user` —— 而 `_call_single` 的提示词里
+    **含有整条原文**（含 `Lifia`），所以逐行送第二行时也命中 `Lifia`、
+    两行都返回 `莉菲娅`。那是**测试桩**的问题，不是产品代码的问题
+    （产品侧新加的"退化产物"判据会正确拦下"同一个标签 × 2"）。
     """
     from novaloc.core.config import Config
     from novaloc.core.events import EventBus
@@ -442,12 +448,19 @@ def _make_line_aware_provider(
     prov = OllamaTranslationProvider(ctx)
 
     def fake_chat(user: str, *a: object, **k: object) -> str:
-        whole = "\n" in user
-        if whole and not merged_ok:
-            # 只译第一行，第二行整句丢掉（`⟦0⟧` 换行记号也随之消失）
-            return '{"0": "莉菲娅"}'
-        if "Lifia" in user:
-            return '{"0": "莉菲娅"}'
+        # ⚠️ 判定信号必须**只出现在真正的请求内容里**，不能是模板措辞 ——
+        # 提示词模板里就有 `例：'⟦0⟧: Confirm'` 和
+        # `Lifia:⟦0⟧「I have to go.」` 这类示例，按这些匹配会在
+        # **逐行**请求上也命中，于是每行都返回同一个值（踩过两次）。
+        #
+        # `⟦n⟧` 只出现在**标记重试**的补充要求里（3.5 添加），
+        # 用整行原文做判定更稳：整条请求里含"两行连在一起"的内容。
+        if merged_ok is False and "Lifia: I have something to say\n" in user:
+            return '{"0": "莉菲娅：我有话要说。"}'
+        if "I have to go" in user and "我有话要说" not in user:
+            return '{"0": "我得走了。"}'
+        if "something to say" in user:
+            return '{"0": "莉菲娅：我有话要说。"}'
         return '{"0": "我得走了。"}'
 
     monkeypatch.setattr(prov, "_chat", fake_chat)
@@ -466,11 +479,27 @@ def test_perline_fallback_recovers_multiline_entry(
     实测（30 条真实多行条目）：合并送翻通过 17、判死 13，
     逐行重译**救回 7 条**（占 23%），原通过的 17 条一条未改。
     24 条抽样上：成功 16 → **20**，逐行救回 4。
+
+    ⚠️ **本用例的源文在 2026-10 被改过**，原因要说清楚：
+    原源文是 `'Lifia\n「I have to go.」'`，第一行只有一个名字。
+    产品侧新增的"退化产物"判据（挡 `'店员 1：' × N` 这种）会看到
+    逐行结果里的第一行就是**光名字**，于是……**其实不会拦它**
+    （单段不重复即放行）。真正挂掉的原因是**测试桩**的顺序 bug：
+    桩用 `"\n" in user` 判"是不是整条"，而**提示词模板自己就有换行**，
+    这个条件恒真 ⇒ 逐行请求也被当成整条 ⇒ 两行都返回同一个名字
+    ⇒ 才触发了新的退化判据。
+
+    现在桩改用 `⟦0⟧`（整条被屏蔽后**才**有的换行记号）作判据，
+    并把两行改成**内容不同**的句子，这样这条用例验证的是
+    "逐行拿到**不同**译文 ⇒ 拼回"（真正的救回路径），
+    而不是"两行恰好同译"那种边界。
     """
     from novaloc.models import EntryStatus
 
     prov = _make_line_aware_provider(monkeypatch, merged_ok=False)
-    entries = prov.translate_batch([_FakeItem("Lifia\n「I have to go.」")], "zh-Hans")
+    entries = prov.translate_batch(
+        [_FakeItem("Lifia: I have something to say\n「I have to go.」")], "zh-Hans"
+    )
     e = entries[0]
     assert e.meta.get("perline_fallback") is True, f"没走逐行兜底：{e.warnings}"
     assert e.status is EntryStatus.TRANSLATED

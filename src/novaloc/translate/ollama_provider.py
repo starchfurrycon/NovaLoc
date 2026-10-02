@@ -111,6 +111,79 @@ def _source_line_count(slots: list[str] | None) -> int:
     return n
 
 
+def _is_degenerate_repetition(lines: list[str], *, max_len: int = 20) -> bool:
+    r"""逐行译文是不是"同一个短片段复制了 N 遍"。
+
+    ## 为什么需要这个（#39 实测）
+
+    模型对**每一行**都回同一个说话人标签时，逐行路径会拼出
+    `'店员 1：\n店员 1：\n店员 1：'` —— 每行单独看都"是合法中文、
+    长度也在范围内"，所以**逐行守卫会全部放行**，拼起来却是把垃圾
+    复制了三遍，还挂着 `status=translated` 写回游戏。这是**静默**的。
+
+    ## 为什么这条判据**有判别力**（而比值判据没有）
+
+    我同时试过"译文/原文比值下限"来挡它 —— 实测**完全重叠、无判别力**：
+
+        人工确认的垃圾：比值 0.28 / 0.17 / 0.04 / 0.43 / 0.38
+        合理合并译文：  比值 0.17 / 0.26 / 0.29 / 0.29 / 0.31 / 0.37
+        ⇒ 垃圾最大 0.43 > 合理最小 0.17，**任何阈值都误杀一边**
+
+    而"**同一个短片段重复**"是**结构性**的，不受源文长短、语种、
+    紧凑程度影响：合理的合并译文里不会出现三行一模一样的短句。
+    ⇒ 只保留这一条。
+
+    ⚠️ `max_len=20` 是"短片段"的界定：三行都等于**长句**时更可能是
+    合理的重复修辞，不当垃圾处理（宁可漏，不可误杀）。
+    """
+    parts = [p.strip() for p in lines if p.strip()]
+    if len(parts) < 2:
+        return False
+    return len(set(parts)) == 1 and len(parts[0]) < max_len
+
+
+def _block_degenerate_entries(
+    entries: list[TranslationEntry], stats: dict[str, int] | None = None
+) -> int:
+    r"""把"同一短片段复制多遍"的译文标成失败、清空译文，返回拦下的条数。
+
+    ## 为什么放在**最后**（#39 实测）
+
+    我先把判据加在 3.7（逐行重译）里，结果实测发现**它漏了**：
+    退化产物根本没走到 3.7 —— 它在**块 3 的 `placeholder_repaired`
+    修复路径**上就被标成 `translated` 了（实测 `placeholder_repaired == 1`）。
+
+    这正是本项目反复出现的陷阱：**"这段代码没问题"与"这段代码没被执行"
+    看起来完全一样**。在**单点**加守卫只覆盖那一个点；而
+    "写回前的最终值"是唯一能覆盖**所有**路径
+    （补空 / 块 3 / 3.5 定向重试 / 3.7 逐行 / 修复路径）的位置。
+
+    ## 为什么抽成独立函数
+
+    原先是内联在 `translate_batch` 末尾的十几行。抽出来之后可以
+    **直接单测**（确定性、不依赖提示词措辞或模型桩）——
+    而"内容驱动"的假模型被我证明是**不可靠的**：提示词模板里就有
+    `例：'⟦0⟧: Confirm'` 和 `Lifia:⟦0⟧「I have to go.」`
+    这类示例文本，按内容匹配会被模板本身命中。
+
+    ⚠️ 只处理**多行**译文：单行短译文不适用（`'莉菲娅'` 这种
+    "整条翻成一个词"是合法正解）。
+    """
+    blocked = 0
+    for e in entries:
+        if e.status is not EntryStatus.TRANSLATED:
+            continue
+        lines = [x for x in (e.target or "").split("\n") if x.strip()]
+        if len(lines) >= 2 and _is_degenerate_repetition(lines):
+            e.status = EntryStatus.FAILED
+            e.target = ""
+            e.warnings = [*e.warnings, "degenerate_repetition"]
+            blocked += 1
+    if blocked and stats is not None:
+        stats["degenerate_blocked"] = stats.get("degenerate_blocked", 0) + blocked
+    return blocked
+
+
 def _best_segment(segs: list[str], slots: list[str] | None = None) -> str | None:
     r"""从模型返回的多个片段里挑**一个最好**的，而不是把它们拼起来。
 
@@ -965,6 +1038,57 @@ class OllamaTranslationProvider:
                     else:
                         per_item_failed.add(li)
 
+            # ---- 2.7 【已删除】"疑似假成功"检测（#39） ----
+            #
+            # 我在这里加过一个检测：源文多行、译文塌成一行且比值过低
+            # ⇒ 判为"假成功"，标失败并交给 3.7 逐行重译。
+            #
+            # **实测证明它没有判别力，所以删掉了**（不是"调阈值"，是删）：
+            #
+            # | 类别 | 译文/原文比值 |
+            # | --- | --- |
+            # | 人工确认的垃圾（只回说话人标签） | 0.28 / 0.17 / **0.04** / 0.43 / 0.38 |
+            # | 合理合并译文（中文把三行合成一句） | **0.17** / 0.26 / 0.29 / 0.29 / 0.31 / 0.37 |
+            #
+            # 垃圾**最大** 0.43 > 合理译文**最小** 0.17 ⇒ **完全重叠**，
+            # 任何阈值都必然误杀一边。我先后取过三个阈值（`len>=40`、
+            # 拉丁字母>=25、拉丁字母>=60），**三次都在误伤**：
+            #
+            # * `len>=40` 把 `'Lifia: I have something to say\n「I have to go.」'`
+            #   （41 字符，其中 `「」` 只贡献长度不贡献信息）判成"足够长"；
+            # * 拉丁字母>=25 同样命中它（26 个字母）；
+            # * 每次误触发都**抢走 3.7 的工作** —— 而 3.7 是**量过**的
+            #   （30 条真实多行条目救回 7 条、原通过的 17 条一条未改）。
+            #
+            # 这是本项目**第四次**"看起来合理 ≠ 量过"。教训与
+            # `_best_segment` docstring 里那次一模一样：**区间重叠的
+            # 判据不能用阈值救，只能换成结构性判据**。
+            #
+            # ## 真正有判别力的那条判据在哪
+            #
+            # "逐行译文是不是同一个短片段重复" —— 见
+            # :func:`_is_degenerate_repetition`，它用在 **3.7** 那里。
+            # 它是**结构性**的（不受语种/紧凑程度影响），
+            # 实测两个方向都成立：
+            #   * 合理合并译文 ⇒ 不触发；
+            #   * `'店员 1：' × N` ⇒ 拦下。
+            #
+            # ## 另外三条实测结论（避免以后重复投入）
+            #
+            # 1. 真实工作区里 `translated` 且"源文多行 + 译文单行"的**只有
+            #    6 条**，逐条看过**全是合理的合并译文**，不含垃圾。
+            # 2. 真正只回标签的那条（`'店员 1\n：'`，比 0.04）**不是**
+            #    靠这条判据抓的 —— 它带 `sentence_drop:6->1`，
+            #    而 `sentence_drop` 是**故意只警告、不判死**的：
+            #    实测开火率 10.7%，人工抽查**大部分是假阳性**
+            #    （语气词被合并），且"真丢内容"与"风格性合并"的
+            #    len_ratio 区间**重叠**，分不开（见 `guards.py` 的说明）。
+            #    ⇒ 那条垃圾的**唯一现有信号就是那个警告**，
+            #      本轮**没有**修好它，作为已知局限记在 ROADMAP。
+            # 3. 所以"假成功"在这个语料上**不是**可判定的主要缺口；
+            #    48.6% 的 `failed` 才是（其中大量是 500
+            #    `token repeat limit reached`）。
+
             # ---- 3. 还原 + 校验 + 守卫 ----
             for local_i, global_i in enumerate(batch):
                 item = uniq_items[global_i]
@@ -1342,6 +1466,29 @@ class OllamaTranslationProvider:
                             self.stats.get(f"perline_why_{why.split(':')[0]}", 0) + 1
                         )
                     continue
+                # ★ 逐行全过守卫**仍然可能是垃圾**：实测模型对每一行都回
+                # 同一个说话人标签（`'店员 1：'` × 3）。每行单独看都
+                # "是合法中文、长度也在范围内"，守卫于是放行，拼起来却是
+                # 把垃圾复制了三遍 —— 还挂着 `status=translated` 写回游戏。
+                #
+                # ## 判据只有"重复"这一条 —— 理由见 `_is_degenerate_repetition`
+                #
+                # 我先加过比值下限（`_is_acceptable_recovery`）。撤掉是因为
+                # **实测证明比值没有判别力**（垃圾 0.04~0.43 与合理译文
+                # 0.17~0.37 完全重叠），而且它当场把一条**已量过**的正解
+                # 拒掉了：`'Lifia\n「I have to go.」'` 的正解就是人名
+                # `'莉菲娅'`（比值 0.125、不含换行），见
+                # `tests/test_marker_retry.py`（实测 30 条救回 7 条、
+                # 原通过的 17 条一条未改）。
+                #
+                # ⇒ 只留结构性判据，两个方向都成立：
+                #   * `'莉菲娅'`（单段，不重复）⇒ 放行 ✅
+                #   * `'店员 1：' × 3`（重复短段）⇒ 拦下 ✅
+                if _is_degenerate_repetition(got_lines):
+                    self.stats["perline_why_degenerate"] = (
+                        self.stats.get("perline_why_degenerate", 0) + 1
+                    )
+                    continue
                 entry.target = "\n".join(got_lines)
                 entry.warnings = []
                 entry.status = EntryStatus.TRANSLATED
@@ -1372,6 +1519,14 @@ class OllamaTranslationProvider:
             entry.model = canonical.model
             entry.glossary_hits = list(canonical.glossary_hits)
             entry.meta = {**canonical.meta, "deduped_from_uid": canonical.uid}
+
+        # ---- 3.9 ★ 最后一道闸：任何路径都不得留下"退化产物"（#39）----
+        #
+        # 判据、实测与"为什么要放在最后"见
+        # :func:`_block_degenerate_entries`。
+        degenerate = _block_degenerate_entries(out, self.stats)
+        if degenerate:
+            log.warning("拦下 %d 条退化译文（同一短片段复制多遍）", degenerate)
 
         return out
 
