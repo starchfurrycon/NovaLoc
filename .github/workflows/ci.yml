@@ -72,7 +72,39 @@ jobs:
           python -c "import novaloc.fonts.catalog, novaloc.fonts.charset, novaloc.fonts.merge, novaloc.fonts.qa"
           python -c "import novaloc.images.io, novaloc.images.render, novaloc.images.inpaint, novaloc.images.textgroup"
           python -c "import novaloc.translate.placeholders, novaloc.translate.guards, novaloc.translate.json_parse"
-          python -c "from novaloc.pipeline.stages import STAGES; assert len(STAGES) == 8, STAGES"
+          python - <<'PY'
+          # 断言**管线的确切阶段**，不是"有几个阶段"。
+          #
+          # 早先这里写的是 `assert len(STAGES) == 8`。它有两个毛病：
+          #   1. 后来加了 `images_localize`，这个数字就过期了 —— 而它在
+          #      本地跑不到（完整套件不含这条），于是 CI 一直红着没人知道；
+          #   2. **数字对不上时看不出是"多了一个"还是"少了一个"**。
+          #      而这两种情况的严重性完全不同："少了一个阶段"意味着
+          #      有一类工作被静默跳过，是事故；"多了一个"通常只是忘了改数字。
+          # 所以这里把阶段**逐个列出来**。
+          from novaloc.pipeline.stages import STAGES
+
+          expect = [
+              ("unpack", "解包资源"),
+              ("detect", "识别引擎"),
+              ("extract", "抽取文本"),
+              ("images_scan", "扫描贴图"),
+              ("translate", "翻译"),
+              ("fonts", "字体适配"),
+              ("images_localize", "贴图汉化"),
+              ("qa", "质检"),
+              ("apply", "回写产物"),
+          ]
+          got = [tuple(s) for s in STAGES]
+          if got != expect:
+              missing = [s for s in expect if s not in got]
+              extra = [s for s in got if s not in expect]
+              raise SystemExit(
+                  f"管线阶段与约定不符。\n缺失（严重：这类工作会被静默跳过）：{missing}\n"
+                  f"新增（若是有意加的，请同步本清单）：{extra}\n实际：{got}"
+              )
+          print(f"OK 管线阶段符合约定：{len(got)} 个")
+          PY
 
       - name: CLI smoke test
         # --help 不需要配置、不需要网络、不需要模型。
