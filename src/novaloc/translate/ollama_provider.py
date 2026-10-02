@@ -624,6 +624,48 @@ class OllamaTranslationProvider:
         #      要靠护栏（hint_echo 已经在拦，见 `guards.py`）。
         #   2. 模型只给纯文本（没有 JSON），由下面 `stripped` 那条接住。
         keys = sorted(mapping)
+        # ---- ★ 把"从 1 开始编号"的响应折成从 0 开始 ----
+        #
+        # ## 实测（Round 7，读到 stderr 才发现的）
+        #
+        # `.scratch/_e2e_auto3.err` 里同一批连报三次同一个症状：
+        #
+        #     批 0（1 条）第 1 次失败：单条翻译失败（无法解析为 JSON）：
+        #         解析结果不是字符串：'{"1": "在 1 个回合内，自动保护生命值较低的队友。",
+        #                              "2": "在 1 回合内，自动保护生命值较少的角色。"}'
+        #     批 0（1 条）第 2 次失败：…（同样的东西，只是译文措辞不同）
+        #     批 0（1 条）第 3 次失败：…
+        #
+        # **1 条输入、3 次重试、3 次全废 ⇒ 这条内容丢失。**
+        #
+        # 关键在于模型给的编号是 **`1, 2`**，不是 `0, 1`。
+        # 而下面这行判定要求**必须有键 0**：
+        #
+        #     joins = isinstance(mapping.get(0), str)      # {1:…, 2:…} ⇒ False
+        #
+        # 于是多段分支**整段被跳过**，`keys` 非空 ⇒ 报"解析结果不是字符串"。
+        # **这不是模型给了坏数据，是我们的形状假设太窄**：
+        # 响应形状本身完全合理（连续编号的字符串片段），只是基准是 1。
+        #
+        # ## 为什么"平移"是安全的（而不是放宽判据）
+        #
+        # 平移之后交给**同一段**既有逻辑处理，等价于"模型当初回的就是 0 基准"：
+        # * 仍然走 `_best_segment` **选段**，绝不拼接（拼接会让两行粘一起）；
+        # * 连续性仍然被检查 —— 有洞就**原样不动**掉到下面的报错，
+        #   所以"编号不连续"这条安全性**没有被放宽**；
+        # * 段选择优先看占位符完整度，因此多行条目的段落边界照样守住。
+        #
+        # 只认**从 1 开始且连续**这一种形态：`min(keys) != 1` 时不动
+        # （比如键是 `[2,3]`，那更像真的编号错乱，宁可报错也不要猜）。
+        if keys and keys[0] == 1 and all(isinstance(mapping[k], str) for k in keys):
+            contiguous = keys == list(range(1, len(keys) + 1))
+            if contiguous:
+                mapping = {k - 1: v for k, v in mapping.items()}
+                keys = sorted(mapping)
+                log.debug(
+                    "单条请求的响应从 1 开始编号，已平移为 0 基准：%d 段",
+                    len(keys),
+                )
         joins = isinstance(mapping.get(0), str)
         if joins and len(keys) > 1:
             if keys != list(range(len(keys))):
