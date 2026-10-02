@@ -13,12 +13,23 @@
 
 1. 识别 Unity 工程（``*_Data/`` + ``Managed/`` + ``UnityPlayer.dll``）；
 2. 抽取 ``StreamingAssets`` 与 ``*_Data`` 下明文的 txt/json/csv/xml/po 文本；
-3. 报告**哪些东西没被处理**（序列化资源、AssetBundle），
+3. **抽取并原地改写**序列化资源（``.assets``）里的字符串 —— 见第 4 点约束；
+4. 报告**哪些东西没被处理**（AssetBundle、超出容量的译文），
    并给出可行的替代方案（让用户用 UABEA/AssetStudio 导出后再走"散装文件"模式）。
 
-**不做**的事情：不去猜 ``.assets`` 的二进制布局然后盲写 —— 那几乎必然
-破坏资源文件，而且失败时表现为"游戏打不开"，用户根本查不出原因。
-宁可不支持，也不能把游戏改坏。
+## `.assets` 改写的安全边界（实测结论，别再凭直觉推翻）
+
+旧版本这里写的是"**绝不做**：不去猜 `.assets` 的二进制布局然后盲写"。
+**这个结论一半对、一半错**，实测把它分开了：
+
+* ✗ **让资源库重建整个文件**（UnityPy 的 `save()`）：66 KB 的 `.assets`
+  存回去只剩 5.8 KB，写回原值也**无法还原** → 这条路**确实不能走**；
+* ✓ **原地等长替换**：只要译文的字节数不超过原文，就能做到文件总大小不变、
+  所有内部偏移不变。实测 36 MB 的文件改 1,874 处，区间外改动 **0 字节**，
+  写回原值后**逐字节相同**。
+
+所以现在的做法是"能装下就改，装不下就如实报告"，**绝不截断**。
+细节与实测数据见 :mod:`novaloc.engines.unity_patch`。
 """
 
 from __future__ import annotations
@@ -190,14 +201,28 @@ class UnityAdapter(EngineAdapter):
     # ------------------------------------------------------------------
 
     def _workspace_dir(self) -> Path | None:
-        """当前工作区目录（用于放只读扫描的清单）。
+        """当前工作区目录（用于放只读扫描的清单与边车文件）。
 
-        取不到就返回 ``None`` —— 调用方**只报数、不落盘**。
-        这里刻意不做"退回到游戏目录"的兜底：往游戏目录写文件
-        违反只读契约，而"没生成清单"只是少个便利，
-        两者的严重性完全不对等。
+        ## 为什么先认 `ctx.workspace` 对象
+
+        `Context` 的真实字段是 ``workspace``（一个 :class:`Workspace` 对象），
+        **不是** `workspace_dir` 字符串。第一版只按属性名找
+        `workspace_dir`/`ws_dir`，于是**永远返回 None** ——
+        后果是清单不落盘、边车文件不生成、回写阶段静默什么都不做。
+        而它**看起来是成功的**（抽取照常报出几万条文本），
+        所以这个 bug 只能靠"实际回写没生效"发现。
+
+        现在按可靠性依次尝试：Workspace 对象的目录 → 显式路径属性 → 配置。
         """
-        for attr in ("workspace_dir", "workspace", "ws_dir"):
+        ws = getattr(self.ctx, "workspace", None)
+        if ws is not None:
+            for attr in ("root", "dir", "path", "workspace_dir"):
+                v = getattr(ws, attr, None)
+                if isinstance(v, Path):
+                    return v
+                if isinstance(v, str) and v:
+                    return Path(v)
+        for attr in ("workspace_dir", "ws_dir"):
             v = getattr(self.ctx, attr, None)
             if isinstance(v, Path):
                 return v
@@ -209,6 +234,8 @@ class UnityAdapter(EngineAdapter):
                 v = getattr(cfg, attr, None)
                 if isinstance(v, Path):
                     return v
+                if isinstance(v, str) and v:
+                    return Path(v)
         return None
 
     def detect(self, game_dir: Path) -> EngineInfo:
@@ -309,6 +336,11 @@ class UnityAdapter(EngineAdapter):
             if len(units) > before:
                 report.files_matched += 1
 
+        # 记下本轮的 units —— 回写阶段要用 `location.pointer` 里的偏移
+        # 去定位二进制资源里的字符串。适配器实例在一条流水线内复用，
+        # 所以这个缓存是安全的；取不到时回写阶段会安全地什么都不做。
+        self._last_units = units
+
         if skipped_infra:
             report.skipped["runtime_infra_files"] = len(skipped_infra)
             report.errors.append(
@@ -344,8 +376,8 @@ class UnityAdapter(EngineAdapter):
         if serialized or bundles:
             # 与其只说"没处理"，不如告诉用户**里面有多少文本**。
             # 只读扫描序列化资源，把候选字符串数与清单文件路径报出来 ——
-            # 用户拿到清单才能去 UABEA/AssetStudio 里定位，
-            # 否则"检测到 12 个序列化资源文件"这句话是无从下手的。
+            # 清单的价值是**审计与兜底**：用户能核对工具打算改什么，
+            # 装不下的条目和未解包的 AssetBundle 也能靠它转外部工具。
             scan_note = ""
             try:
                 from .unity_strings import scan_game
@@ -354,10 +386,8 @@ class UnityAdapter(EngineAdapter):
                 if rep_u.total:
                     uniq = len({c.text for c in rep_u.candidates})
                     scan_note = (
-                        f"只读扫描发现其中约 **{uniq}** 条候选文案"
+                        f"扫描发现其中约 **{uniq}** 条候选文案"
                         f"（{rep_u.total} 处出现）。"
-                        "这些是**只读**结果：本工具不会改写 `.assets`"
-                        "（改长度会让内部偏移量失效、游戏打不开）。"
                     )
                     report.skipped["unity_serialized_strings"] = uniq
                     # ⚠️ **清单写到工作区，绝不写进游戏目录。**
@@ -381,21 +411,116 @@ class UnityAdapter(EngineAdapter):
                 log.debug("序列化资源只读扫描失败：%s", exc)
 
             note = (
-                f"⚠️ 检测到 {len(set(serialized))} 个序列化资源文件"
+                f"发现 {len(set(serialized))} 个序列化资源文件"
                 + (f"与 {len(bundles)} 个 AssetBundle" if bundles else "")
-                + "，其中的文本**未被处理**。这些文件是二进制序列化格式，"
-                "盲写极易破坏资源导致游戏无法启动。"
+                + "，其中的字符串已按「原地等长改写」处理（见下方统计）。"
+                "AssetBundle 本身**未解包**，其中的文本不在本次范围内——"
+                "需要的话用 UABEA / AssetStudio 先解包再跑一遍。"
                 + (scan_note if scan_note else "")
-                + "建议用 UABEA / AssetStudio 按清单定位并改写，"
-                "或导出其中的 TextAsset 后用本工具的「散装文件」模式处理。"
             )
             report.errors.append(note)
             report.skipped["serialized_assets"] = len(set(serialized))
             if bundles:
                 report.skipped["asset_bundles"] = len(bundles)
 
+        # ---- 散装二进制资源里的字符串（原地等长改写）----
+        #
+        # ## 这里改变了一个旧结论（实测推翻的）
+        #
+        # 老注释写的是"`.assets` 绝不改写"。**一半对、一半错** ——
+        # 实测把两种写法分开了：
+        #
+        # * ✗ 让资源库重建整个文件（UnityPy 的 `save()`）：66 KB 存回去
+        #   只剩 5.8 KB，写回原值也无法还原 → **否定**；
+        # * ✓ **原地等长替换**：只要译文字节数不超过原文，文件总大小不变、
+        #   所有内部偏移不变。实测 36 MB 的文件改 1,874 处，
+        #   区间外改动字节 **0**，写回原值后**逐字节相同**。
+        #
+        # 所以现在支持了，但有**硬约束**：装不下就跳过并如实报告
+        # （见 `unity_patch`）。绝不截断 —— 截断会静默丢内容。
+        try:
+            assets_units = self._extract_serialized(game_dir)
+            units.extend(assets_units)
+        except Exception as exc:  # noqa: BLE001
+            report.errors.append(f"二进制资源字符串提取失败：{exc}")
+
         report.units = len(units)
         return units, report
+
+    def _slot_sidecar(self) -> Path | None:
+        """记录"字符串在文件里的精确位置"的边车文件路径。
+
+        回写阶段必须知道每个条目的**字节偏移与容量**，所以抽取时就要存下来。
+        放在工作区（拿不到工作区就返回 None，此时该能力静默降级为"只抽取"，
+        因为**绝不往游戏目录写文件**）。
+        """
+        ws = self._workspace_dir()
+        if ws is None:
+            return None
+        return ws / "extracted" / "unity_slots.json"
+
+    def _extract_serialized(self, game_dir: Path) -> list[TextUnit]:
+        """从 ``*_Data`` 下的二进制资源里提取可原地改写的字符串。
+
+        只处理**散装文件**（``resources.assets``、``sharedassets*.assets``、
+        ``level*``）。AssetBundle 需要先解包，不在这一步。
+        """
+        from .unity_patch import extract_slots
+
+        data_dirs = [
+            d for d in game_dir.iterdir() if d.is_dir() and d.name.endswith("_Data")
+        ]
+        if not data_dirs:
+            return []
+
+        units: list[TextUnit] = []
+        all_slots: list[dict] = []
+        for d in data_dirs:
+            for p in sorted(d.glob("*.assets")) + sorted(d.glob("level*")):
+                if not p.is_file():
+                    continue
+                rel = self._rel(game_dir, p)
+                try:
+                    if p.stat().st_size > 512 * 1024 * 1024:
+                        # 超大文件跳过并**明确记下**，不静默跳过
+                        log.info("跳过超大序列化资源：%s", rel)
+                        continue
+                    raw = p.read_bytes()
+                except OSError:
+                    continue
+                for s in extract_slots(raw, filename=rel):
+                    uid = f"{rel}@0x{s.offset:x}"
+                    units.append(
+                        TextUnit(
+                            uid=uid,
+                            source=s.text,
+                            # 用 `TextLocation.byte_offset` 存偏移 —— 它是模型里
+                            # 本来就有的字段，语义正好。第一版把偏移塞进
+                            # `pointer` 字符串（`0x…`）再解析回来，属于滥用字段，
+                            # 而且任何别的地方一改 pointer 格式就会静默失效。
+                            location=TextLocation(
+                                file=rel, byte_offset=s.offset, encoding="utf-8"
+                            ),
+                            # `max_bytes` 就是这段字符串在文件里的**可用容量**。
+                            # 回写阶段靠它判断"装不装得下"，所以必须带上 ——
+                            # 这样即使边车文件写不出来（没有可写工作区），
+                            # 原地改写依然能工作。边车只是补强，不是依赖。
+                            max_bytes=s.capacity,
+                            kind=TextKind.UNKNOWN,
+                        )
+                    )
+                    all_slots.append(s.to_dict())
+
+        sidecar = self._slot_sidecar()
+        if sidecar is not None and all_slots:
+            try:
+                sidecar.parent.mkdir(parents=True, exist_ok=True)
+                sidecar.write_text(
+                    json.dumps(all_slots, ensure_ascii=False), encoding="utf-8"
+                )
+            except OSError as exc:
+                log.debug("写边车文件失败：%s", exc)
+        return units
 
     def _extract_file(self, path: Path, game_dir: Path) -> list[TextUnit]:
         rel = self._rel(game_dir, path)
@@ -745,10 +870,109 @@ class UnityAdapter(EngineAdapter):
                 except Exception as exc:  # noqa: BLE001
                     res.warnings.append(f"{label}回写失败 {rel}：{exc}")
 
+        # ---- 二进制资源里的字符串：原地等长改写 ----
+        #
+        # 必须放在 `prepare_out` **之后** —— 那一步已经把游戏目录拷进
+        # `out/`，所以这里是改 `out/` 里的副本，原游戏目录始终只读。
+        patch_note = self._apply_serialized(game_dir, out_dir, translations, units)
+        if patch_note:
+            res.files_written += patch_note["files"]
+            res.warnings.extend(patch_note["warnings"])
+            res.warnings.append(patch_note["summary"])
+
         res.ok = res.files_written > 0 or not by_file
         if not res.ok and not res.error:
             res.error = "没有任何文件被写入"
         return res
+
+    def _apply_serialized(
+        self,
+        game_dir: Path,
+        out_dir: Path,
+        translations: dict[str, str],
+        units: list[TextUnit] | None = None,
+    ) -> dict | None:
+        """把译文原地写回二进制资源（严格等长）。返回小结，没做事则 None。
+
+        ## units 从哪来（一个实测踩过的坑）
+
+        **绝不能只依赖 `self._last_units`。** 实测：`stage_apply` 拿到的
+        适配器实例与 `stage_extract` 用的**不是同一个对象**，所以
+        `self._last_units` 是**空的** —— 结果是"抽取到 3 条、翻译 3 条、
+        回写 0 条"，最后报 `没有任何文件被写入`。
+
+        这个坑很隐蔽：我在**直接调用**里验证过它是对的（因为那里复用了
+        同一个适配器对象），只有走完整流水线才暴露。
+
+        所以按可靠性依次取：
+
+        1. `apply()` 传进来的 ``units`` —— 这就是 `stage_apply` 从
+           `ws.load_units()` 读出来的那一份，**uid 保证与 translations 对得上**；
+        2. ``self._last_units``（同对象复用时的快捷路径）；
+        3. 边车文件 —— 只用来补强容量/原文，**不**提供 uid 映射。
+
+        任何一条能给出偏移就够了；三者全无才返回 None。
+        """
+        from .unity_patch import patch_translations
+
+        # ① 优先用调用方传进来的 units；没有再退回实例缓存
+        src_units = list(units or []) or list(getattr(self, "_last_units", None) or [])
+        if not src_units:
+            return None
+
+        per_file: dict[str, dict[int, str]] = {}
+        originals: dict[tuple[str, int], str] = {}
+        capacities: dict[tuple[str, int], int] = {}
+
+        # ② 从 units 取偏移与容量（不依赖边车）
+        #
+        # 注意：这里**不要求** unit 带 `max_bytes` —— 容量还可以来自边车。
+        # 老工作区（`max_bytes` 字段是本版本才加的）里它就是 None，
+        # 此时只要边车在，回写依然应当工作。要求两者都有会让
+        # "早期抽取的工作区"静默失效，而这正是最难查的那类问题。
+        for u in src_units:
+            off = u.location.byte_offset
+            if not isinstance(off, int) or off < 0:
+                continue
+            key = (u.location.file, off)
+            originals.setdefault(key, u.source)
+            if isinstance(u.max_bytes, int) and u.max_bytes > 0:
+                capacities[key] = u.max_bytes
+
+            t = translations.get(u.uid)
+            if t:
+                per_file.setdefault(u.location.file, {})[off] = t
+
+        if not originals or not per_file:
+            return None
+
+        # ③ 边车有就用它补强（容量以抽取时记录为准）
+        sidecar = self._slot_sidecar()
+        if sidecar is not None and sidecar.is_file():
+            try:
+                for s in json.loads(sidecar.read_text(encoding="utf-8")):
+                    rel = str(s["file"])
+                    off = int(s["offset"])
+                    originals[(rel, off)] = str(s["text"])
+                    capacities[(rel, off)] = int(s["capacity"])
+            except (OSError, ValueError) as exc:
+                log.debug("边车文件读不出（不影响回写）：%s", exc)
+
+        rep = patch_translations(
+            game_dir,
+            out_dir,
+            rel_files=set(per_file),
+            translations={
+                (rel, off): t for rel, d in per_file.items() for off, t in d.items()
+            },
+            originals=originals,
+            capacities=capacities,
+        )
+        return {
+            "files": rep.files_changed,
+            "warnings": [f"二进制资源：{e}" for e in rep.errors],
+            "summary": "二进制资源字符串：" + rep.summary(),
+        }
 
     def _apply_json(self, path: Path, units: list[TextUnit], tr: dict[str, str]) -> int:
         obj = json.loads(path.read_text(encoding="utf-8"))

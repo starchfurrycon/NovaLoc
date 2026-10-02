@@ -278,9 +278,15 @@ def main() -> int:
     print(f"    报告的问题 {len(urep.errors)} 条：")
     for e in urep.errors:
         print(f"      · {e[:120]}")
-    check("如实报告了未处理的序列化资源/AssetBundle",
+    check("如实报告了序列化资源/AssetBundle",
           any("序列化资源" in e for e in urep.errors), str(urep.errors))
-    check("说明了这些内容未被处理", any("未被处理" in e for e in urep.errors))
+    # 现在的口径变了：`.assets` 里的字符串**会**被原地等长改写
+    # （见 tests/test_unity_patch.py），所以报告里应说明这一点，
+    # 并把 AssetBundle（未解包）列为真正未处理的部分。
+    check("说明了序列化资源会被原地改写",
+          any("原地等长改写" in e for e in urep.errors), str(urep.errors))
+    check("说明了 AssetBundle 未被解包",
+          any("AssetBundle" in e and "未" in e for e in urep.errors))
     check("给出了可行的替代方案",
           any("UABEA" in e or "AssetStudio" in e for e in urep.errors))
 
@@ -294,10 +300,61 @@ def main() -> int:
     ugot = {u.uid: u.source for u in uu2}
     ubad = [(u.uid, utr[u.uid], ugot.get(u.uid)) for u in uunits if ugot.get(u.uid) != utr[u.uid]]
     check("Unity 译文往返一字不差", not ubad, f"{len(ubad)} 处，例如 {ubad[:3]}")
-    # 二进制资源必须原样复制而不是被改写
-    check("序列化资源原样复制（未被改写）",
+    # 没有可译字符串的资源必须**原样**保留（不能被"顺手"重写）
+    # 注意：这里相等是**因为本来就没东西可改**（level0 全是 0 字节），
+    # 不是因为"永不改写 .assets" —— 后者已经被推翻了。
+    # "有字符串时会被正确改写"由 tests/test_unity_patch.py 覆盖。
+    check("无可译字符串的资源原样保留",
           (uout / "MyGame_Data" / "level0").read_bytes()
           == (unity / "MyGame_Data" / "level0").read_bytes())
+
+    # ---------- 5b. Unity .assets 内字符串的原地改写 ----------
+    #
+    # 这一节验证本版本新增的能力：`.assets` 里的**长度前缀字符串**
+    # 现在会被抽取并原地等长改写。旧版本这里是"绝不改写"。
+    print("\n[5b] Unity .assets 原地改写")
+    import struct as _st
+
+    def _mkstr(t: str) -> bytes:
+        b = t.encode("utf-8")
+        cap = (len(b) + 3) & ~3
+        return _st.pack("<I", len(b)) + b + b"\x00" * (cap - len(b))
+
+    u2 = SB / "unity2"
+    d2 = u2 / "MyGame_Data"
+    d2.mkdir(parents=True, exist_ok=True)
+    (u2 / "UnityPlayer.dll").write_bytes(b"MZ")
+    (d2 / "Managed").mkdir(exist_ok=True)
+    (d2 / "Managed" / "Assembly-CSharp.dll").write_bytes(b"MZ")
+    (d2 / "globalgamemanagers").write_bytes(b"\x00" * 50 + b"2021.3.16f1" + b"\x00" * 20)
+    # 一段真对白 + 前后哨兵字节（哨兵用来证明"区间外零改动"）
+    assets_orig = (
+        b"\xAB" * 16
+        + _mkstr("The wise king ruled the human world for many years.")
+        + b"\xCD" * 16
+    )
+    (d2 / "resources.assets").write_bytes(assets_orig)
+
+    ua2 = get_adapter("unity", ctx)
+    au, _ = ua2.extract_text(u2)
+    adialog = [u for u in au if "wise king" in u.source]
+    check("从 .assets 里抽到了字符串", bool(adialog), f"{len(au)} 条 unit")
+    if adialog:
+        du = adialog[0]
+        check("抽取结果带字节偏移", isinstance(du.location.byte_offset, int)
+              and du.location.byte_offset > 0, str(du.location))
+        aout = SB / "unity2_out"
+        # 译文必须比原文短才放得下（这是硬约束）
+        atr = {du.uid: "英明的国王统治人间多年。"}
+        ares = ua2.apply(u2, aout, au, atr)
+        check("原地改写的回写阶段成功", ares.ok, ares.error)
+        newb = (aout / "MyGame_Data" / "resources.assets").read_bytes()
+        check("★ 文件大小不变", len(newb) == len(assets_orig),
+              f"{len(assets_orig)} → {len(newb)}")
+        check("★ 中文确实写进了资源", "英明的国王统治人间多年。".encode() in newb)
+        # 区间外必须零改动：前后哨兵原样
+        check("★ 前后哨兵字节未被触碰",
+              newb[:16] == b"\xAB" * 16 and newb[-16:] == b"\xCD" * 16)
 
     # ---------- 6. 散装 ----------
     print("\n[6] 散装文件")

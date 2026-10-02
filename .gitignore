@@ -88,6 +88,11 @@ tests/fixtures/*_out3/
 tests/fixtures/wire_*/
 tests/fixtures/_wire/
 tests/fixtures/arwes-test/
+# `unity2` 与它的产物是本轮"`.assets` 原地改写"端到端测试**运行时**造的
+# 合成 Unity 工程（见 `tests/test_engines_all.py` 的 [5b] 段）。
+# 它是产物、不是素材 —— 入库会让仓库多出几个假 exe/dll。
+tests/fixtures/unity2/
+tests/fixtures/unity2_out/
 
 # 合成 RPG Maker 工程里的 `data/` 曾经只有 `test_engine_rpgmaker.py` 跑过
 # 才会有（被上面通用的 `data/` 规则忽略），而另外两个端到端套件直接读它 ——

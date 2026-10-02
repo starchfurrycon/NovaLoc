@@ -729,10 +729,11 @@ def unity_strings_cmd(
     )
     console.print(f"清单已写到 [bold]{dest}[/bold]")
     console.print(
-        "[yellow]⚠️ 这些文本**没有**被改写[/yellow]"
-        "（`.assets` 是二进制序列化格式，盲写会让游戏打不开）。"
+        "[dim]本命令只导出**清单**（不改文件）。"
+        "要真正改写，用 `novaloc run <id>` —— "
+        "它会对这些资源做「原地等长改写」：文件大小与内部偏移都不变，"
+        "译文装不下的条目会保留原文并如实上报。[/dim]"
     )
-    console.print("[dim]用 UABEA / AssetStudio 打开清单里的文件，按 offset 定位后改写。[/dim]")
     for e in rep.errors[:5]:
         console.print(f"  [yellow]! {e}[/yellow]")
 
@@ -2186,14 +2187,23 @@ def auto(
             ent.font_ok = bool(cs and getattr(cs, "total", 0))
 
             if not units:
-                # 抽不到文本：常见于走 .assets/.pak 的 Unity 游戏。
-                # 不算失败 —— 是"这个引擎的文本不在我能读的地方"，
-                # 需要用户先用 AssetStudio / UABEA 导出。
+                # 抽不到文本。现在 `.assets` 里的字符串**已经能改**了
+                # （见 `novaloc.engines.unity_patch`），所以走到这里
+                # 通常意味着文本在**更外层**的容器里：
+                #
+                # * **AssetBundle**（`.bundle`/`.unity3d`）—— 本工具不解包；
+                # * **自研打包格式**（`.pak`/`.dat`/`.bin`）；
+                # * **根本没有文本文件** —— 文字是**画在贴图里**的。
+                #   实测 AliQ 就是这种：613 MB 资源里只有 2 KB 假名噪声。
+                #
+                # 不算失败，但要**说清是哪一种**，否则用户不知道该往哪走。
                 ent.status = "no_text"
                 ent.message = (
-                    f"引擎 {ent.engine_id} 但抽不到可译文本；"
-                    "若文本在 Unity 的 .assets/AssetBundle 里，"
-                    "可先用 UABEA / AssetStudio 导出成散装文件再扫一次"
+                    f"引擎 {ent.engine_id}，但既没有明文文本，"
+                    "也没有从序列化资源里读到字符串。可能的原因："
+                    "① 文本在未解包的 AssetBundle / 自研归档里 —— "
+                    "用 UABEA / AssetStudio 解包后再扫；"
+                    "② 文字直接画在贴图里（纯图游戏）—— 本工具的贴图汉化流程可处理。"
                 )
                 return
 
