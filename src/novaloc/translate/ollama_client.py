@@ -17,6 +17,50 @@ import httpx
 
 from .sanitize import sanitize_for_json, sanitize_tree
 
+_log = logging.getLogger(__name__)
+
+#: 超过这个秒数的请求会额外打一条 WARNING。
+#:
+#: ## 为什么需要这个（一次真实的"看起来卡死"）
+#:
+#: 一次端到端跑在 21:25:17 之后再无输出，我到 21:36:37 去查时已静默
+#: **11.3 分钟**，同时：`novaloc` 进程 **ΔCPU = 0s**、与 Ollama 有一条
+#: **Established** 连接、Ollama 进程 **ΔCPU = 0s** 且模型即将过期。
+#:
+#: 也就是说：**客户端在等一个不来的响应，而这件事在日志里一个字都没有。**
+#: `request_timeout_s = 300`，所以单次最多等 5 分钟；但我**无法**从日志判断
+#: 那 11 分钟是"一次卡死"还是"两次各 5 分钟的超时" —— 因为日志里
+#: **没有时间戳、也没有任何超时记录**。
+#:
+#: 判据断在这里，所以先补**观测**：每次请求都记耗时，慢的额外告警。
+#: 这条 WARNING 说清楚了"我在等谁、等了多久" —— 之后的日志才能回答
+#: "到底卡在哪一次请求上"。
+SLOW_REQUEST_S = 60.0
+
+
+def _log_request(method: str, path: str, elapsed: float, *, ok: bool, note: str = "") -> None:
+    """记一次 Ollama 请求的耗时。**成功也记** —— 否则量不出常态基线。"""
+    if elapsed >= SLOW_REQUEST_S:
+        _log.warning(
+            "Ollama 请求过慢：%s %s 用了 %.1fs（%s）%s",
+            method,
+            path,
+            elapsed,
+            "成功" if ok else "失败",
+            f"　{note}" if note else "",
+        )
+    else:
+        _log.debug(
+            "Ollama %s %s %.2fs %s%s",
+            method,
+            path,
+            elapsed,
+            "ok" if ok else "fail",
+            f" {note}" if note else "",
+        )
+
+
+
 log = logging.getLogger(__name__)
 
 
@@ -86,20 +130,35 @@ class OllamaClient:
         # 见 `novaloc.translate.sanitize` 的模块文档。
         if "json" in kw:
             kw["json"] = sanitize_tree(kw["json"])
+        _t0 = time.time()
         try:
             resp = self.client.request(method, url, **kw)
         except httpx.ConnectError as exc:
+            _log_request(method, path, time.time() - _t0, ok=False, note="连接失败")
             raise OllamaNotRunning(
                 f"连接不上 Ollama（{self.host}）。请确认服务已启动：`ollama serve`。原始错误：{exc}"
             ) from exc
         except httpx.TimeoutException as exc:
+            # ★ 超时**必须说出来**。原先它只变成一句 OllamaError 交给重试层，
+            # 于是"等了 5 分钟什么都没发生"在日志里完全看不出来 ——
+            # 那 11 分钟静默就是这么来的（见 `SLOW_REQUEST_S` 的说明）。
+            _log_request(
+                method,
+                path,
+                time.time() - _t0,
+                ok=False,
+                note=f"超时（上限 {self._timeout}）",
+            )
             raise OllamaError(f"请求 Ollama 超时（{path}）：{exc}") from exc
         except UnicodeEncodeError as exc:
             # 兜底：万一有别的路径绕过了上面的净化，也不要把
             # UnicodeEncodeError 漏给调用方（它会被重试层忽略）。
+            _log_request(method, path, time.time() - _t0, ok=False, note="编码失败")
             raise OllamaError(
                 f"请求体含无法编码的字符（孤立代理项），已拒绝发送：{exc}"
             ) from exc
+
+        _log_request(method, path, time.time() - _t0, ok=resp.status_code < 400)
 
         if resp.status_code == 404:
             body = _safe_json(resp)
