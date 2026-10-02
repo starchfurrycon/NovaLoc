@@ -654,7 +654,7 @@ class Pipeline:
         target_lang = self.ctx.config.translate.target_lang
         throttle = ProgressThrottle(self.bus, "translate", min_interval_s=0.4, min_delta=0.005)
 
-        # 按类型分批：UI 短标签可以大批量，长对白必须小批量。
+        # 按类型分组：UI 短标签可以大批量，长对白必须小批量。
         # 混在一起会让模型把长句译成标签风格，或者把标签译得啰嗦。
         buckets: dict[str, list[TextUnit]] = {}
         for u in units:
@@ -665,9 +665,12 @@ class Pipeline:
         total = len(units)
 
         for kind, group in buckets.items():
-            chunk_size = 12 if kind in ("dialogue", "narration") else 40
-            for i in range(0, len(group), chunk_size):
-                chunk = group[i : i + chunk_size]
+            batch_indices = self._chunk_indices(provider, group, kind)
+            #: 该 kind 内已处理到的下标（只用于日志定位；批次大小不再是固定的，
+            #: 所以不能用"第几批 × 批大小"反推，必须显式累加）。
+            seen = 0
+            for idxs in batch_indices:
+                chunk = [group[j] for j in idxs]
                 items = [
                     TranslateItem(
                         unit=u,
@@ -685,7 +688,7 @@ class Pipeline:
                     # 一批失败不能让整个项目挂掉：标记该批为失败，继续后面的。
                     # 否则一条奇怪的文本就能让几小时的翻译白跑。
                     self.bus.log(
-                        f"批次翻译失败（{kind} {i}-{i + len(chunk)}）：{exc}",
+                        f"批次翻译失败（{kind} {seen}-{seen + len(chunk)}）：{exc}",
                         stage="translate",
                         severity=Severity.WARN,
                     )
@@ -701,6 +704,7 @@ class Pipeline:
                         for u in chunk
                     ]
                 out.extend(res)
+                seen += len(chunk)
                 done += len(chunk)
                 throttle(done / max(1, total), f"已翻译 {done}/{total}")
                 if on_progress is not None:
@@ -712,6 +716,75 @@ class Pipeline:
             on_progress(out, True)
         self._report_provider_stats(provider)
         return out
+
+    def _chunk_indices(
+        self, provider: object | None, group: list[TextUnit], kind: str
+    ) -> list[list[int]]:
+        r"""把一个 kind 的条目切成批次，返回**下标列表**。
+
+        ## 为什么要改成"问提供者"，而不是写死数字
+
+        旧实现是写死的：
+
+            chunk_size = 12 if kind in ("dialogue", "narration") else 40
+
+        **这个 12 绕过了提供者自己的批切分**（`OllamaProvider._make_batches`，
+        它按 `max_batch_chars=3000` / `max_batch_strings=40` /
+        `max_batch_long_chars=200` 切，并且用 `_SHORT_KINDS` 防"短标签被长句带长"）。
+        写死 12 的后果实测（`.scratch/_chunk_gain.py`，真实长度分布）：
+
+            游戏                     dialogue 批数
+                                   写死 12    提供者切
+            Dungeon And Darkness      266       112    (2.4×)
+            072 Project               800       371    (2.2×)
+
+        而全库文本的**中位长度只有 9 字符** —— 12 条一批约 108 字符，
+        离 3000 字符的上限差得极远，纯粹是浪费往返。
+
+        ## 为什么敢改大（实测，不是推理）
+
+        `.scratch/_chunk_quality.py`：同一批 120 条真实 dialogue，
+        chunk=12 与 chunk=40 各翻一遍（两边都 120/120 拿到译文）：
+
+            批大小   长度比中位   长度比p90   最大
+              12       0.30        0.67     1.33
+              40       0.32        0.46     1.50
+
+        短句（原文 ≤10 字符）平均译文长：12 -> 40 是 **-41%**，
+        即**没有**"短句被长句带长"的迹象。
+
+        ## 兜底
+
+        提供者可能没有这个方法（测试注入的假 provider、别的实现），
+        或者它抛异常。这时**退回**按 kind 的固定块 —— 慢，但一定可用，
+        而且不会把一条文本弄丢。绝不因为"想快"而让整轮翻译挂掉。
+        """
+        mk = getattr(provider, "_make_batches", None)
+        if callable(mk):
+            try:
+                items = [
+                    TranslateItem(
+                        unit=u,
+                        glossary={},
+                        context_lines=[u.context] if u.context else [],
+                    )
+                    for u in group
+                ]
+                batches = mk(items)
+                # 校验：必须覆盖且不重复，否则宁可退回固定块，
+                # 也不能漏译或重译（漏译是静默的，最难发现）。
+                flat = [j for b in batches for j in b]
+                if sorted(flat) == list(range(len(group))):
+                    return [list(b) for b in batches if b]
+                log.warning(
+                    "提供者返回的批次不完整（%d 个下标 / 应有 %d），退回固定分批",
+                    len(flat),
+                    len(group),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("调用提供者分批失败（%s），退回固定分批", exc)
+        size = 12 if kind in ("dialogue", "narration") else 40
+        return [list(range(i, min(len(group), i + size))) for i in range(0, len(group), size)]
 
     def _report_provider_stats(self, provider: object) -> None:
         r"""把翻译提供者的统计汇总打印一次。
