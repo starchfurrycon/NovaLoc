@@ -281,10 +281,30 @@ class OllamaTranslationProvider:
         per_item = max(1, int(getattr(o, "max_output_tokens_per_item", 48)))
         factor = float(getattr(o, "max_output_char_factor", 2.2))
         # 内容需要多少
+        #
+        # ★ 这条保险丝必须**跟着内容走**，不能按"每条平均"一刀切。
+        #
+        # 旧实现是 `ceiling = per_item * n_items + 64`，即"每条平均 48 token"。
+        # 批里一旦混进长条目，额度就被平均掉，实测（`072 Project` 真实文本，
+        # 工作区 f4b03ca791a9）：
+        #
+        #   * 单条 400 字符的魔物说明 ⇒ `need=912`，但 `ceiling=48*1+64=` **112**；
+        #     而它的中文译文要 **~300 token**
+        #     （另一次探针实测：`940 字符 -> 279 token`）⇒ JSON 被截断在
+        #     字符串中间（`'{"t": "……【生命值】\\n【攻击力】\\n【'`），
+        #     **三种解析策略全部失败**，重试 3 次再逐条降级，最后还是空译文。
+        #   * 后果：`len(source) > 200` 的条目 **18/20 = 90% 拿不到译文**，
+        #     而全库游戏里 3–4 行的"人物/魔物介绍"**全部**超过 200 字符。
+        #
+        # 取"内容估算"与"条数×每条额度"里**较大**的那个，再留 64 token
+        # 给 JSON 收尾。回归测试见
+        # `tests/test_ollama_options_wiring.py::test_long_single_item_gets_budget_proportional_to_its_length`
+        # —— 该用例在旧实现下**确实是红的**（已验证）。
         need = int(src_chars * factor) + 12 * max(1, n_items) + 32
-        # 上限：绝不超过"每条 per_item"这条保险丝（防止内容超长导致无上限）
-        ceiling = per_item * max(1, n_items) + 64
-        return max(64, min(need, ceiling, o.num_ctx // 3))
+        per_count = per_item * max(1, n_items) + 64
+        budget = max(need, per_count)
+        # 硬上限：绝不超过上下文的三分之一，防止跑飞（原实现的本意，保留）
+        return max(64, min(budget, o.num_ctx // 3))
 
     # ------------------------------------------------------------------
     # 批量切分

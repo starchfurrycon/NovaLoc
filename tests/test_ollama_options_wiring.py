@@ -168,3 +168,69 @@ def test_no_unreachable_code_after_return() -> None:
         "`_options()` 在 return 之后还有代码（不可达），"
         f"会让人以为设置生效了：{[ast.dump(n)[:60] for n in tail]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# ★ 输出 token 预算必须**跟着内容走**，不能按"每条平均"一刀切
+# ---------------------------------------------------------------------------
+#
+# 这是一个**真实造成 90% 长条目丢译文**的回归点，实测证据见
+# `_num_predict` 的 docstring。旧的写法是：
+#
+#     ceiling = per_item(48) * n_items + 64
+#     return max(64, min(need, ceiling, num_ctx // 3))
+#
+# 单条 400 字符的魔物说明：need=912，但 ceiling=48*1+64=**112**，
+# 于是 `num_predict=112`，模型的中文译文（实测要 ~300 token）
+# 在字符串中间被截断：`'{"t": "……【生命值】\\n【攻击力】\\n【'`，
+# 三种解析策略全失败、重试 3 次、逐条降级，最后还是空译文。
+#
+# 下面这些用例**故意写成"长条目单批"** —— 那正是旧实现被打穿的情形。
+
+
+def test_long_single_item_gets_budget_proportional_to_its_length() -> None:
+    """单条长文本必须拿到与**它自己长度**相称的额度。
+
+    旧实现给 400 字符的单条只批 112 token（= 48*1+64），
+    实测译文需要约 300 token ⇒ JSON 被截断。
+    """
+    p = _provider()
+    n = p._num_predict(1, 400)
+    assert n >= 300, (
+        f"单条 400 字符只拿到 {n} token —— 实测中文译文需约 300，"
+        "会被截断成坏 JSON（详见 _num_predict docstring）"
+    )
+
+
+def test_budget_is_monotonic_in_source_chars() -> None:
+    """原文越长，额度必须不减少（内容驱动的直接推论）。"""
+    p = _provider()
+    prev = 0
+    for chars in (10, 50, 100, 200, 400, 800, 1600):
+        got = p._num_predict(1, chars)
+        assert got >= prev, f"{chars} 字符的额度 {got} 比更短原文的 {prev} 还小"
+        prev = got
+
+
+def test_budget_never_exceeds_third_of_context() -> None:
+    """兜底上限仍在：绝不超过 `num_ctx // 3`（防跑飞的初衷不能丢）。"""
+    p = _provider()
+    ctx_len = p.cfg.ollama.num_ctx
+    for n_items, chars in ((1, 100_000), (40, 100_000), (1000, 10**6)):
+        got = p._num_predict(n_items, chars)
+        assert got <= ctx_len // 3, f"{n_items} 条 {chars} 字符算出 {got}，超过兜底"
+
+
+def test_short_batch_budget_not_reduced_by_long_item() -> None:
+    """短条目占多数时，额度不该被算小（否则短句也会烂）。
+
+    批里混一条长的：旧实现按"每条平均"给，短句会被连累。
+    """
+    p = _provider()
+    mostly_short = p._num_predict(40, 400)  # 40 条共 400 字符 = 每条约 10 字符
+    # 40 条短句至少要拿到 48 token/条（`max_output_tokens_per_item` 的本意），
+    # 但不得越过 `num_ctx // 3` 的兜底 —— 两者取小。
+    floor = min(48 * 40, p.cfg.ollama.num_ctx // 3)
+    assert mostly_short >= floor, (
+        f"40 条短文本只拿到 {mostly_short} token（应至少 {floor}），短句会被截断"
+    )

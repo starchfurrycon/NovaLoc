@@ -135,11 +135,25 @@ def test_real_batch_sizes_get_enough_room() -> None:
 
 
 def test_fuse_limits_pathological_content() -> None:
-    """保险丝：内容异常长时也不能无上限。"""
+    """保险丝：内容异常长时也不能无上限 —— 兜底是 `num_ctx // 3`。
+
+    ## 为什么这条断言从 `per_item*12+64` 改成了 `num_ctx // 3`
+
+    原来它断言 `cap <= per_item * 12 + 64`（= 640）。那条断言**把缺陷固化了**：
+    "每条平均 48 token"这个一刀切的上限正是长条目被截断的原因
+    （单条 400 字符只给 112 token，而译文实测要 ~300，见
+    `ollama_provider._num_predict` 的 docstring）。
+
+    防跑飞的**真正**兜底从来是 `num_ctx // 3`：实测把它放到 2730
+    （等于基本不限）时，模型 24/24 **全部自己停**
+    （`done_reason='stop'`，0 条被截断），真实"输出 token/原文字符"
+    比值只有 **0.25**（p90 0.30）。所以 2730 这条兜底**不会误伤**正常内容，
+    同时仍然挡住"撞 num_ctx 反复生成"的跑飞。
+    """
     p = _provider()
-    per_item = p.cfg.ollama.max_output_tokens_per_item
     cap = p._num_predict(12, 1_000_000)
-    assert cap <= per_item * 12 + 64, f"保险丝失效：{cap}"
+    assert cap <= p.cfg.ollama.num_ctx // 3, f"兜底失效：{cap}"
+    assert cap >= 1, "上限必须为正"
 
 
 # ----------------------------------------------------------------------
