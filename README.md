@@ -607,7 +607,9 @@ python .scratch\_run_each_alone.py
 
 架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，
 字体机制见 [docs/FONTS.md](docs/FONTS.md)，
-排错见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
+排错见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)，
+**真实 163 个游戏的全库盘点实测**见 [docs/LIBRARY_INVENTORY.md](docs/LIBRARY_INVENTORY.md)，
+真实游戏就地写回的端到端验证见 [docs/E2E_VERIFICATION.md](docs/E2E_VERIFICATION.md)。
 
 ## 授权
 
