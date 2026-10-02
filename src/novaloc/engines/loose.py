@@ -33,6 +33,41 @@ FONT_SUFFIXES = (".ttf", ".otf", ".ttc", ".woff", ".woff2")
 
 _NOT_TEXT_RE = re.compile(r"^[\s\d\W_]+$", re.UNICODE)
 
+#: 引擎配置文件名（小写）。**这些不是游戏文案。**
+ENGINE_CONFIG_FILES = frozenset({"game.ini"})
+
+#: `Key=Value` 结构。用于识别"引擎配置"而不是"用户可见文案"。
+_CONFIG_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*\s*=")
+
+
+def _is_engine_config_line(filename: str, line: str) -> bool:
+    r"""这一行是不是**引擎配置**（而非游戏文案）。
+
+    ## 实测的问题
+
+    RPG Maker VX Ace 的 `Game.ini` 会被当成普通文本抽出来：
+
+        Start=0            SoftModeFlag=0     WindowModeFlag=1
+        SEandBGM=3         FrameSkip=0        Proxy=      ProxyPort=
+
+    这些是**运行参数**，翻成中文毫无意义，而且会污染翻译记忆
+    （记忆库按相似度匹配，一堆 `XxxFlag=N` 会拉低命中质量），
+    真正做写回时还可能把配置写坏。
+
+    ## 为什么用"文件名 + Key=Value"两个条件
+
+    只看文件名太粗暴 —— 万一某个 `.ini` 里真有要给玩家看的文案，
+    一刀切会漏掉。加上 `Key=Value` 结构判断后，规则变成
+    **"引擎配置文件里的键值对行"**，范围明确、可证伪：
+
+    * `Game.ini` + `Start=0`            ⇒ 跳过（配置）
+    * `Game.ini` + `是否继续游戏？`      ⇒ **保留**（不是 KV 结构）
+    * `messages.ini` + `greet=你好`     ⇒ 保留（不是引擎配置文件）
+    """
+    if filename.lower() not in ENGINE_CONFIG_FILES:
+        return False
+    return bool(_CONFIG_LINE_RE.match(line))
+
 #: 超过这个数量的图片就不再整目录扫了（避免把素材库当成游戏）
 MAX_IMAGES = 20000
 
@@ -134,6 +169,10 @@ class LooseFilesAdapter(EngineAdapter):
                     for lineno, line in enumerate(text.splitlines(), 1):
                         s = line.strip()
                         if len(s) < 3 or _NOT_TEXT_RE.match(s):
+                            continue
+                        if _is_engine_config_line(f.name, s):
+                            # 引擎配置（`Game.ini` 里的 `WindowModeFlag=1`、
+                            # `ProxyPort=` 之类）不是游戏文案。
                             continue
                         units.append(
                             TextUnit(
