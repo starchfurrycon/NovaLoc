@@ -710,7 +710,90 @@ class Pipeline:
 
         if on_progress is not None:
             on_progress(out, True)
+        self._report_provider_stats(provider)
         return out
+
+    def _report_provider_stats(self, provider: object) -> None:
+        r"""把翻译提供者的统计汇总打印一次。
+
+        ## 为什么必须打印
+
+        `OllamaProvider.stats` 里的数字**一直在记**，但**从来没有被输出过**。
+        实测代价：一次端到端跑（`Dungeon And Darkness-Steam`）里，
+        `批 12 条里只回 2 条` 出现 **8 次**、`Ollama 返回 500: prediction
+        aborted, token repeat limit reached` 出现若干次 —— 也就是**每批
+        都要多花 11 次单条请求**，而收尾报告**一个字都没提**。
+
+        这正是"慢到看起来像卡死、流水线却一切正常"的成因：
+        所有异常都只走了 `log.warning`，淹在几百行日志里。
+
+        现在把非零计数汇总成一行 warnings 摘要 + 一行 informational 统计，
+        让"藏起来的慢"变成一眼可见的数字。
+
+        ## 只报**非零**项
+
+        全零项打出来只是噪音（"single_fallbacks: 0" 没有信息量）。
+        但 `batches` / `items` 作为分母要留着，否则看不懂比例。
+        """
+        snap_fn = getattr(provider, "stats_snapshot", None)
+        if not callable(snap_fn):
+            return
+        try:
+            st = snap_fn()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("取翻译统计失败：%s", exc)
+            return
+        if not isinstance(st, dict) or not st:
+            return
+
+        items = int(st.get("items", 0) or 0)
+        batches = int(st.get("batches", 0) or 0)
+        # 这些是"降级/异常"类计数：非零就说明质量或速度受了影响
+        warn_keys = (
+            "retries",
+            "single_fallbacks",
+            "batch_mostly_missing",
+            "placeholder_fatal",
+            "cross_item_leak",
+            "empty_retry",
+            "empty_recovered",
+            "recovered_json",
+            "placeholder_repaired",
+            "empty_recovered",
+            "surrogate_sanitized",
+            "marker_retry_recovered",
+            "perline_recovered",
+        )
+        nonzero = {
+            k: int(st[k])
+            for k in dict.fromkeys(warn_keys)
+            if int(st.get(k, 0) or 0) > 0
+        }
+        others = {
+            k: int(v)
+            for k, v in st.items()
+            if k not in warn_keys and k not in ("items", "batches") and int(v or 0) > 0
+        }
+        nonzero.update(others)
+        log.info(
+            "翻译统计：%d 条 / %d 批（平均每批 %.1f 条）",
+            items,
+            batches,
+            items / max(1, batches),
+        )
+        if nonzero:
+            # 逐条降级是**最贵**的一项：每触发一次就多 N 次单条请求。
+            # 把"额外请求数"直接算出来，比让人自己乘更直白。
+            extra = int(st.get("single_fallbacks", 0) or 0)
+            log.warning(
+                "翻译过程中出现降级/修复：%s（逐条降级 %d 次 ⇒ 至少多出 %d 次请求；"
+                "若这个数字很大，优先查批大小与提示词格式）",
+                "、".join(f"{k}={v}" for k, v in sorted(nonzero.items())),
+                extra,
+                extra,
+            )
+        else:
+            log.info("翻译过程中没有出现降级/修复（无重试、无逐条降级、无占位符致命）")
 
     # ------------------------------------------------------------------
 

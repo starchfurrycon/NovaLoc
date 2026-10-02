@@ -181,6 +181,27 @@ class OllamaTranslationProvider:
 
     # ------------------------------------------------------------------
 
+    def stats_snapshot(self) -> dict[str, int]:
+        """给调用方一份统计的**只读快照**。
+
+        为什么需要这个公开入口（而不是让调用方直接读 `self.stats`）：
+
+        `self.stats` 里的数字**本来就在记**，但**从来没被汇总输出过** ——
+        实测代价是：那两种"慢到看起来像卡死、流水线却一切正常"的降级路径
+        （整批只回 2/12、逐条降级）在整轮端到端跑里各出现 11 次，
+        却**没有任何一处**把它们报出来。查问题时只能靠翻日志里散落的
+        `log.warning` 行去数。
+
+        实测数据（`Dungeon And Darkness-Steam` 一次端到端）：
+        日志 331 行里，`批 12 条里只回 2 条` 出现 8 次、
+        `Ollama 返回 500: prediction aborted` 出现若干次，
+        而收尾报告里**一个字都没提**。
+
+        所以把快照做成公开方法，让流水线在 `translate` 阶段结束时
+        汇总打印一次 —— 让"藏在计数里的慢"变成一眼能看到的数字。
+        """
+        return dict(self.stats)
+
     def available(self) -> tuple[bool, str]:
         if self._ready is not None:
             return self._ready
