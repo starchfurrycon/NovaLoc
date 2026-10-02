@@ -402,3 +402,97 @@ def test_adapter_apply_works_without_instance_state(tmp_path) -> None:
     assert res.ok, res.error
     nb = (out / "MyGame_Data" / "resources.assets").read_bytes()
     assert "英明的国王统治人间。".encode() in nb, "新实例也必须能回写"
+
+
+# ---------------------------------------------------------------------------
+# ★ 流水线层：换适配器实例后仍然必须回写
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_apply_patches_assets_after_fresh_adapter(tmp_path, monkeypatch) -> None:
+    """★ 端到端回归：`extract` 与 `apply` 用**不同适配器实例**时仍要写出中文。
+
+    这是上面那条适配器测试的**上游**版本，也是我更在意的形态 ——
+    因为它走的是真实流水线（`stage_extract` → 手工塞译文 → `stage_apply`），
+    而不是直接调适配器。实测那个 bug 就是在这里暴露的：
+    `stage_apply` 报告的 `units=3 translations=3` 而回写 0 条，
+    最后报 `[回写产物] 没有任何文件被写入`。
+
+    **不调用翻译模型**：译文直接写进 `translations/entries.jsonl`，
+    所以这条测试是确定性的、不需要 Ollama。
+    """
+
+    from novaloc.core.config import Config
+    from novaloc.core.events import EventBus
+    from novaloc.core.registry import Context
+    from novaloc.core.workspace import Workspace
+    from novaloc.models import TranslationEntry
+    from novaloc.pipeline.stages import Pipeline
+
+    # 每个测试用独立数据根（`Workspace.create` 写在数据根下）
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    monkeypatch.setenv("NOVALOC_DATA_ROOT", str(data_root))
+
+    game = tmp_path / "MyGame"
+    d = game / "MyGame_Data"
+    (d / "Managed").mkdir(parents=True)
+    (game / "UnityPlayer.dll").write_bytes(b"MZ" + b"\x00" * 32)
+    (d / "Managed" / "Assembly-CSharp.dll").write_bytes(b"MZ" + b"\x00" * 32)
+    (d / "globalgamemanagers").write_bytes(b"\x00" * 32 + b"2021.3.16f1" + b"\x00" * 16)
+    assets = d / "resources.assets"
+    assets.write_bytes(
+        b"\xAB" * 16
+        + _mk_string("The wise king ruled the human world for many years.")
+        + b"\xCD" * 16
+    )
+    before = assets.read_bytes()
+
+    ws = Workspace.create("MyGame", game, target_lang="zh-Hans")
+    ws.save()
+    ctx = Context(config=Config(), events=EventBus(), workspace=ws, logger=None)
+    pipe = Pipeline(ws, ctx)
+
+    r = pipe.stage_extract()
+    assert r.ok, r.error
+    units = ws.load_units()
+    assert units, "前提下：抽取必须能读到 .assets 里的字符串"
+
+    # 手工塞译文（**不调模型**，保持测试确定性）
+    entries = [
+        TranslationEntry(
+            uid=u.uid, source=u.source, target="英明的国王统治了人间很多年。",
+            status="translated", engine="unity",
+        )
+        for u in units
+        if isinstance(u.location.byte_offset, int) and u.max_bytes
+    ]
+    assert entries, "前提：units 必须带 byte_offset 与 max_bytes"
+    ws.save_entries(entries)
+
+    r2 = pipe.stage_apply()
+    assert r2.ok, f"apply 失败：{r2.error}"
+
+    # ★ 注意写在哪：`stage_apply` **只写** `workspaces/<id>/out`，
+    #   原游戏目录这时**一个字节都不该变** —— 覆盖原游戏是 `auto`
+    #   写回阶段（备份之后）才做的事。这条纪律正是"游戏不会被工具
+    #   悄悄改坏"的保证，所以两个地方都要断言。
+    assert assets.read_bytes() == before, "原游戏目录必须原样（只读契约）"
+
+    patched = ws.out_dir / "MyGame_Data" / "resources.assets"
+    assert patched.is_file(), "out/ 里必须产出改过的资源"
+    after = patched.read_bytes()
+
+    assert len(after) == len(before), "文件大小必须不变"
+    assert after[:16] == b"\xAB" * 16, "前哨兵必须原样"
+    assert after[-16:] == b"\xCD" * 16, "后哨兵必须原样"
+    assert "英明的国王统治了人间很多年。".encode() in after, "中文必须写进资源"
+    assert b"The wise king" not in after, "原文应已被替换"
+
+    # 区间外零改动：只有那条字符串的槽位允许变
+    off = units[0].location.byte_offset
+    cap = units[0].max_bytes
+    assert isinstance(off, int) and isinstance(cap, int)
+    allowed = set(range(off, off + 4 + cap))
+    stray = [i for i in range(len(before)) if before[i] != after[i] and i not in allowed]
+    assert not stray, f"槽位外被改动了：{stray[:8]}"
