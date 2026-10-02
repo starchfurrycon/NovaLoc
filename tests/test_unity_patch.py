@@ -14,7 +14,14 @@ from __future__ import annotations
 
 import struct
 
+import pytest
+
 from novaloc.engines.unity_patch import (
+    MAX_LEN,
+    MIN_LEN,
+    _candidate_offsets,
+    _extract_slots_legacy,
+    _extract_slots_reference,
     align4,
     extract_slots,
     patch_translations,
@@ -496,3 +503,192 @@ def test_pipeline_apply_patches_assets_after_fresh_adapter(tmp_path, monkeypatch
     allowed = set(range(off, off + 4 + cap))
     stray = [i for i in range(len(before)) if before[i] != after[i] and i not in allowed]
     assert not stray, f"槽位外被改动了：{stray[:8]}"
+
+
+# ---------------------------------------------------------------------------
+# ★ 性能优化必须**结果不变**
+# ---------------------------------------------------------------------------
+#
+# `extract_slots` 原本对每个字节都调 `slot_at`，实测：
+#
+#   * `Robolife2_Data/resources.assets` 前 20 MB → 19,057,391 次调用，
+#     其中长度前缀合法的只占 **2.58%**，扫描速度 **2.33 MB/s**；
+#   * 按这个速度，`HolyKnightRicca`（9,410 MB 可扫文件）要 **1–2 小时**，
+#     实测整轮盘点就卡在这种游戏上（240s 超时）。
+#
+# 优化成"先挑候选偏移（numpy 向量化），再逐个走原判据"后 **16.7 MB/s**。
+#
+# ⚠️ 性能优化最怕"快了但结果变了"，尤其是这种**回写游戏文件**的功能 ——
+# 少认或多认一个槽位都会影响写回。所以这里对着**逐字节的参考实现**
+# 逐项比对，包括偏移、容量、文本三项。
+
+
+def _synthetic_assets(seed: int = 0, size: int = 20000) -> bytes:
+    """造一段"像 .assets"的字节：夹杂真字符串、随机字节、伪长度前缀。
+
+    必须包含会让优化实现出错的几种情况：
+    * 合法字符串，且**后面紧跟着**另一个字符串（测推进语义）；
+    * 长度前缀合法但内容**不是** UTF-8（decode 会失败）；
+    * 长度前缀合法但内容含 NUL（必须被拒）；
+    * 长度前缀**超出文件尾部**（越界边界）；
+    * 随机字节，制造大量"前缀合法但内容不是文本"的假候选。
+    """
+    import random
+
+    rnd = random.Random(seed)
+    buf = bytearray()
+    words = [
+        "Hello world",
+        "A wise king ruled the land for many years.",
+        "Attack +5",
+        "こんにちは世界",
+        "x",
+        "",  # 空串（长度 0，应被 MIN_LEN 拒掉）
+        "a" * 40,
+        "Mixed 中文 and English",
+    ]
+    i = 0
+    while len(buf) < size:
+        i += 1
+        pick = rnd.random()
+        if pick < 0.25:
+            buf += _mk_string(words[i % len(words)])
+        elif pick < 0.35:
+            # 合法长度前缀但内容不是 UTF-8
+            payload = bytes(rnd.randrange(0x80, 0x100) for _ in range(6))
+            buf += struct.pack("<I", len(payload)) + payload
+        elif pick < 0.45:
+            # 合法长度前缀但内容含 NUL
+            buf += struct.pack("<I", 6) + b"ab\x00cde"
+        elif pick < 0.5:
+            # 长度前缀指向文件外（越界）—— 放在最后
+            buf += struct.pack("<I", MAX_LEN)
+        else:
+            buf += bytes(rnd.randrange(256) for _ in range(rnd.randrange(1, 12)))
+    return bytes(buf[:size])
+
+
+def _slot_tuples(slots: list) -> list[tuple[int, int, str]]:
+    return [(s.offset, s.capacity, s.text) for s in slots]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_optimized_extract_matches_reference(seed: int) -> None:
+    r"""★ 候选筛选实现必须与"逐字节"参考实现**逐项一致**。
+
+    比对三项：偏移、容量、文本。任何一项不同都说明优化改变了行为，
+    而行为一变就会影响**回写游戏文件**（少认=漏翻，多认=可能改坏别的字节）。
+    """
+    data = _synthetic_assets(seed)
+    new = extract_slots(data, filename="f")
+    ref = _extract_slots_reference(data, filename="f")
+    assert _slot_tuples(new) == _slot_tuples(ref), (
+        f"seed={seed}: 优化实现与参考实现结果不一致\n"
+        f"  新 {len(new)} 项，参考 {len(ref)} 项\n"
+        f"  新独有 {list(set(_slot_tuples(new)) - set(_slot_tuples(ref)))[:3]}\n"
+        f"  参独有 {list(set(_slot_tuples(ref)) - set(_slot_tuples(new)))[:3]}"
+    )
+
+
+def test_candidate_offsets_only_returns_plausible_prefixes() -> None:
+    r"""候选偏移必须**只**包含长度前缀落在 `[MIN_LEN, MAX_LEN]` 的位置。
+
+    这是优化的**正确性前提**：`slot_at` 对不合法前缀必然返回 None，
+    所以只挑合法前缀不改变结果。若这条断言坏了，等价性就没有依据。
+    """
+    data = _synthetic_assets(3)
+    cands = _candidate_offsets(data)
+    assert cands == sorted(cands), "候选必须升序（推进逻辑依赖顺序）"
+    assert len(cands) < len(data), "不该把所有偏移都当候选"
+    for i in cands[:400]:
+        (ln,) = struct.unpack_from("<I", data, i)
+        assert MIN_LEN <= ln <= MAX_LEN, f"偏移 {i} 的前缀 {ln} 不在范围内"
+    # 反过来：真槽位的位置必须都在候选里（否则会漏）
+    for s in extract_slots(data, filename="f"):
+        assert s.offset in set(cands), (
+            f"真槽位偏移 {s.offset} 不在候选集合里 —— 优化会漏掉它"
+        )
+
+
+def test_extract_handles_empty_and_tiny_input() -> None:
+    """空/极小输入不能崩（`_candidate_offsets` 有若干边界分支）。"""
+    for data in (b"", b"\x01", b"\x04", b"\x04\x00\x00\x00", b"\xff" * 8):
+        assert extract_slots(data, filename="f") == []
+        assert _extract_slots_reference(data, filename="f") == []
+
+
+def test_back_to_back_strings_are_both_found() -> None:
+    r"""紧挨着的两个字符串必须都找到（测"推进语义"没被优化改坏）。
+
+    原实现找到槽位后把游标推到 `region_end`。优化实现只挑候选位置，
+    若推进逻辑写错，第二个紧邻的字符串就会被跳过。
+    """
+    data = _mk_string("First line") + _mk_string("Second line")
+    got = [s.text for s in extract_slots(data, filename="f")]
+    assert "First line" in got and "Second line" in got, f"漏了紧邻字符串：{got}"
+
+
+# ---------------------------------------------------------------------------
+# ★★ 旧生产实现**漏文本**（在写等价性用例时才发现）
+# ---------------------------------------------------------------------------
+#
+# 旧实现把"推进到 `region_end`"写在了 `if keep:` **之外**：
+#
+#     slot = slot_at(data, i)
+#     if slot is not None:
+#         keep, ... = _looks_like_game_text(slot.text)
+#         if keep:
+#             out.append(slot)
+#         i = max(slot.region_end, i + 4)     # ← keep 为假时也执行
+#         continue
+#
+# 于是"内容不像游戏文案"的候选被拒之后，游标仍然跳过整段 ——
+# 而真正要翻译的字符串可能就起始在这段区间**内部**。
+#
+# 实测 `_synthetic_assets(2)`：偏移 10807 有一个完全合法的字符串
+# `'A wise king ruled the land for many years.'`（`keep=True conf=0.85`），
+# 却因为偏移 10797 的 'ȳȪΓ' 被判 reject 并跳过整段而**永远检查不到**。
+#
+# 这是**原本就在丢文案**，不是性能优化引入的差异。
+
+
+def test_new_impl_is_strict_superset_of_legacy() -> None:
+    r"""★ 新实现必须**只多不少**于旧实现 —— "漏文本"不能再回来。
+
+    这条是那个缺陷的哨兵。若有人把"被拒也跳过整段"写回去，
+    这里会立刻红。
+    """
+    for seed in range(6):
+        data = _synthetic_assets(seed)
+        new = set(_slot_tuples(extract_slots(data, filename="f")))
+        old = set(_slot_tuples(_extract_slots_legacy(data, filename="f")))
+        missing = old - new
+        assert not missing, (
+            f"seed={seed}: 新实现比旧实现**少**了 {len(missing)} 项（漏文本回归）\n"
+            f"  {sorted(missing)[:3]}"
+        )
+
+
+def test_legacy_impl_really_drops_a_real_string() -> None:
+    r"""★ 把那个缺陷**钉成可复现的证据**（而不是只写在注释里）。
+
+    若哪天旧实现被"修好"了（或测试数据变了以至于暴露不出问题），
+    这条会失败并提醒复核：说明"严格超集"那条断言已经失去意义。
+    """
+    data = _synthetic_assets(2)
+    new = set(_slot_tuples(extract_slots(data, filename="f")))
+    old = set(_slot_tuples(_extract_slots_legacy(data, filename="f")))
+    gained = new - old
+    assert gained, (
+        "这份数据没能暴露旧实现的漏文本缺陷 —— 测试数据需要加强，"
+        "否则 `test_new_impl_is_strict_superset_of_legacy` 变成一句空话"
+    )
+    # 被漏掉的那一项必须真的是游戏文案（含多词/字母），
+    # 不能是"多认了一堆垃圾"
+    texts = [t for _o, _c, t in gained]
+    assert any(" " in t and any(ch.isalpha() for ch in t) for t in texts), (
+        f"新实现多认出来的不是正常文案：{texts[:4]}"
+    )
+    # 而且必须是**参考实现**（逐字节、已修缺陷）也认的
+    ref = set(_slot_tuples(_extract_slots_reference(data, filename="f")))
+    assert gained <= ref, "多认出来的项连参考实现都不认 —— 说明是误报"

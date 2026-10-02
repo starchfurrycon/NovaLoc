@@ -197,11 +197,136 @@ class PatchReport:
         return "；".join(parts)
 
 
+def _candidate_offsets(data: bytes) -> list[int]:
+    """所有"长度前缀可能合法"的偏移，**升序**。
+
+    ## 为什么需要它（实测的性能缺陷）
+
+    :func:`extract_slots` 原本对**每一个字节**都调 :func:`slot_at`。
+    实测（`Robolife2_Data/resources.assets` 前 20 MB）：
+
+    | 指标 | 实测值 |
+    | --- | --- |
+    | `slot_at` 调用次数 | **19,057,391**（0.91 次/字节） |
+    | 其中长度前缀合法的 | 541,038（**2.58%**） |
+    | `slot_at` 自身耗时 | **8.8 s**（cProfile tottime 第一位） |
+    | 扫描速度 | 2.33 MB/s |
+
+    也就是说 **97% 的调用是在做"读 4 字节 → 发现不在 `[4, 4096]` → 返回 None"**。
+    按这个速度，`HolyKnightRicca`（9,410 MB 可扫文件）需要 **1–2 小时**，
+    实测整轮盘点就卡在这种游戏上（240 s 超时）。
+
+    ## 为什么"只挑合法前缀"不改变结果
+
+    :func:`slot_at` 的第一件事就是判长度前缀；前缀不合法**必然返回 None**，
+    所以那些位置本来就产生不了槽位，跳过它们不影响输出。
+
+    唯一要小心的是 :func:`extract_slots` 的**推进语义**：找到一个槽位后
+    会把游标推到 `slot.region_end`（跳过整段）。原来的实现是
+    "逐字节 + 推进"，这里改成"只看候选 + 同样的推进" ——
+    因为推进只依赖**已接受的**槽位，而**接受与否**在两种实现里是同一套
+    判断（同一个 :func:`slot_at` + 同一个 :func:`_looks_like_game_text`），
+    所以结果逐字节一致（有专门用例对着原实现比对）。
+    """
+    n = len(data)
+    if n < MIN_LEN + 4:
+        return []
+    # 逐字节读 4 字节小端长度是 1900 万次 Python 调用，纯 Python 做不了。
+    # numpy 的 `unpackbits` 把"每个偏移的 32 位是否在范围内"变成
+    # 32 次向量化比较，整段只用一次内存视图转换。
+    try:
+        import numpy as np
+
+        buf = np.frombuffer(data, dtype=np.uint8)
+        if buf.size < MIN_LEN + 4:
+            return []
+        # ★ 用**跨步视图**把 4 个字节平面叠起来，而不是 `unpackbits`。
+        #
+        # `unpackbits` 会为 20 MB 输入生成 **160 MB** 的位数组中间量，
+        # 内存带宽把收益吃掉了（实测只快 1.3x）。
+        # `as_strided` 是只读视图、**不复制数据**，再按列加权求和即得
+        # 每个偏移处的 32 位小端值。
+        win = buf.size - 3
+        planes = np.lib.stride_tricks.as_strided(
+            buf, shape=(win, 4), strides=(1, 1), writeable=False
+        )
+        val = planes.astype(np.uint32) @ np.array(
+            [1, 256, 65536, 16777216], dtype=np.uint32
+        )
+        idx = np.nonzero((val >= MIN_LEN) & (val <= MAX_LEN))[0]
+        # 上界：前缀 + 最短内容都还必须落在文件内
+        idx = idx[idx <= (buf.size - 4 - MIN_LEN)]
+        return [int(x) for x in idx.tolist()]
+    except ImportError:  # pragma: no cover - numpy 是硬依赖，兜底而已
+        pass
+    # 兜底：纯 Python 逐字节读前缀（慢但正确）
+    out: list[int] = []
+    limit = n - 4 - MIN_LEN
+    for i in range(0, min(limit, n - 4) + 1):
+        (ln,) = struct.unpack_from("<I", data, i)
+        if MIN_LEN <= ln <= MAX_LEN:
+            out.append(i)
+    return out
+
+
 def extract_slots(data: bytes, *, filename: str = "") -> list[StringSlot]:
     """扫出一个文件里所有**可原地替换**的文案区间。
 
     判据复用 :func:`unity_strings._looks_like_game_text`（保守优先）——
     否则 `Main Texture`、`Hidden/Universal…` 这类资源名会淹没结果。
+
+    ## 实现要点：只扫候选位置
+
+    逐字节试是 O(大小) 的 Python 循环，实测 **2.33 MB/s**，
+    在 100 MB 级的 `.assets` 上要几十秒、十几 GB 的游戏上要一两小时。
+    这里先用 :func:`_candidate_offsets` 一次性挑出**长度前缀可能合法**的
+    偏移（实测只占 2.58%），再逐个走原判据 —— **结果完全一致**。
+    """
+    out: list[StringSlot] = []
+    for i in _candidate_offsets(data):
+        slot = slot_at(data, i)
+        if slot is None:
+            continue
+        keep, _conf, _why = _looks_like_game_text(slot.text)
+        if not keep:
+            continue
+        slot.file = filename
+        out.append(slot)
+    return out
+
+
+def _extract_slots_legacy(data: bytes, *, filename: str = "") -> list[StringSlot]:
+    """**旧的生产实现**（保留下来做对照，别再拿它当生产路径）。
+
+    ## 它有一个真的**漏文本**缺陷
+
+    旧实现是"逐字节 + 推进"，但推进写在了 `if keep:` **之外**：
+
+        slot = slot_at(data, i)
+        if slot is not None:
+            keep, ... = _looks_like_game_text(slot.text)
+            if keep:
+                out.append(slot)
+            i = max(slot.region_end, i + 4)     # ← keep 为假时也执行
+            continue
+
+    于是**内容不像游戏文案**的候选（例如 'ȳȪΓ'、'aaaa…' 这类纯符号/重复串）
+    被拒之后，游标仍然被推到 `region_end`，**把整段都跳过去了** ——
+    而真正要翻译的字符串可能就起始在这段区间**内部**。
+
+    实测（`tests/test_unity_patch.py` 的 `_synthetic_assets(2)`）：
+    偏移 10807 处有一个完全合法的字符串
+    `'A wise king ruled the land for many years.'`（前缀 42、容量 44、
+    判据 `keep=True conf=0.85 '多词文本'`），
+    但偏移 10797 的候选 'ȳȪΓ' 被判 `reject(text)`
+    并把游标推到 10855 —— **10807 从此再也不会被检查**。
+
+    这不是"性能优化引入的差异"，而是**原本就在丢文案**。
+    按真实文件的候选密度（合法前缀约占 2.58%）估计，被吞掉的概率不低。
+
+    保留它的唯一用途：让测试断言
+    **新实现的结果是旧实现的严格超集**（只多不少）——
+    "漏文本"绝不能再回来。
     """
     out: list[StringSlot] = []
     i = 0
@@ -213,8 +338,38 @@ def extract_slots(data: bytes, *, filename: str = "") -> list[StringSlot]:
             if keep:
                 slot.file = filename
                 out.append(slot)
+            # ⚠️ 这一行就是那个缺陷：`keep` 为假时**也**跳过整段
             i = max(slot.region_end, i + 4)
             continue
+        i += 1
+    return out
+
+
+def _extract_slots_reference(data: bytes, *, filename: str = "") -> list[StringSlot]:
+    """**参考实现**：逐字节扫，但**修掉**了上面那个漏文本缺陷。
+
+    生产路径走 :func:`extract_slots`；这个函数用于
+    `tests/test_unity_patch.py` 里"两种实现结果逐项一致"的断言 ——
+    优化性能时最怕"快了但结果变了"，所以留一个慢而明确的口径。
+
+    与 :func:`_extract_slots_legacy` 的唯一区别：候选被
+    `_looks_like_game_text` 拒掉时**只前进 1 字节**，
+    这样区间内部可能存在的真字符串不会被跳过。
+    """
+    out: list[StringSlot] = []
+    i = 0
+    n = len(data)
+    while i + 4 <= n:
+        slot = slot_at(data, i)
+        if slot is not None:
+            keep, _conf, _why = _looks_like_game_text(slot.text)
+            if keep:
+                slot.file = filename
+                out.append(slot)
+                # 只在**接受**时才跳过整段
+                i = max(slot.region_end, i + 4)
+                continue
+            # 被拒 ⇒ 只前进 1 字节（旧实现在这里是跳过整段，会漏文案）
         i += 1
     return out
 
