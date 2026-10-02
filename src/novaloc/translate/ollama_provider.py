@@ -74,6 +74,43 @@ _SHORT_KINDS = {
 _MERGE_STRIP = re.compile(r"[^0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff]+")
 
 
+def _source_line_count(slots: list[str] | None) -> int:
+    r"""源文有多少行 —— 从**换行占位符**数出来。
+
+    ## 为什么需要它（#37 实测）
+
+    `mask_newlines=True` 会把换行换成占位符，于是**多行源文在提示词里
+    是一行**：
+
+        源文 89 字符 / 3 行
+        掩码后: 'Mashiro:⟦0⟧"Mnnn! ♡ …⟦1⟧I-It sounds so lewd…"'
+        slots 个数: 2　（两个都是 '\n'）
+
+    但模型**仍按语义行回多段**。此时 `_best_segment` 只留一段，
+    **其余行被丢掉**（实测比值稳定在 0.04~0.29，结构性）。
+
+    ## 判据是结构性的，不用阈值
+
+    * 源文行数 = 换行占位符个数 + 1；
+    * 若模型给的**段数正好等于源文行数** ⇒ 这是**逐行对应**，
+      按行序拼回**不会复读**（每段对应**不同的**源行）。
+
+    这条判据不依赖任何阈值，所以不会重演 `_best_segment` docstring 里
+    那次失败（"覆盖率区间重叠，任何阈值都误杀一边"）。
+
+    只数**确实是换行**的占位符：`\\C[6]`、`\\N[2]` 这类引擎转义
+    被屏蔽后也进 `slots`，但它们**不是**行边界，数进来会把行数算多、
+    进而误判"逐行对应"。
+    """
+    if not slots:
+        return 1
+    n = 1
+    for s in slots:
+        if s and s.replace("\r\n", "\n").replace("\r", "\n") == "\n":
+            n += 1
+    return n
+
+
 def _best_segment(segs: list[str], slots: list[str] | None = None) -> str | None:
     r"""从模型返回的多个片段里挑**一个最好**的，而不是把它们拼起来。
 
@@ -677,7 +714,49 @@ class OllamaTranslationProvider:
                 raise ProviderError(
                     f"单条翻译返回了非字符串片段：{ {k: type(mapping[k]).__name__ for k in keys} }"
                 )
-            picked = _best_segment([mapping[k] for k in keys], slots)
+            # ---- ★ 段数 == 源文行数 ⇒ 按行序拼回，而不是只选一段 ----
+            #
+            # ## 实测（#36 / #37）
+            #
+            # `mask_newlines=True` 把多行源文**压成一行**（换行 → 占位符），
+            # 但模型**仍按语义行回多段**。此时只选一段会**丢掉其余行**，
+            # 且是**结构性**的（同一源文重复 4 次，比值极差中位只有 0.02）：
+            #
+            #     源文 89 字符 / 3 行
+            #     整条 ⇒ '玛希罗：'        ← 只剩角色名，比值 0.04
+            #     拆行 ⇒ 3/3 行全有，比值 0.51
+            #
+            # `status` 还是 `translated`、**没有任何 warning** ——
+            # "非空"不等于"完整"，这是最难发现的一类损失。
+            #
+            # ## 为什么这里可以拼（而 `_best_segment` 说拼接是错的）
+            #
+            # `_best_segment` 反对拼接，针对的是**段数 ≠ 行数**的三种形态
+            # （同一内容的替代译文 / 段 0 不完整 / 各段完全相同）——
+            # 那些情况拼接确实会复读。
+            #
+            # 而**段数正好等于源文行数**时，各段对应**不同的**源行，
+            # 拼回**不可能**复读。判据是**结构性**的（数占位符），
+            # 不依赖任何阈值 —— 所以不会重演 docstring 里那次
+            # "覆盖率区间重叠、任何阈值都误杀一边"的失败。
+            #
+            # 段数 ≠ 行数时**保持原行为**，宁可少救也不要赌。
+            segs = [mapping[k] for k in keys]
+            n_src_lines = _source_line_count(slots)
+            if (
+                len(segs) > 1
+                and n_src_lines > 1
+                and len(segs) == n_src_lines
+                and all(s.strip() for s in segs)
+            ):
+                joined = "\n".join(s.strip() for s in segs)
+                log.debug(
+                    "单条请求：段数(%d) == 源文行数(%d)，按行序拼回（避免只留一段）",
+                    len(segs),
+                    n_src_lines,
+                )
+                return joined
+            picked = _best_segment(segs, slots)
             if picked is not None:
                 log.debug(
                     "单条请求收到批格式 %d 段响应，按占位符完整度选段：%r",
