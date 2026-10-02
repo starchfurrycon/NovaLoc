@@ -38,10 +38,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from conftest import requires_ollama  # noqa: E402
+
 from novaloc.core.config import Config  # noqa: E402
 from novaloc.core.events import EventBus  # noqa: E402
 from novaloc.core.registry import Context  # noqa: E402
 from novaloc.translate.ollama_provider import OllamaTranslationProvider  # noqa: E402
+
+# 本文件用真的 `OllamaTranslationProvider`（构造与探活都走网络）。
+# 没有可用的 Ollama 就整体跳过 —— 见 conftest 里 `requires_ollama` 的说明。
+pytestmark = requires_ollama
+
 
 
 def _provider() -> OllamaTranslationProvider:

@@ -44,7 +44,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from conftest import requires_ollama  # noqa: E402
+
 from novaloc.translate import prompts  # noqa: E402
+
+# 本文件用真的 `OllamaTranslationProvider`（构造与探活都走网络）。
+# 没有可用的 Ollama 就整体跳过 —— 见 conftest 里 `requires_ollama` 的说明。
+pytestmark = requires_ollama
+
 
 
 def _batch_prompt(n: int = 4) -> str:
