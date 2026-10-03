@@ -614,7 +614,33 @@ class OllamaTranslationProvider:
         # 传 masked 作为 sources：模型有时不按"对象数组"回，而是回
         # "原文作键的对象"（实测 translategemma:4b 就是这样），
         # 解析层靠这个反查编号。
-        mapping, res = parse_translations(raw, expect_indices=expect, sources=list(masked))
+        #
+        # ★★ 同时接受**未掩码原文**形态：`mask_newlines=True` 时换行在
+        #    `masked` 里是 ``⟦0⟧``，而模型经常回吐字面 ``\n`` 形态
+        #    （单条路径实测连续 3 次全败，见 `_call_single` 的注释）。
+        #
+        # ⚠️ **不能**把两种形态塞进同一个 `sources`：`_build_source_index`
+        #    按**位置**分配编号，于是"原文形态"会落在编号 len(masked) 上
+        #    ⇒ 反查"原文作键"得到的是那个越界编号，而不是它真正对应的
+        #    0..n-1。实测踩到：单条传 `[掩码, 原文]` 得到 `{1: ...}`
+        #    而不是 `{0: ...}` ⇒ 取不到译文。
+        #
+        #    所以做**两次独立解析**：先用模型实际看到的掩码形态，
+        #    取不到再用原文形态。两次的 `sources` 都与 `expect` 严格平行。
+        mapping, res = parse_translations(
+            raw, expect_indices=expect, sources=list(masked)
+        )
+        if not mapping:
+            raw_sources = [it.unit.source or "" for it in batch_items]
+            if any(
+                s and s != m
+                for s, m in zip(raw_sources, masked, strict=False)
+            ):
+                mapping2, res2 = parse_translations(
+                    raw, expect_indices=expect, sources=raw_sources
+                )
+                if mapping2:
+                    mapping, res = mapping2, res2
         if not res.ok:
             raise ProviderError(
                 f"JSON 解析失败（{'; '.join(res.notes)[:160]}）：{raw[:180]!r}"
@@ -737,9 +763,42 @@ class OllamaTranslationProvider:
         #
         # ⚠️ 单条请求的 `sources` 就是 **`masked`**（屏蔽换行后的原文）——
         # 模型看到的就是它，所以它回吐的键也应该是它。
+        #
+        # ★★ 但实测**还要再试一次**（2026-10 第二次修这里）：
+        #    `mask_newlines=True` 时 `masked` 里换行是记号 ``⟦0⟧``，
+        #    而模型经常回吐**原文形态**（字面 ``\n``）而不是记号形态。
+        #    真实日志（``auto5.err``，单条路径连续 3 次全败）：
+        #
+        #        第 1 次：{"t": {"火山を主な生息地とする竜種。\n首の長さで…": "火山是主要栖息地…"}}
+        #        第 3 次：{"t": {"火山是主要栖息地…": ""}}
+        #
+        #    键里是 ``\n``、而 `sources=[masked]` 里是 ``⟦0⟧`` ⇒
+        #    `to_translation_map` 反查不到 ⇒ `mapping` 为空 ⇒ 报
+        #    "解析得到空映射"。**而译文明明就在值里。**
+        #
+        #    实测判据（`.scratch/_reject_probe.py`）：
+        #
+        #        parse_translations(原文作键, sources=[掩码形态]) → keys=None ❌
+        #        parse_translations(原文作键, sources=[原文形态]) → keys=[0]  ✅ 取出 58 字符
+        #
+        # ⚠️ **不能**把两个形态塞进同一个 `sources` 列表：那会让
+        #    "原文形态" 落在下标 1 ⇒ 反查回来是**编号 1**，
+        #    而单条只有编号 0 ⇒ 取不到。实测踩到：
+        #
+        #        sources=[掩码, 原文] → {1: '火山是主要栖息地…'}   ← 编号错了
+        #
+        #    正确做法是**两次独立解析**：先用模型实际看到的形态，
+        #    取不到再用原文形态。两次的 `sources` 都只有一个元素
+        #    ⇒ 反查结果必然是编号 0。
         mapping, res = parse_translations(
             raw, expect_indices=[0], sources=[masked]
         )
+        if not mapping and item.unit.source and item.unit.source != masked:
+            mapping2, res2 = parse_translations(
+                raw, expect_indices=[0], sources=[item.unit.source]
+            )
+            if mapping2:
+                mapping, res = mapping2, res2
         # ⚠️ 这里的处理**必须**认得出"模型按批格式回答单条请求"这一形态。
         #
         # ## 实测形态（真实游戏，ITEM_DESC）
