@@ -427,6 +427,75 @@ class Workspace:
                 continue
         return out
 
+    @classmethod
+    def find_for_game(cls, game_dir: str | Path) -> Workspace | None:
+        """找出**已经为这个游戏目录建过**的工作区（没有就返回 ``None``）。
+
+        ## 为什么必须有它（实测缺陷）
+
+        批量模式（``novaloc auto``）原来对每个游戏**无条件**
+        `Workspace.create(...)` —— 每次都生成一个新 id。实测后果：
+
+        同一个游戏目录下堆了 **4 个**工作区，
+        而每个新工作区的 `translations/entries.jsonl` 都是**空的**
+        ⇒ `stage_translate(only_pending=True)` 没有东西可跳过
+        ⇒ **整轮从第一条重新翻一遍**。
+
+        这直接毁掉了本工具的续跑能力：跑了一小时的成果，
+        一重启就全白费（旧工作区还在，但不会再被使用）。
+        对"自动汉化整个游戏库（174 个游戏）"这种长任务，
+        这是**致命**的 —— 任何中断都意味着从零开始。
+
+        ## 挑哪一个（多个同时存在时）
+
+        按"已翻译条目数"从多到少。理由：那是**真实工作量**的度量，
+        比 mtime 靠谱 —— mtime 会被"只跑了一次 detect"这种空操作刷新。
+
+        路径比较用 `resolve()` 规范化：库目录里的路径可能带
+        ``..`` 或符号链接，直接比字符串会漏匹配。
+
+        ⚠️ **已知取舍**：这样**区分大小写**（`resolve()` 不会改大小写）。
+        在 Windows 上 ``D:\\games\\A`` 与 ``D:\\Games\\a`` 会被当成两个项目
+        ⇒ 最坏情况是重复翻一遍，**不会**翻错对象。
+        这个方向的错误代价小得多，所以选择保守。
+        """
+        try:
+            want = Path(game_dir).expanduser().resolve()
+        except OSError:
+            return None
+
+        best: tuple[int, Workspace] | None = None
+        base = paths.workspaces_dir()
+        if not base.exists():
+            return None
+        for d in base.iterdir():
+            pf = d / "project.json"
+            if not pf.is_file():
+                continue
+            try:
+                proj = Project.model_validate_json(pf.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            if not proj.game_dir:
+                continue
+            try:
+                got = Path(proj.game_dir).expanduser().resolve()
+            except OSError:
+                continue
+            if got != want:
+                continue
+            n = 0
+            ent = d / "translations" / "entries.jsonl"
+            if ent.is_file():
+                try:
+                    with ent.open(encoding="utf-8", errors="replace") as fh:
+                        n = sum(1 for ln in fh if ln.strip())
+                except OSError:
+                    n = 0
+            if best is None or n > best[0]:
+                best = (n, cls(proj, d))
+        return best[1] if best else None
+
     def delete(self) -> None:
         if self.root.exists() and self.root.is_dir() and self.root.parent == paths.workspaces_dir():
             shutil.rmtree(self.root)

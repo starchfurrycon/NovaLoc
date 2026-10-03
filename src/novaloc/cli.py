@@ -2337,9 +2337,19 @@ def auto(
     def process(ent: GameEntry) -> None:
         ent.status = "running"
         try:
-            ws = Workspace.create(ent.name, ent.path)
+            # ★ 复用同一个游戏目录**已有**的工作区（如果存在）。
+            #
+            # 原来无条件 `Workspace.create` ⇒ 每次跑都新建一个空工作区
+            # ⇒ `only_pending=True` 没有东西可跳过 ⇒ **整轮重翻**。
+            # 实测后果：同一游戏堆了 4 个工作区，每个都从零开始，
+            # 跑了一小时的成果一重启就白费（详见
+            # `Workspace.find_for_game` 的 docstring）。
+            ws = Workspace.find_for_game(ent.path)
+            if ws is None:
+                ws = Workspace.create(ent.name, ent.path)
+            else:
+                ent.message = "复用已有工作区（续跑）"
             ws.project.engine = ent.engine_id if ent.engine_id != "unknown" else ""
-            ws.project.stage = "created"
             ws.save()
             ent.project_id = ws.project.id
 
