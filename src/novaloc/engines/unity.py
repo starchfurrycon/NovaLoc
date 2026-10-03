@@ -189,6 +189,76 @@ _SKIP_KEYS = {
 }
 _NOT_TEXT_RE = re.compile(r"^[\s\d\W_]+$", re.UNICODE)
 
+#: 找 ``*_Data`` / ``StreamingAssets`` 时的最大下潜层数。
+#:
+#: ## 为什么不能只看顶层（实测踩到）
+#:
+#: 库里 7 个 Unity 游戏被判成 ``unknown``（conf 0.0），而它们的
+#: ``globalgamemanagers``/``resources.assets``/``level0`` **全都在**
+#: （`.scratch/_unity_miss.py`）。原因是它们**多套了一层目录**：
+#:
+#:     Dusk City Uncensored\Dusk City_Data\resources.assets
+#:     ^^^^^^^^^^^^^^^^^^^^ ← 发布者名/包装目录，顶层看不到 *_Data
+#:
+#: 而 `detect` 用的是 `game_dir.iterdir()`（**只扫顶层**）⇒ 直接返回
+#: conf 0.0 ⇒ 引擎判成 `unknown` ⇒ **连抽取都不跑**。
+#:
+#: 这类"多套一层"在自制/搬运的游戏里很常见（解包后又套了一层文件夹），
+#: 所以必须支持。层数上限的作用是**别为了找 _Data 而把整个游戏遍历一遍**
+#: （库里有 4 GB 级的 `resources.assets`）。
+_UNITY_DATA_MAX_DEPTH = 4
+
+#: 下潜时**不进入**的目录名。这些要么不可能含 `_Data`，
+#: 要么体量巨大、遍历它们的代价远超收益。
+_UNITY_SKIP_DIRS = frozenset(
+    {
+        "_novaloc_backup", "backup", "backups", "save", "saves",
+        "node_modules", ".git", "__pycache__", "$recycle.bin",
+        "system volume information", "windows",
+    }
+)
+
+
+def _find_unity_dirs(game_dir: Path, *, max_depth: int = _UNITY_DATA_MAX_DEPTH) -> list[Path]:
+    """在 ``game_dir`` 下**限定层数**地找出 ``*_Data`` 与 ``StreamingAssets``。
+
+    ★ 返回的路径**可能不是顶层的**。调用方拿它做
+    `p.relative_to(game_dir)` 仍是正确的（`_rel` 就是这么算的），
+    所以嵌套目录的项目在**抽取与回写**上本来就能工作 ——
+    唯一的问题曾经是"找不到它们"。
+
+    ⚠️ 层数用尽时**明确报出来**，不要静默截断：
+    静默截断会让"没找到"和"没找过"看起来一样，
+    正是本项目反复吃过的那个亏。
+    """
+    found: list[Path] = []
+    truncated = False
+    stack: list[tuple[Path, int]] = [(game_dir, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        try:
+            children = [c for c in cur.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        for c in children:
+            low = c.name.lower()
+            if c.name.endswith("_Data") or c.name == "StreamingAssets":
+                found.append(c)
+                continue  # 命中后不再往下（_Data 内部不会有另一个 _Data）
+            if low in _UNITY_SKIP_DIRS or low.endswith(".app"):
+                continue
+            if depth + 1 >= max_depth:
+                truncated = True
+                continue
+            stack.append((c, depth + 1))
+    if truncated:
+        log.debug(
+            "查找 *_Data 时达到层数上限 %d：%s —— 若有更深的 Unity 工程会被漏掉",
+            max_depth,
+            game_dir,
+        )
+    return sorted(found)
+
 
 @register("engine", "unity")
 class UnityAdapter(EngineAdapter):
@@ -240,12 +310,25 @@ class UnityAdapter(EngineAdapter):
 
     def detect(self, game_dir: Path) -> EngineInfo:
         info = EngineInfo(engine_id=self.id, display_name=self.display_name, root=game_dir)
-        data_dirs = [d for d in game_dir.iterdir() if d.is_dir() and d.name.endswith("_Data")]
+        # ★ 必须用"限定层数的递归查找"，不能用 `iterdir()`：
+        #   实测 7 个游戏把 `*_Data` 藏在下一层（`Dusk City_Data/`），
+        #   只看顶层 ⇒ conf 0.0 ⇒ 判成 unknown ⇒ 连抽取都不跑。
+        data_dirs = [d for d in _find_unity_dirs(game_dir) if d.name.endswith("_Data")]
         if not data_dirs:
             return info
 
         info.confidence = 0.5
         info.evidence.append(f"发现 {len(data_dirs)} 个 *_Data 目录：{[d.name for d in data_dirs]}")
+        # 记录 `*_Data` 相对游戏根的位置：嵌套时这行日志能直接解释
+        # "为什么以前判不出来"。
+        rels = []
+        for d in data_dirs:
+            try:
+                rels.append(d.relative_to(game_dir).as_posix())
+            except ValueError:
+                rels.append(d.name)
+        if any("/" in r for r in rels):
+            info.evidence.append(f"（其中嵌套在子目录里：{rels}）")
 
         d = data_dirs[0]
         if (d / "Managed").is_dir():
@@ -290,12 +373,11 @@ class UnityAdapter(EngineAdapter):
         # 回写时译文被叠加成"【译】【译】xxx"。
         # 早先就是这么错的，所以这里用 resolve() 后按路径去重，
         # 并且剔除"已被其它根包含"的子目录。
-        raw_roots: list[Path] = []
-        for d in game_dir.iterdir():
-            if not d.is_dir():
-                continue
-            if d.name.endswith("_Data") or d.name == "StreamingAssets":
-                raw_roots.append(d)
+        #
+        # ★ 用 `_find_unity_dirs`（限定层数递归）而不是 `iterdir()`：
+        #   与 `detect` 保持一致。否则会出现"检测到了引擎、抽取却什么都没找到"
+        #   这种自相矛盾的状态（前者看得到嵌套目录、后者看不到）。
+        raw_roots: list[Path] = list(_find_unity_dirs(game_dir))
         resolved = sorted({r.resolve() for r in raw_roots})
         roots: list[Path] = []
         for r in resolved:
@@ -560,8 +642,9 @@ class UnityAdapter(EngineAdapter):
         """
         from .unity_patch import extract_slots
 
+        # ★ 同样用限定层数递归：与 `detect`/`extract_text` 保持一致。
         data_dirs = [
-            d for d in game_dir.iterdir() if d.is_dir() and d.name.endswith("_Data")
+            d for d in _find_unity_dirs(game_dir) if d.name.endswith("_Data")
         ]
         if not data_dirs:
             return []
