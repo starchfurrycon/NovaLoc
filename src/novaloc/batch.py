@@ -320,6 +320,80 @@ def _unique_backup_dir(backup_root: Path, game_name: str) -> Path:
     return backup_root / f"{game_name}-{stamp}-{time.time_ns() % 1_000_000_000}"
 
 
+def preserve_pristine_backup(backup_root: Path, game_name: str) -> Path | None:
+    """把"最初的原版"备份标记为 ``-orig``，保证它永远不被覆盖、可回滚。
+
+    ## 为什么需要它（隐患，不是臆测）
+
+    `_unique_backup_dir` 保证"每次写回都有自己的目录"，所以
+    **第二次**写回会新建一个备份目录 —— 这本身没问题，但有个前提：
+    **第二次真的跑起来了**。隐患在于：
+
+    * ``auto --watch`` 正在对一个游戏做写回（备份目录已建、内容还在拷）；
+    * 我（或用户）又跑了一次 ``auto``，它判定"这次还没有备份"，
+      于是又建一个目录、又写一遍。
+
+    结果：**没有一份备份是"最初的原版"** —— 每份备份的都是
+    "上一次被改过的版本"。真出事想回滚到出厂状态时，**回不去**。
+
+    ## 判据：**只在"第一次写回刚发生"这个窗口内标记**
+
+    写回**之后**调用（此时新备份目录刚建好）。标记条件是：
+
+    1. 该游戏**还没有**任何 ``-orig-`` 目录；**且**
+    2. 该游戏的备份目录**恰好只有一个**（说明这是第一次写回）。
+
+    条件 2 是关键：如果已经有 2 个未标记目录，说明至少写回过两次，
+    那两份都**不是**原版（第二份备份的是第一遍改过的内容），
+    此时**什么都不标记** —— 宁可没有 orig，也不要把"改过的版本"
+    谎称成原版。
+
+    ## 诚实说明
+
+    这是**启发式**，不是密码学保证：它只能保证从加上本函数之后，
+    第一次写回的原版一定被标记。在此之前遗留的备份目录如果只有一个，
+    会被当成 orig —— 而它可能已经被改过。这一点不假装。
+
+    返回被标记的目录（没标记任何东西就返回 ``None``）。
+    """
+    if not backup_root.is_dir():
+        return None
+
+    prefixed: list[tuple[Path, str]] = []
+    has_orig = False
+    for d in sorted(backup_root.iterdir()):
+        if not d.is_dir():
+            continue
+        if d.name.startswith(f"{game_name}-orig-"):
+            has_orig = True
+            continue
+        # ★ 严格前缀：必须是 `<游戏名>-` 开头，且后缀形如 `YYYYMMDD-HHMMSS`
+        #   （或带 `-2` 这类去重后缀）。
+        #   用裸 `startswith(game_name)` 会把 `MyGame2-...` 当成 `MyGame`
+        #   的备份 —— 实测这是真 bug，见
+        #   `tests/test_batch_pristine_backup.py::test_does_not_touch_other_games`。
+        rest = d.name[len(game_name) :] if d.name.startswith(game_name) else None
+        if rest is None or not rest.startswith("-"):
+            continue
+        stamp = rest[1:]
+        if not stamp or not all(c.isdigit() or c == "-" for c in stamp):
+            continue
+        prefixed.append((d, stamp))
+
+    if has_orig or len(prefixed) != 1:
+        return None
+
+    src, stamp = prefixed[0]
+    dest = backup_root / f"{game_name}-orig-{stamp}"
+    if dest.exists():
+        return None
+    try:
+        src.rename(dest)
+    except OSError:
+        return None
+    return dest
+
+
 def write_back(
     source_dir: Path,
     out_dir: Path,

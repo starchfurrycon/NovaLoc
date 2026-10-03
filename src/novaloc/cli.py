@@ -2256,6 +2256,7 @@ def auto(
         GameEntry,
         detect_already_chinese,
         find_games,
+        preserve_pristine_backup,
         write_back,
     )
     from .engines import detect_engine  # noqa: PLC0415
@@ -2402,6 +2403,15 @@ def auto(
                     backup_root=data_root / BACKUP_DIR_NAME,
                     exclude_dirs={BACKUP_DIR_NAME},
                 )
+                # ★ 写回**之后**立刻标记原版：此时新建的备份目录是
+                #   该游戏的第一个 ⇒ 它就是"原版"。若已经标记过或
+                #   已有多个备份，函数会什么都不做（宁可没有 orig，
+                #   也不把改过的版本谎称成原版）。详见其 docstring。
+                orig = preserve_pristine_backup(
+                    data_root / BACKUP_DIR_NAME, ent.path.name
+                )
+                if orig is not None:
+                    log.info("已把最初的原版备份标记为：%s", orig)
                 ent.written_back = len(rep.written)
                 ent.message = (
                     f"写回 {len(rep.written)} 个文件"
@@ -2474,11 +2484,60 @@ def auto(
         console.print(f"[yellow]清单写不出去：{exc}[/yellow]")
 
     if watch:
+        # ---------------------------------------------------------------
+        # 守望状态**落盘**
+        #
+        # 原来 `seen` 只在内存里 —— 重启一次，**库里所有游戏**都会被当成
+        # "新出现"而重跑一遍（实测全库跑一次要很久）。
+        # 状态虽然也在各项目的 `.novaloc.json` 里，但守望模式**应该**
+        # 自己也记住，否则"重启后空了"这件事会静默发生。
+        # ---------------------------------------------------------------
+        state_path = data_root / "watch-state.json"
+        seen: set[str] = {str(g).lower() for g in games}
+        if state_path.is_file():
+            try:
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+                names = saved.get("seen") or []
+                if isinstance(names, list):
+                    before = len(seen)
+                    seen.update(str(x).lower() for x in names if isinstance(x, str))
+                    log.info(
+                        "守望状态：从 %s 读回 %d 条（本次新增 %d）",
+                        state_path.name,
+                        len(seen) - before,
+                        len(seen),
+                    )
+            except (OSError, ValueError) as exc:
+                console.print(
+                    f"[yellow]守望状态文件读不出来（{exc}），"
+                    "本次会把库里现有游戏当作已见。[/yellow]"
+                )
+
+        def _save_seen() -> None:
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "library": str(root),
+                            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "seen": sorted(seen),
+                        },
+                        ensure_ascii=False,
+                        indent=1,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                log.warning("守望状态写不出去：%s", exc)
+
+        _save_seen()
         console.print(
             f"\n[bold]守望模式[/bold]：每 {interval:.0f} 秒扫一次 {root}，"
-            "新出现的游戏会自动处理。按 Ctrl+C 停止。"
+            "新出现的游戏会自动处理。按 Ctrl+C 停止。\n"
+            f"[dim]已记住 {len(seen)} 个游戏（{state_path}）—— "
+            "重启不会把整库重跑一遍。[/dim]"
         )
-        seen = {str(g).lower() for g in games}
         try:
             while True:
                 time.sleep(max(5.0, interval))
@@ -2490,6 +2549,9 @@ def auto(
                     continue
                 for g in fresh:
                     seen.add(str(g).lower())
+                # ★ 先落盘再处理：万一处理中崩了/断电，
+                #   重启后不会把"已经看过的"又当新游戏。
+                _save_seen()
                 console.print(f"\n发现 {len(fresh)} 个新游戏：")
                 for g in fresh:
                     ent = scan_one(g)
@@ -2505,6 +2567,7 @@ def auto(
                     else:
                         console.print(f"    → {ent.status}　[dim]{ent.message}[/dim]")
         except KeyboardInterrupt:
+            _save_seen()
             console.print("\n[yellow]已停止守望。[/yellow]")
         return
 
