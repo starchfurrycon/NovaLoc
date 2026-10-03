@@ -592,6 +592,49 @@ class OllamaTranslationProvider:
             return ""
         return prompts.build_glossary_block(list(seen.items()))
 
+    def _respect_gate(self) -> None:
+        """动态资源占用的闸门：如果 `_pause` 存在就**睡到它消失**。
+
+        ## 为什么是"睡"而不是"退出"
+
+        退出会丢掉这一轮已经完成的进度吗？其实不会（有断点续跑），
+        但**退出意味着模型被卸载**，下次要重新加载（实测冷启动十几秒），
+        而且 `auto` 的主循环会把当前游戏判成"失败"或"未完成"，
+        下次要重新抽取。所以"挂着睡"的代价比"退出重来"小得多。
+
+        ## 为什么每 5 秒看一次文件
+
+        用户可能**手动**创建 `_pause` 来临时让路（有意保留的口子），
+        也可能由忙闲监视器创建。文件很小，5 秒一次读的开销可以忽略，
+        而 5 秒的响应延迟对人来说就是"立刻"。
+
+        ## 醒来后为什么还要再确认一次
+
+        因为文件可能在"读到不存在"之后、真正开始推理之前被创建。
+        再确认一次把窗口缩到一次文件读的时间。做不到零窗口 ——
+        真要严格就得让监视器去网关 Ollama，那会引入更多故障点。
+        这里选择"最多多跑一批"，一批只有几秒。
+        """
+        import time as _time
+
+        from . import busy
+
+        root = getattr(self.cfg, "data_root", "") or ""
+        if not root or not busy.is_paused(root):
+            return
+        waited = 0.0
+        while busy.is_paused(root):
+            _time.sleep(5.0)
+            waited += 5.0
+            if waited % 60.0 < 5.0:
+                # 每分钟报一次，别刷屏
+                import logging as _logging
+
+                _logging.getLogger(__name__).info(
+                    "机器忙/用户在用，暂停翻译（已让路 %.0f 秒）", waited
+                )
+        self.stats["paused_s"] = self.stats.get("paused_s", 0.0) + waited
+
     def _call_batch(self, batch_items: list[TranslateItem], masked: list[str]) -> dict[int, str]:
         """一次批量调用。返回 ``{批次内下标: 译文}``。"""
         user = prompts.build_batch_user_prompt(
@@ -1084,6 +1127,12 @@ class OllamaTranslationProvider:
         mask_nl = self.cfg.translate.mask_newlines
 
         for bi, batch in enumerate(batches):
+            # ★ 动态资源占用：每批之前问一次"现在该让路吗"。
+            #
+            # 为什么放在**批次边界**而不是"随时打断"：
+            # 一批就是一次 Ollama 往返，打断它会浪费已经算出来的 token；
+            # 而批次之间的延迟最多几秒，用户感觉不到。
+            self._respect_gate()
             self.stats["batches"] += 1
             batch_items = [uniq_items[i] for i in batch]
             sources = [it.unit.source for it in batch_items]

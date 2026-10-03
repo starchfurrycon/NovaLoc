@@ -2284,6 +2284,28 @@ def auto(
         "--bundles",
         help="抽取时也读 UnityFS 包里的文本（默认关：多数游戏包里没文本，且扫描有耗时）。",
     ),
+    only: str = typer.Option(
+        "",
+        "--only",
+        help=(
+            "只处理这些引擎，逗号分隔（如 `--only unity`）。"
+            "★ 初筛用：本工具只对已注册的引擎有效，"
+            "引擎不认识的游戏**一定翻不了**，提前排除可省掉整轮白跑。"
+        ),
+    ),
+    skip: str = typer.Option(
+        "",
+        "--skip",
+        help="跳过这些引擎，逗号分隔（如 `--skip loose` —— loose 层实测几乎抽不到文本）。",
+    ),
+    max_size_mb: float = typer.Option(
+        0.0,
+        "--max-size-mb",
+        help=(
+            "只处理体积不超过这个 MB 的游戏（0 = 不限）。"
+            "★ 体积与条目数强相关，先跑小的能看到成果。"
+        ),
+    ),
     json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
 ) -> None:
     """批量汉化整个游戏库；**就地写回**原游戏目录（先自动备份）。
@@ -2362,6 +2384,50 @@ def auto(
             by_engine.items(), key=lambda kv: -kv[1]
         )))
 
+    # ---------------------------------------------------------------
+    # ★ 初筛：在**动手之前**按引擎/体积排除，避免为注定失败的game烧机时
+    # ---------------------------------------------------------------
+    #
+    # 三层初筛（前两层在这里做，第三层在 `run_pipeline` 里做）：
+    #
+    #   ① 已是中文         —— 扫描阶段就跳过了（`detect_already_chinese`）；
+    #   ② 引擎不认识/被排除 —— **本工具注册表里没有的引擎一定翻不了**，
+    #      实测这种游戏会在"跑完七个阶段后"才报失败，纯属白烧；
+    #   ③ 抽不到文本       —— 只能抽过才知道，见 `run_pipeline` 的提前掉头。
+    #
+    # 为什么"体积"也要能筛：实测条目数与体积强相关（1 GB 的游戏动辄
+    # 上万条），而全库 308 GB / 约 300 万条要跑数十天。
+    # 先按体积从小到大跑，用户能**早点拿到可见成果**，
+    # 也便于小样本验收后再放开全量。
+    n_before = len(todo)
+    if only:
+        want = {s.strip() for s in only.split(",") if s.strip()}
+        todo = [e for e in todo if (e.engine_id or "unknown") in want]
+        console.print(f"  初筛 --only {sorted(want)}：{n_before} → {len(todo)} 个")
+    if skip:
+        drop = {s.strip() for s in skip.split(",") if s.strip()}
+        todo = [e for e in todo if (e.engine_id or "unknown") not in drop]
+        console.print(f"  初筛 --skip {sorted(drop)}：{n_before} → {len(todo)} 个")
+    if max_size_mb > 0:
+        limit_bytes = max_size_mb * 1024 * 1024
+        kept: list[GameEntry] = []
+        for e in todo:
+            try:
+                sz = sum(
+                    f.stat().st_size
+                    for f in Path(e.path).rglob("*")
+                    if f.is_file()
+                )
+            except OSError:
+                kept.append(e)
+                continue
+            if sz <= limit_bytes:
+                kept.append(e)
+        console.print(
+            f"  初筛 --max-size-mb {max_size_mb:.0f}：{len(todo)} → {len(kept)} 个"
+        )
+        todo = kept
+
     if dry_run:
         console.print("\n[yellow]试运行：不会写任何文件。将要处理的游戏：[/yellow]")
         for e in todo[:60]:
@@ -2409,6 +2475,49 @@ def auto(
     from .core.events import EventBus  # noqa: PLC0415
     from .pipeline.stages import Pipeline  # noqa: PLC0415
 
+    def run_pipeline(pipe: Pipeline, ws: Workspace) -> bool:
+        r"""跑九个阶段；**抽不到文本就立刻掉头**，不白跑后面七个。
+
+        返回 ``False`` 表示"这个游戏没有可译文本"（调用方标 `no_text`）。
+
+        ## ★ 为什么要在这里提前掉头（这是"初筛"的核心一层）
+
+        原来是无条件跑完九个阶段。实测后果：
+
+        * `stage_extract` 发现 0 条会返回 `ok=False` ⇒ 抛 `PipelineError`
+          ⇒ 被 `process` 的 `except` 抓成 **`failed`**；
+        * 但**在此之前**，`stage_images_scan` 已经跑了 ——
+          它要扫遍全部贴图（几百 MB 到几 GB 的游戏要几分钟到十几分钟），
+          纯属浪费；
+        * 而且状态被记成"失败"，用户看报告会以为"出错了"，
+          其实只是"这类引擎的文本不在明文里"，**不是错误**。
+
+        实测这个库里有 4 个游戏是"引擎不认识"、另外还有若干"认得出但抽不到"
+        （见 `.scratch/_which_unsupported.py`）。190 个待处理游戏里这类占一部分，
+        每个白烧几分钟 ~ 十几分钟，累计是可观的。
+        """
+        for sid, _label in _stage_order():
+            if sid == "images_scan" and not ws.load_units():
+                # 还没抽到文本就轮到扫贴图 ⇒ 直接跳出去（下面统一判 no_text）
+                break
+            if sid == "detect":
+                pipe.stage_detect()
+            elif sid == "extract":
+                pipe.stage_extract()
+            elif sid == "images_scan":
+                pipe.stage_images_scan()
+            elif sid == "translate":
+                pipe.stage_translate(only_pending=True)
+            elif sid == "fonts":
+                pipe.stage_fonts()
+            elif sid == "images_localize":
+                pipe.stage_images_localize()
+            elif sid == "qa":
+                pipe.stage_qa()
+            elif sid == "apply":
+                pipe.stage_apply()
+        return bool(ws.load_units())
+
     def process(ent: GameEntry) -> None:
         ent.status = "running"
         try:
@@ -2432,26 +2541,21 @@ def auto(
             ctx = Context(config=cfg, events=bus, workspace=ws, logger=None)
             pipe = Pipeline(ws, ctx)
             with ws.lock(what="auto"):
-                for sid, _label in _stage_order():
-                    if sid == "detect":
-                        pipe.stage_detect()
-                    elif sid == "extract":
-                        pipe.stage_extract()
-                    elif sid == "images_scan":
-                        pipe.stage_images_scan()
-                    elif sid == "translate":
-                        pipe.stage_translate(only_pending=True)
-                    elif sid == "fonts":
-                        pipe.stage_fonts()
-                    elif sid == "images_localize":
-                        pipe.stage_images_localize()
-                    elif sid == "qa":
-                        pipe.stage_qa()
-                    elif sid == "apply":
-                        pipe.stage_apply()
+                has_units = run_pipeline(pipe, ws)
 
             units = ws.load_units()
             ent.units = len(units)
+            if not has_units:
+                # ★ 初筛：抽不到文本 ⇒ 记 `no_text` 而不是 `failed`。
+                # 这不是错误（文本可能在未解包的归档里，或者本来就画在贴图上），
+                # 记成 failed 会让用户以为工具坏了。
+                ent.status = "no_text"
+                ent.message = (
+                    f"引擎 {ent.engine_id}，但没有抽到可译文本（已跳过扫描贴图/翻译/"
+                    "质检/回写四个阶段）。可能：① 文本在未解包的 AssetBundle 或"
+                    "自研归档里；② 文字直接画在贴图上。"
+                )
+                return
             if units:
                 tr = [e for e in ws.load_entries() if e.status.value == "translated"]
                 ent.translated = len(tr)
@@ -2460,26 +2564,32 @@ def auto(
             cs = ws.load_charset()
             ent.font_ok = bool(cs and getattr(cs, "total", 0))
 
-            if not units:
-                # 抽不到文本。现在 `.assets` 里的字符串**已经能改**了
-                # （见 `novaloc.engines.unity_patch`），所以走到这里
-                # 通常意味着文本在**更外层**的容器里：
-                #
-                # * **AssetBundle**（`.bundle`/`.unity3d`）—— 本工具不解包；
-                # * **自研打包格式**（`.pak`/`.dat`/`.bin`）；
-                # * **根本没有文本文件** —— 文字是**画在贴图里**的。
-                #   实测 AliQ 就是这种：613 MB 资源里只有 2 KB 假名噪声。
-                #
-                # 不算失败，但要**说清是哪一种**，否则用户不知道该往哪走。
-                ent.status = "no_text"
-                ent.message = (
-                    f"引擎 {ent.engine_id}，但既没有明文文本，"
-                    "也没有从序列化资源里读到字符串。可能的原因："
-                    "① 文本在未解包的 AssetBundle / 自研归档里 —— "
-                    "用 UABEA / AssetStudio 解包后再扫；"
-                    "② 文字直接画在贴图里（纯图游戏）—— 本工具的贴图汉化流程可处理。"
-                )
-                return
+            # ★★ 写回前的最后一道保险：**这个游戏正在运行吗？**
+            #
+            # 这是用户明确要求的「我随时玩对应文件夹的游戏时不会影响」。
+            # 为什么后果严重到必须专门挡：
+            #
+            # * `write_back` 会**覆盖原游戏文件**。若游戏正在跑，它可能
+            #   ① 读到写了一半的文件 ⇒ 崩溃；② 退出时把内存里的旧数据
+            #   写回存档 ⇒ 和刚替换的资源不匹配 ⇒ **存档损坏**。
+            # * 而且这是**不可逆**的：备份只保证"能退回原版"，
+            #   但玩家那一刻的存档进度保不住。
+            #
+            # 注意这里检查的是"游戏进程的 exe 在当前游戏目录下"
+            # （结构性事实，见 `busy.is_game_running`），
+            # 不依赖游戏窗口标题怎么命名。
+            if not no_write_back:
+                from .translate import busy as _busy  # noqa: PLC0415
+
+                running, who = _busy.is_game_running(ent.path)
+                if running:
+                    ent.status = "deferred"
+                    ent.message = (
+                        f"检测到游戏正在运行（{who}），**已跳过写回**以免破坏存档。"
+                        f"翻译产物已保存在 {ws.out_dir}；关掉游戏后重跑即可自动写回。"
+                    )
+                    log.info("游戏正在运行，跳过写回：%s", who)
+                    return
 
             if not no_write_back:
                 rep = write_back(
@@ -2532,6 +2642,7 @@ def auto(
         mark = {
             "done": "[green]✅[/green]",
             "no_text": "[yellow]○[/yellow]",
+            "deferred": "[cyan]⏸[/cyan]",
             "failed": "[red]✗[/red]",
         }.get(ent.status, "?")
         console.print(
@@ -2547,13 +2658,15 @@ def auto(
     # ---------------------------------------------------------------
     n_done = sum(1 for e in entries if e.status == "done")
     n_notext = sum(1 for e in entries if e.status == "no_text")
+    n_defer = sum(1 for e in entries if e.status == "deferred")
     n_fail = sum(1 for e in entries if e.status == "failed")
     console.print()
     t = Table(title="批量汉化结果", box=box.SIMPLE_HEAVY, title_justify="left")
     t.add_column("结果", style="bold")
     t.add_column("数量", justify="right")
     t.add_row("[green]已汉化并写回[/green]", str(n_done))
-    t.add_row("[yellow]无可译文本[/yellow]", str(n_notext))
+    t.add_row("[yellow]无可译文本（跳过）[/yellow]", str(n_notext))
+    t.add_row("[cyan]游戏在运行，已缓写回[/cyan]", str(n_defer))
     t.add_row("[red]失败[/red]", str(n_fail))
     t.add_row("已是中文（跳过）", str(len(skipped)))
     t.add_row("合计", str(len(entries)))
@@ -2567,6 +2680,7 @@ def auto(
         "library": str(root),
         "done": [e.to_dict() for e in entries if e.status == "done"],
         "no_text": [e.to_dict() for e in entries if e.status == "no_text"],
+        "deferred": [e.to_dict() for e in entries if e.status == "deferred"],
         "failed": [e.to_dict() for e in entries if e.status == "failed"],
         "skipped": [e.to_dict() for e in entries if e.status == "skipped"],
     }
