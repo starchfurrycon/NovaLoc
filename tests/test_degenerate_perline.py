@@ -179,7 +179,7 @@ def _mk_entry(target: str, source: str = FAKE_SRC) -> object:
 
 def test_final_gate_blocks_degenerate_translation() -> None:
     """★ 3.9 闸门必须拦下"同一短句复制多遍"的**最终**译文。"""
-    e = _mk_entry("店员 1：\n店员 1：\n店员 1：\n店员 1：")
+    e = _mk_entry("店员 1：\n店员 1：\n店员 1：\n店员 1：", source="短源文。")
     n, stats = _gate([e])
     assert n == 1, "闸门没拦下退化产物"
     assert e.status is EntryStatus.FAILED
@@ -189,11 +189,17 @@ def test_final_gate_blocks_degenerate_translation() -> None:
 
 
 def test_final_gate_counts_what_it_blocks() -> None:
-    """拦下要有计数 —— 否则线上看不出它在起作用。"""
+    """拦下要有计数 —— 否则线上看不出它在起作用。
+
+    ⚠️ 这里的"正常"条目**必须**配一个短源文：若沿用长 `FAKE_SRC`，
+    它的译文 `'第一行。\\n第二行。'`（13 字符）会落进
+    `_is_label_only_output` 的判据（长源文 + 译文 ≤12）而被拦 ——
+    那条路径有它自己的用例，这里只想隔离"重复结构"这一条。
+    """
     entries = [
         _mk_entry("店员 1：\n店员 1："),
         _mk_entry("教授：\n教授："),
-        _mk_entry("第一行。\n第二行。"),  # 正常，不该被拦
+        _mk_entry("第一行。\n第二行。", source="短源文。"),  # 正常，不该被拦
     ]
     n, stats = _gate(entries)
     assert n == 2, f"应拦下 2 条，实际 {n}"
@@ -229,6 +235,52 @@ def test_final_gate_ignores_long_repeated_lines() -> None:
     assert e.status is EntryStatus.TRANSLATED
 
 
+# ------------------------------------------------- 「只回标签」判据的**撤回**
+#
+# 这里的用例守的是**撤回本身**：判据已停用，且必须保持停用。
+# 详见 `_is_label_only_output` 的 docstring（#42）。
+
+
+def test_label_only_criterion_is_retracted() -> None:
+    """★ 撤回的判据必须恒返回 False —— 绝不能因为误调用而误杀。"""
+    from novaloc.translate.ollama_provider import _is_label_only_output
+
+    # 连"确认是垃圾"的样本也必须不再被拦（判据已停用）
+    for src, tgt in [
+        ("Man 1:\n" + "x" * 60, "男人 1\n："),
+        ("Clerk 1:\n" + "y" * 90, "人 1\n："),
+        ("Clerk 1:\n" + "z" * 130, "店员 1\n："),
+    ]:
+        assert not _is_label_only_output(tgt, src)
+
+
+def test_KNOWN_LIMITATION_length_bands_overlap() -> None:
+    r"""★ **撤回的可执行证据**：垃圾与合法译文的长度区间**重叠**。
+
+    实测（源文都 ≥60 字符）::
+
+        4   '人 1\n：'                         ← 垃圾
+        5   '店员 1\n：'                       ← 垃圾
+        7   '女店员：\n欢迎。'                  ← 垃圾
+        **10  '男行人:\n嗯？怎么了？'             ← 合法简明译文！**
+        12  '男人：\n哼，我马上就要了。'
+        13  '马西罗:\n喂！♡ 亲爱的！♡'           ← 垃圾
+
+    **垃圾 13 > 合法 10** ⇒ 任何"译文长度"阈值都必然误杀一边。
+    我把阈值调到 ≤12 时能抓到全部确认垃圾，但**仍然误杀**
+    `'男行人:\n嗯？怎么了？'`。
+
+    ⇒ 这是 `_best_segment`（2026-09）、#39 之后**第三次**同源现象。
+    本用例把这个"分不开"的事实钉住：谁想再加这类阈值，
+    先看这条，并准备好解释为什么这一次不会误杀。
+    """
+    garbage_max = 13  # '马西罗:\n喂！♡ 亲爱的！♡'
+    legit_min_at_that_size = 10  # '男行人:\n嗯？怎么了？'
+    assert garbage_max > legit_min_at_that_size, (
+        "若哪天垃圾最短 > 合法最长，就可以重新考虑阈值判据了"
+    )
+
+
 # ---------------------------------------------------------------- 已知局限
 
 
@@ -237,30 +289,29 @@ def test_KNOWN_LIMITATION_content_loss_is_not_fatal(
 ) -> None:
     r"""★ **已知局限（故意让它"通过"，把缺口写成可执行的记录）**。
 
-    实测那条 `'店员 1\n：'`（源 142 字符 / 3 行，只译出说话人标签）
-    在真实路径上的**最终状态是 `translated`**，只带
-    `sentence_drop:6->1` 警告。本用例**断言这个现状** ——
-    如果哪天它变成 FAILED，这条用例会红，提醒我们来更新 ROADMAP。
+    ## 内容丢失**没有**被修好，本轮也没能修
 
-    为什么**没有**修好它：我量过三类"假成功"判据，全部**无判别力**：
+    实测那条 `'店员 1\n：'` 所在的**整类**"只回说话人标签"，
+    经三轮尝试后确认**无法用判据可靠区分**（详见
+    `_is_label_only_output` 的撤回说明）：
 
-    * 译文/原文比值 —— 垃圾 0.04~0.43 与合理译文 0.17~0.37 **重叠**；
-    * `sentence_drop` 判死 —— 实测开火率 10.7%、**大部分是假阳性**
-      （语气词合并），且与"真丢内容"的 len_ratio 区间重叠（见 guards.py）；
-    * 源文行数 - 译文行数 —— 与"合理合并"同样重叠。
+    * 比值判据 —— 垃圾 0.04~0.43 vs 合法 0.17~0.37，**重叠**；
+    * 绝对长度判据 —— 垃圾 13 vs 合法 10，**重叠**；
+    * 行数判据 —— 与"合理合并"**重叠**。
 
-    唯一有判别力的是**结构性**的"同一段重复"（3.9 已守），
-    而这条垃圾**不是**重复结构，所以守不住。
-    ⇒ **报出局限，而不是上一个会误杀正确译文的启发式。**
-    （拦下正确产物比漏放一个可疑项更糟 —— 与 `guards.py` 里
-    `sentence_drop` 的取舍同源。）
+    ⇒ 本用例断言**现状**：这类条目最终是 `translated`，
+    只带 `sentence_drop` 警告。**如果哪天它变成 FAILED，这条会红**，
+    提醒来更新 ROADMAP/CHANGELOG —— 那是好消息，不是回归。
+
+    ⚠️ 唯一本项目能可靠抓住的是**同一短片段复制多遍**
+    （`_is_degenerate_repetition`，零误杀），它对这类**不适用**。
     """
     p = _prov(monkeypatch, {"__default__": FAKE_LABEL, "__whole__": FAKE_LABEL})
     out = p.translate_batch([_Item(FAKE_SRC)], "zh-Hans")
     e = out[0]
     # 记录现状：内容丢失**不会**被判死（这是局限，不是期望）
     assert e.status is EntryStatus.TRANSLATED, (
-        "现状变了（内容丢失被拦下了）—— 好消息，请更新 ROADMAP #39 并改掉本用例"
+        "现状变了（内容丢失被拦下了）—— 好消息！请更新 ROADMAP #42 并改掉本用例"
     )
     assert any(w.startswith("sentence_drop") for w in e.warnings), (
         f"连警告都没有了，那才是真退步：{e.warnings}"
