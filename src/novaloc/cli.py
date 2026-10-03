@@ -2268,6 +2268,15 @@ def auto(
     interval: float = typer.Option(
         60.0, "--interval", help="守望模式的扫描间隔（秒）。"
     ),
+    backlog: bool = typer.Option(
+        False,
+        "--backlog",
+        help=(
+            "配合 --watch-only：**先补完库里积压的待处理游戏**，再进守望循环。"
+            "★ 让自启的单一服务同时覆盖「积压」和「新游戏」，"
+            "关机重启后不会停在半路。"
+        ),
+    ),
     limit: int = typer.Option(0, "--limit", help="最多处理几个游戏（0 = 不限）。"),
     depth: int = typer.Option(2, "--depth", help="向下找游戏的层数。"),
     force: bool = typer.Option(
@@ -2592,12 +2601,43 @@ def auto(
                     return
 
             if not no_write_back:
+                from .translate import busy as _busy  # noqa: PLC0415
+
+                def _game_started() -> str:
+                    """写回**每个文件之前**重新确认游戏没被启动。
+
+                    ## 为什么"进写回之前查一次"还不够（实测的窗口）
+
+                    写回是**逐个文件** copy 的。一个上千文件的游戏要好几秒，
+                    上万文件的要几十秒。用户完全可能**恰好在这段时间里**
+                    双击启动游戏 —— 那一刻游戏开始读的正是被替换到一半的
+                    资源目录 ⇒ 崩溃，或退出时把旧数据写回存档 ⇒ **存档损坏**。
+
+                    所以把检查下沉到文件粒度。代价是每个文件多一次
+                    `Get-CimInstance` 查询（实测一次几十毫秒）——
+                    对"回写"这种本来就不是热路径的操作完全可接受。
+                    """
+                    run, who = _busy.is_game_running(ent.path)
+                    return f"游戏被启动（{who}）" if run else ""
+
                 rep = write_back(
                     ent.path,
                     ws.out_dir,
                     backup_root=data_root / BACKUP_DIR_NAME,
                     exclude_dirs={BACKUP_DIR_NAME},
+                    should_stop=_game_started,
                 )
+                if rep.aborted:
+                    # 中途叫停 ⇒ 游戏目录是"部分新部分旧"，
+                    # 必须**显式告诉用户**，不能默默当成成功。
+                    ent.status = "deferred"
+                    ent.message = (
+                        f"写回进行到 {len(rep.written)} 个文件时{rep.aborted}，"
+                        "已立即停止（备份完整，可恢复）。"
+                        "请关掉游戏后重跑，会继续把剩余文件写完。"
+                    )
+                    log.warning("写回中途停止：%s", rep.aborted)
+                    return
                 # ★ 写回**之后**立刻标记原版：此时新建的备份目录是
                 #   该游戏的第一个 ⇒ 它就是"原版"。若已经标记过或
                 #   已有多个备份，函数会什么都不做（宁可没有 orig，
@@ -2622,7 +2662,7 @@ def auto(
             ent.message = f"{type(exc).__name__}: {exc}"
             log.debug("批量处理失败", exc_info=True)
 
-    if watch_only:
+    if watch_only and not backlog:
         # ★ `--watch-only`：**不重跑库里现有游戏**，直接进守望循环。
         #
         # 为什么不复用下面的 `for i, ent in enumerate(todo, 1):` 然后
@@ -2633,6 +2673,28 @@ def auto(
             "只等新游戏出现。[/dim]"
         )
         todo = []
+
+    if watch_only and backlog and todo:
+        # ★ `--backlog`：先补完积压，再进守望循环。
+        #
+        # ## 为什么必须有这个开关（实测的**真缺口**）
+        #
+        # 自启的只有守望服务，而它跑的是 `--watch-only` ⇒ **只等新游戏**。
+        # 于是"关机 → 开机"之后：
+        #
+        #   * 正在跑的全库翻译进程**没了**（它是手工起的，不在自启清单里）；
+        #   * 唯一自启的守望服务又拒绝碰积压 ⇒ **翻译就此停住**，
+        #     而且完全不报错（守望日志一切正常）。
+        #
+        # 用户问的就是这个场景："我关机开机…不会影响翻译吧？"
+        # 在加这个开关之前，答案是**会**。
+        #
+        # `--backlog` 让它这一轮先处理现有待办，处理完再进守望循环，
+        # 因此自启一份守望服务就等于"积压 + 新游戏"都覆盖。
+        console.print(
+            f"\n[dim]--backlog：先处理库里现有 {len(todo)} 个待处理游戏，"
+            "处理完再进守望循环。[/dim]"
+        )
 
     for i, ent in enumerate(todo, 1):
         console.rule(f"[{i}/{len(todo)}] {ent.name}")
@@ -2724,9 +2786,13 @@ def auto(
             f"[dim]已记住 {len(state.seen)} 个游戏（{state.path}）—— "
             "重启不会把整库重跑一遍。[/dim]"
         )
-        if watch_only:
+        if watch_only and not backlog:
             console.print(
                 "[dim]--watch-only：不重跑库里现有游戏，只等新游戏。[/dim]"
+            )
+        elif watch_only and backlog:
+            console.print(
+                "[dim]--backlog：积压已处理完，之后只等新游戏。[/dim]"
             )
         try:
             while True:

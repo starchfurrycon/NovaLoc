@@ -279,6 +279,9 @@ class WriteBackReport:
     written: list[str] = field(default_factory=list)
     backup_dir: str = ""
     failed: list[str] = field(default_factory=list)
+    #: 非空 ⇒ 中途被 `should_stop` 叫停，这里放原因。
+    #: 调用方**必须**把它报给用户：此时 `source_dir` 是"部分新部分旧"。
+    aborted: str = ""
 
 
 def _unique_backup_dir(backup_root: Path, game_name: str) -> Path:
@@ -401,8 +404,28 @@ def write_back(
     backup_root: Path,
     dry_run: bool = False,
     exclude_dirs: set[str] | None = None,
+    should_stop: Callable[[], str] | None = None,
 ) -> WriteBackReport:
-    """把 ``out_dir`` 里**变了的**文件覆盖回 ``source_dir``，先备份原件。"""
+    """把 ``out_dir`` 里**变了的**文件覆盖回 ``source_dir``，先备份原件。
+
+    ## ``should_stop``：**逐文件**的紧急刹车（实测发现的窗口）
+
+    调用方在进入写回**之前**已经查过一次"游戏在不在跑"。但那样还不够：
+
+    写回是**逐个文件** copy 的，一个上万个文件的游戏要好几秒。
+    如果用户在那一刻**正好把游戏启动起来**，就会在写回进行到一半时
+    开始读文件 —— 读到的新旧混合文件 ⇒ 崩溃，或者退出时把旧数据
+    写回存档 ⇒ **存档损坏**（不可逆）。
+
+    ``should_stop`` 每个文件之前调一次，返回**非空字符串**表示"立刻停"，
+    那个字符串会记进 ``rep.aborted``。默认 ``None`` = 不检查
+    （保持原有行为，避免影响其它调用方）。
+
+    停下来时**已经写了的不回滚** —— 因为回滚本身要再写一遍文件，
+    在"游戏正在读"的时刻做这个反而更危险。此时 ``source_dir`` 是
+    "部分新部分旧"，但**备份是完整的**（备份在写之前做，逐文件进行），
+    可以据此恢复。
+    """
     rep = WriteBackReport()
     rels = changed_files(source_dir, out_dir, exclude_dirs=exclude_dirs)
     if not rels:
@@ -412,6 +435,12 @@ def write_back(
     rep.backup_dir = str(backup_dir)
 
     for rel in rels:
+        # ★ 每个文件之前重新确认一次（见 docstring 里的窗口说明）
+        if should_stop is not None:
+            why = should_stop()
+            if why:
+                rep.aborted = why
+                break
         src = out_dir / rel
         dst = source_dir / rel
         bak = backup_dir / rel
