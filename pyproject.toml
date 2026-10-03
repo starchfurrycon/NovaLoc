@@ -84,7 +84,15 @@ inpaint = ["torch>=2.4", "scikit-image>=0.24"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.11"]
 
 [project.scripts]
-novaloc = "novaloc.cli:app"
+# ⚠️ 必须是**函数**（`run_app`），不能是 Typer 应用对象（`app`）。
+#
+# 写成 `novaloc.cli:app` 时，`novaloc --version` 直接调用 Typer 应用 ⇒
+# `main()` 只是它的 callback ⇒ **callback 不执行** ⇒ 放在 `main()` 里的
+# `reconfigure(encoding="utf-8")` 永远不跑 ⇒ 重定向到文件时输出 GBK 乱码。
+# 实测：裸环境输出 `d0 c2 d2 eb`（GBK「新译」），
+#       加 PYTHONIOENCODING=utf-8 才变成 `e6 96 b0 …`（UTF-8）。
+# 详见 `novaloc.cli._ensure_utf8_streams` 的注释。
+novaloc = "novaloc.cli:run_app"
 
 [project.urls]
 Homepage = "https://github.com/starchfurrycon/novaloc"

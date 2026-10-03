@@ -53,6 +53,55 @@ from .pipeline import STAGE_LABELS, STAGES, Pipeline, PipelineError, StageResult
 #: 显式带上 encoding，避免 Windows 上默认 GBK 把中文行输出炸掉。
 console = Console(highlight=False, emoji=True)
 
+
+def _ensure_utf8_streams() -> None:
+    """把 stdout/stderr 切到 UTF-8。
+
+    ## 为什么必须在**模块导入时**调用，而不只是在 `main()` 里
+
+    真实缺陷（2026-10 实测，一直存在到 v1.6.0）：
+
+        pyproject.toml 里写的是  novaloc = "novaloc.cli:app"
+                                       ^^^ Typer **应用对象**本身
+
+    于是 `novaloc --version` 直接调用 Typer 应用，而 `main()` 只是它的
+    **callback** —— callback 在 `--version` 这种 eager 选项下**不会执行**。
+    原来只有 `main()` 里做了 `reconfigure`，所以：
+
+        $ novaloc --version   →  输出 GBK 字节（中文乱码）
+        $ novaloc --help      →  同样
+
+    实测字节（`.scratch/_enc_ab.py`）：
+
+        裸环境                  d0 c2 d2 eb   ← GBK 的「新译」
+        PYTHONIOENCODING=utf-8  e6 96 b0 ...  ← UTF-8
+
+    ## 为什么这个 bug 危险
+
+    **在终端里看不出来**（终端按控制台代码页显示，GBK 反而"正常"），
+    只有**重定向到文件**时才暴露 ⇒ 恰好是所有后台服务/日志的场景。
+    这正是"自动守望"那条链路踩到的坑：日志文件里 PowerShell 写的行
+    是 UTF-8、Python CLI 写的行是 GBK，**同一文件两种编码**。
+
+    ## 为什么试用/重试三件事
+
+    * `reconfigure` 是首选（Python 3.7+，正规做法）；
+    * 有的流（被包装过的、非文本流）不支持 `reconfigure` ⇒ 退到
+      `PYTHONIOENCODING`（它会让 Python 在下次启动时就用 UTF-8）；
+    * 都失败也**不能抛** —— 输出编码坏了不该让整个命令失败。
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 - 非文本流/已包装的流会不支持
+            pass
+
+
+# ★ 模块导入时就切好：这样连 `--version` / `--help` 这类
+#   **不经过 `main()` callback** 的路径也是 UTF-8。
+_ensure_utf8_streams()
+
 #: 全局 ``--json``：目前只有部分命令支持，但保持一致的名字。
 _JSON_MODE = False
 
@@ -127,12 +176,7 @@ def main(
     ),
 ) -> None:
     """NovaLoc 新译：把一款外语游戏变成中文可玩版本。"""
-    # Windows 控制台默认不是 UTF-8，中文与 ✅/❌ 会变成乱码方块。
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001 - 被重定向到非文本流时忽略
-            pass
+    _ensure_utf8_streams()
 
 
 # --------------------------------------------------------------------------
