@@ -2033,4 +2033,148 @@ got='【被动效果】最大生命值增加 5%。 需要等级：1'          �
 
 ---
 
+## 19. #53 ★★ "译文与原文讲的是两件事"——排查到底，结论是**对齐没坏**
+
+### 19.1 现象
+
+全库抽查译文质量（`.scratch/_quality_sample.py`，按 uid 哈希取 1/97 间隔）时，
+出现一条看着**极严重**的：
+
+```
+源  'Overwhelmed by pleasure and exhaustion, Mashiro could no longer think.
+     The office worker held her in his arms as she collapsed on the spot.
+     He brought her straight to his home.'
+译  '前方可能导致游戏过关，取决于你的选择。\n我们建议你保存游戏。\n※存档菜单将打开。'
+```
+
+译文的**长度与形状都对**（三行中文），所以现成的守卫**全部放行**：
+占位符完整、长度比正常、没有异种文字、没有重复。但它讲的是"存档提示"。
+
+**如果这是成片的条目错位，那就是本项目最严重的缺陷** ——
+所有对话都会对错人。所以必须查到底，不能"看着像幻觉就算了"。
+
+### 19.2 我试错的两个判据（都废了，记录以免后人重走）
+
+| # | 判据 | 结果 | 为什么错 |
+|---|------|------|----------|
+| 1 | 源文的**专有名词**在译文里找不到任何音译痕迹 | 报 **12.27%**（2981/24304） | `真实现手` / `真酱` / `真梨` **都是 `Mashiro` 的译名**，只是译法不统一。我的音译字表没收这几个字 ⇒ 几乎全是误报 |
+| 2 | **A 的译文 ≈ B 的原文**（长度比 + 首字母音译） | 报 **907,835** 处 | 这个游戏**几乎每条都以 `Mashiro:` 开头**，而 `M` 在首字表里映射到"马玛米姆梅摩莫真"⇒ **任意两条都能"匹配"** |
+
+> **教训**：凡是用"语义相似 / 音译"的判据，在角色名反复出现的语料上
+> 都会被刷爆。**只有精确字符串的观察才可信。**
+
+### 19.3 精确定位：那条样本的真实来源
+
+用 `.scratch/_align_root.py` 按 uid 里的指针回到**原游戏 JSON** 取值：
+
+```
+条目 #1125  uid = CommonEvents.json:/13/list/331/parameters/0
+  工作区记录的 source = 3 行合并（被快感淹没…/他抱住她…/他带她回自己家）
+  原游戏 /13/list/331/parameters/0 的真值 = 只有第 1 行
+```
+
+再看原文件的结构：
+
+```
+[330] code=101  ''                                    ← 打开消息框
+[331] code=401  'Overwhelmed by pleasure and exhaustion, ...'
+[332] code=401  'The office worker held her in his arms ...'
+[333] code=401  'He brought her straight to his home.'
+```
+
+⇒ `/331` `/332` `/333` 是**同一个消息框的三行**。
+`siblings` 机制（`rpgmaker.py:738`）把它们**合成一条**翻译，
+写回时由 `_split_across_slots` 拆回各槽位（`rpgmaker.py:1216`）。
+
+**所以"合并"是设计，不是 bug。** 问题只可能是：
+**拆分后的片段有没有写回各自的指针。**
+
+### 19.4 为什么这里是对的（而且早有回归测试）
+
+```python
+pointers = [u.location.pointer, *u.location.siblings]
+pieces = _split_across_slots(text, len(pointers), u.source)
+for ptr, piece in zip(pointers, pieces, strict=True):
+    self._set_pointer(obj, ptr, piece)      # ← 每片写各自的指针
+```
+
+`zip(..., strict=True)` 保证片数与指针数**必须相等**，不会静默错配。
+
+而且这不是新代码 —— `tests/test_rpgmaker_command_format.py` 里
+**早就有一对镜像用例**，正是钉这个失败方式：
+
+* `test_apply_writes_split_translation_to_every_slot`：
+  两格合并的译文必须**拆到两格**（只写第一格 ⇒ 玩家看到"一中文一英文"）；
+* `test_apply_never_duplicates_text_across_slots`：
+  反过来，**不能**把整段往每格都写一遍（消息框显示两遍，"每格都有中文"看着像成功）。
+
+跑过：`16 passed`（`-k "split or apply or roundtrip"`）。
+
+### 19.5 那条样本到底为什么错 ⇒ **它在测试工作区、是旧代码产物**
+
+| 工作区 | 指向的游戏目录 | 性质 |
+|--------|----------------|------|
+| `0e8a810078c5` | `E:\lush\1\_novaloc_test_lib\Midnight Exhibitionist DX` | ⚠️ **测试副本** |
+| `1e82e05c2953` | `E:\lush\1\_novaloc_test_lib\Dungeon And Darkness-Steam` | ⚠️ **测试副本** |
+| `f4b03ca791a9` 等 6 个 | `E:\lush\1\newlytransport\...` | ✅ 真库 |
+
+那条样本出自 `0e8a810078c5` —— **`_novaloc_test_lib` 里的旧代码产物**，
+且 `project.json` 的 `created_at` 早于本轮的合并写回改动。
+**真库工作区里没有这个形状。**
+
+### 19.6 真库的实测数字（这才是要看的）
+
+`.scratch/_audit_adjacent_shift.py`，精确字符串判据：
+
+```
+真库 + 测试工作区 合计已译 24,497
+  (A) target(i) == source(i±1)    : 33   (0.135%)
+  (B) target(i) == target(i±1)    : 452  (1.845%)
+  (C) source(i) == source(i+1) 但 target 不同 : 49 (0.200%)
+```
+
+但 (A) 的 33 条里**绝大多数是我判据的假阳性**：
+`'Type of Zero・Mumyo'` 这种**专有名词没被译**（`target == source` 逐字相同），
+于是"本条译文 == 邻条原文"必然成立 —— 那不是错位，是**正确的原样保留**。
+
+**修正判据**（要求邻条**真的被翻译过**，即 `source != target`）后：
+
+```
+(A) 修正后串位: 1  (0.004%)
+    [f4b03ca791a9] #2527.译文 == #2528.原文  'far east store'
+```
+
+剩下这**一条**也是没被译的英文店名。⇒ **真库的对齐是干净的。**
+
+(B) 452 条"邻条同译文"里，长度分布：
+
+```
+0~20 字: 146 条   20~40 字: 69 条   40~60 字: 11 条
+```
+
+绝大多数是**很短的重复台词**（`"啊！"`、`"……"`、`"嗯……"`），
+本来就该译成同一个词 —— 属于正常，不是缺陷。
+
+### 19.7 结论与留下的东西
+
+* **对齐没有坏**，真库的条目↔译文映射是干净的（修正后 1/24,497）；
+* 那个吓人的样本来自**测试工作区的旧产物**，不是真库；
+* `tests/test_rpgmaker_command_format.py` 里的镜像用例**已经覆盖**这个失败方式，
+  不需要加新代码 —— 本轮**没有改任何 src**，只补了审计脚本与本文档。
+
+**留作回归工具**（`_scratch` 不进包，只在仓库里）：
+
+| 脚本 | 用途 |
+|------|------|
+| `.scratch/_audit_adjacent_shift.py` | 精确字符串查相邻串位 / 重译 |
+| `.scratch/_quality_sample.py` | 按哈希抽样人读译文 |
+| `.scratch/_align_root.py` | 按 uid 指针回原游戏取值，定位单条 |
+
+**给 `.scratch/_audit_misalignment.py` 的补丁说明**：
+它现有判据（`源>=90 字` 且 `译文/源文 < 0.30`）只能抓**"译文极短"**形状，
+**抓不到等长替换**。本轮的串位恰好是等长替换，比值 0.8~1.2。
+两者**互补**，不要用一个替掉另一个。
+
+---
+
 本文档应随代码变更同步更新。**如果你发现某处描述与代码不符，以代码为准并修本文档。**
