@@ -2390,7 +2390,93 @@ PS 5.1 默认按 **ANSI(GBK)** 解码无 BOM 的文件。改成 **`utf-8-sig`** 
 和 ROADMAP §17.3 同一个问题：从后台任务里无法证明进程能否活过会话拆除。
 `-EncodedCommand` 的内容已经**解码核对**过（不要信任终端里显示的乱码）。
 
-### 20.6 这一轮的取舍说明
+### 20.6 ★★ Windows 脚本的三条编码/解析硬要求（本轮全部踩了一遍）
+
+这一节独立出来，因为这三个坑**每条都花了很久才定位**，而且表现都像
+"文件损坏"或"进程没起来"，完全联想不到真正原因。
+现在有 `scripts/check-script-encoding.py` 自动检查（进了仓库）。
+
+#### ① `.cmd` 必须 **CRLF** 行尾
+
+我用编辑器写出 LF-only 的 `.cmd` 后，cmd.exe **按字节偏移错位地读每一行**，
+把行首几个字符吃掉：
+
+```
+REM NovaLoc busy-watcher launcher (ASCII ONLY).
+  -> 'sy-watcher' is not recognized as an internal or external command
+setlocal
+  -> 'use' is not recognized ...
+```
+
+**看起来像文件损坏**，实际只是行尾。定位过程：先怀疑中文路径、再怀疑
+`%~dp0`、再怀疑变量展开，最后用 Python 数了字节才看到
+`CRLF 行数=0  仅LF 行数=19`。
+
+#### ② `.cmd` 必须是**纯 ASCII**（中文只放 `.ps1`）
+
+cmd.exe 按 OEM 代码页（本机 GBK）解析 `.cmd`。UTF-8 中文会被当 GBK 解，
+容易在字符串中间拼出 `"` 或 `&` ⇒ 语法崩。
+我第一版 `watch-busy.cmd` 里有 552 个非 ASCII 字节（大段中文注释），
+另外一处中文在 `start "..."` 的窗口标题里把命令行切断了。
+
+⇒ 规则：**`.cmd` 写 ASCII，注释用英文；中文解释放 `.ps1` 或 Python。**
+
+#### ③ `.ps1` 必须 **UTF-8 with BOM**，且**注释里也不能出现「$名:」**
+
+两条不同的问题：
+
+* **BOM**：PowerShell 5.1 读无 BOM 文件时按 ANSI(GBK) 解码，中文乱码。
+  本轮我在编辑 `watch-busy.ps1` 时把 BOM 弄丢了，导致中文全部乱码。
+* **`$名:` 形状**：`"$round:"` 会被当成**驱动器引用**（`$drive:` 语法）：
+
+      Variable reference is not valid. ':' was not followed by a valid
+      variable name character.
+
+  修法是写 `${round}:`。**但真正的教训是**：我改完之后，
+  为了解释原因在**注释里**原样写了 `"$round:"` ——
+  **注释不是安全区**，照样触发同一个 ParserError。
+  文件里连注释都不能出现那个形状。
+
+#### 附带发现：`>>` 重定向出来的是 **UTF-16LE**
+
+`cmd /c "powershell.exe ... >> log"` 写出的文件开头是 `ff fe`（UTF-16LE BOM）。
+之后所有按 UTF-8 读的工具看到的都是乱码。
+
+⇒ 结论：**不要用 shell 重定向收集 PowerShell 的输出**，
+让 Python 侧用显式 `encoding="utf-8"` 自己写日志。
+
+（这与早先记下的"只有 `cmd /c ... >> out` 是字节透明的"并不矛盾：
+那条讲的是 **cmd 自己**输出时的行为；这里是 **powershell.exe** 在写，
+它选了 UTF-16。）
+
+#### 工具化：`scripts/check-script-encoding.py`
+
+```
+python scripts/check-script-encoding.py          # 只检查
+python scripts/check-script-encoding.py --fix    # 检查并修 BOM / 行尾
+```
+
+它做三件事，每件都对应上面一个坑：
+
+1. 数 CRLF / LF-only（`.cmd`）；
+2. 找非 ASCII 行（`.cmd`）；
+3. 查 BOM **并用 PowerShell 自己的 `Parser` 做语法校验**（`.ps1`）——
+   语法这一项必须用真 Parser，正则判断会漏（`$名:` 这种就是）。
+
+它上线后立刻抓出两个我自己没发现的错：
+`watch-busy.ps1` 丢了 BOM，以及一处 `}` 不匹配的语法错误。
+
+#### 日志可证伪：「活着但空闲」与「压根没起来」不能长得一样
+
+监视器最初只在**状态发生变化**时写日志，于是它正常跑着、日志却是**空的**。
+这两件事的表现完全一样，我自己都被骗过一次（以为是进程没起）。
+
+⇒ 加了**启动横幅**（无条件写一行当前判定）。
+`test` 之外也留了 `--once` 子命令，便于手工确认。
+
+---
+
+### 20.7 这一轮的取舍说明
 
 * **没有改模型**：实测没有更快的可用模型，换 7B 只会更慢。
   我把证据留在 `ACCEPTANCE.md`，用户若要"质量换速度"可以自己换。

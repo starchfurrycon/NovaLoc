@@ -417,9 +417,19 @@ def monitor(
 
     was_busy = False
     free_since = 0.0
+    first = True
     while True:
         st = evaluate(cfg, library=library)
         now = time.time()
+        if first:
+            # ★ 启动横幅：**必须有**。
+            #
+            # 实测教训：一开始只在"状态发生变化"时写日志，
+            # 于是监视器正常跑着、日志却是**空的** ——
+            # "活着但空闲"和"压根没起来"完全无法区分。
+            # 用户（和我自己）都会以为它没工作。
+            say(f"启动：{st.describe()}　（数据根 {root}）")
+            first = False
         # 空闲要**连续空闲**超过 calm_down_s 才真正解除
         if st.busy:
             free_since = 0.0
