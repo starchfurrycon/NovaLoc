@@ -371,7 +371,41 @@ def _looks_useful(value: Any) -> bool:
         k_numeric = [k for k in value if _coerce_int(k) is not None]
         if k_numeric:
             return any(_coerce_str(value[k]) not in (None, "") for k in k_numeric)
-        return False
+        # ★★ **以原文为键**的对象：``{"vigilance requirements": "警戒要求"}``
+        #
+        # ## 这是一个真 bug 的修复点（实测）
+        #
+        # `to_translation_map` 的 docstring 明确写了它**支持**
+        # ``{"原文": "译文"}`` 形态，理由是实测 `translategemma:4b`
+        # 真的会这么回（要求按行给 ``编号<TAB>原文`` 时它回
+        # ``{"HP": "生命值", "MP": "魔法值"}`` —— 完整且正确）。
+        #
+        # 但 `_looks_useful` 只认**数字键**，于是这种**合法且正确**的
+        # 返回被判定为"没用" ⇒ `parse_json_loose` 直接丢弃 ⇒
+        # `parse_translations` 得到空映射 ⇒ 报"解析得到空映射" ⇒
+        # 每个命中的批次都白跑一次解析、掉到单条重试。
+        #
+        # 实测现场（真实游戏库，`072 Project_Useless Princess…`）：
+        #
+        #     stderr: 批 0（1 条）第 1 次失败：单条翻译失败（所有解析策略均失败，
+        #             原始输出前 200 字符：'{"vigilance requirements": "警戒要求"}'）
+        #             ：解析得到空映射
+        #
+        # 译文**明明是对的**（"警戒要求" 完全正确），却被当成失败。
+        # 两个模块对同一种形态的判断**互相矛盾** —— 这才是缺陷本体。
+        #
+        # ## 判据与反例
+        #
+        # 要求：键是**非平凡字符串**（长度 > 1），且**每个值都是非空字符串**。
+        #
+        # * 长度 > 1 是为了**不误收** ``{"t": "译文"}``（正常的单条形态，
+        #   它"有译文但没索引"，必须继续被拒）；
+        # * "每个值都是非空字符串"排除 ``{"i": 0, "t": "…"}`` 这类
+        #   值为数字的批条目（那种会被上面的数字键分支处理）。
+        return bool(value) and all(
+            isinstance(k, str) and len(k) > 1 and isinstance(v, str) and v.strip()
+            for k, v in value.items()
+        )
 
     if isinstance(value, (list, tuple)):
         if not value:
