@@ -1218,6 +1218,145 @@ def repair_dropped_masks(
     return out
 
 
+def _is_newline_slot(slot: str) -> bool:
+    r"""该槽位是否就是**一个换行**（``mask(newlines=True)`` 塞进来的）。
+
+    ``_placeholder_spans`` 把 ``\n`` 直接存进槽位，所以值就是 ``"\n"``。
+    这里同时认 ``\r\n``（有些引擎的行尾是 CRLF，屏蔽时必须整体当一个槽位，
+    否则会被拆成两个记号而模型只会保留一个）。
+    """
+    return slot in ("\n", "\r\n", "\r")
+
+
+#: 换行记号补回时允许吸附的**句读边界**（全角 + 半角）。
+#: 换行落在这里才是玩家读起来自然的断句；落在词中间会把一个词劈成两行。
+_BREAK_AFTER = "。！？；…!?;：:、）」』】》”’\"')）]}"
+
+
+def _snap_newline_pos(text: str, pos: int) -> int:
+    """把换行插入点吸附到最近的**句读边界之后**。
+
+    ## 为什么必须吸附
+
+    纯按比例算出来的位置落在**词中间**：
+
+        译文: '她使用一种特殊的战斗技巧，该技巧结合了来自她的家族的武术和魔法。'
+        比例:                                         ↑ 这里 —— 劈开了"武术"
+
+    换行在 RPG Maker 里就是**真的换行**，把一个词劈成两行是玩家看得见的损坏。
+
+    ## 判据
+
+    在 ``pos`` 附近的窗口里找**句读符**（``。！？；…，、`` 等），
+    把插入点放到**该句读符之后**。后向优先（保持行序不被拉长），
+    再前向；都没有就退回原位置。
+
+    ⚠️ 半径必须**有界**（12 个字符）：为了找句读而把换行挪得很远，
+    会让"第 2 行"的内容跑到第 3 行去 —— 那比劈开一个词更糟。
+    """
+    n = len(text)
+    pos = max(0, min(n, pos))
+    if pos <= 0 or pos >= n:
+        return pos
+    # `text[i - 1]` 就是"紧邻插入点左边的那个字符"。若它是句读符，
+    # 插入即落在句读**之后** ⇒ 正是我们要的。
+    for d in range(0, 13):
+        i = pos + d
+        if i <= 0 or i > n:
+            break
+        if text[i - 1] in _BREAK_AFTER:
+            return i
+    for d in range(1, 13):
+        i = pos - d
+        if i <= 0:
+            break
+        if text[i - 1] in _BREAK_AFTER:
+            return i
+    return pos
+
+
+def repair_missing_newlines(
+    masked_source: str,
+    translated_raw: str,
+    slots: list[str],
+) -> str | None:
+    r"""把模型**按行拆开、丢了换行记号**的译文重新补上换行。
+
+    ## 实测现场（真实游戏库，RPG Maker MV，占失败总数的 ~80%）
+
+    批量提示词里写着"**键是行号**"，于是模型看到**多行**条目时
+    很自然地**一段一行**地回答（``"1"`` 表示第二行），
+    而**不是**保留我们塞进原文的 ``⟦n⟧`` 换行记号：
+
+        源:   'She uses a special combat technique that combines \n
+                martial arts and magic inherited from her family.\n
+                Healthy girl with e…'
+        掩码: 'She uses … combines ⟦0⟧martial arts … family.⟦1⟧Healthy girl …'
+        模型: '{"0": "她使用一种特殊的战斗技巧，……", "1": "健康美丽的女孩，……"}'
+
+    两条译文**都对**、也**都全** —— 少的只是那个换行记号。
+    但 `verify_restored` 发现 ``⟦0⟧`` ``⟦1⟧`` 都没了 ⇒ 判致命 ⇒
+    **整条不产出译文**，玩家看到英文。实测这一个缺陷造成
+    **869 / 5099（17%）** 的条目失败，且**集中在多行块**
+    （每 500 条分桶：0% 0% 0.2% → **33% → 57% → 37%** → 0% 0% → 28%）。
+
+    ## 为什么这种情况可以安全地把记号补回去
+
+    ``⟦n⟧`` 的槽位值就是 ``"\n"``（见 :func:`_is_newline_slot`）。
+    **换行插在句子的哪个位置，语义上都是断行**，不存在"插错地方就出错"
+    的问题（这和 ``\V[1]`` 完全不同 —— 变量挪了位置指的就是别人）。
+    所以对**换行类**槽位，"按比例位置 + 句读吸附"插入是安全的。
+
+    ## 判据（结构性的，不用阈值）
+
+    只有当**所有**缺失槽位都是换行、且其它槽位一个不缺时才修复。
+    有任何**内容类**槽位缺失 ⇒ 返回 ``None``，仍走原来的
+    :func:`repair_dropped_masks`（或干脆拒绝）。
+    这条路径**不会**削弱"变量/颜色码不能丢"的保证。
+
+    ## 插入点怎么定（两级）
+
+    1. **按比例**：用 `_relative_position` 求该换行在原文里的相对位置，
+       乘译文长度 ⇒ 期望插入点。原文里其它未缺失记号的位置也算进去，
+       所以译文越长越准；
+    2. **吸附句读**：再用 :func:`_snap_newline_pos` 挪到最近的
+       ``。！？；…`` 之后，避免把一个词劈成两行。
+
+    从右往左插，避免坐标偏移（与 :func:`repair_dropped_masks` 同一纪律）。
+
+    返回修好的文本，或 ``None``（不改、交给调用方按原样处理）。
+    """
+    if not slots or not translated_raw:
+        return None
+
+    tgt_idx = set(mask_indices(translated_raw))
+    missing = [i for i in range(len(slots)) if i not in tgt_idx]
+    if not missing:
+        return None
+    # ★ 只处理"缺的全是换行"这一种情形。任何内容类槽位缺失 ⇒ 不碰。
+    if not all(_is_newline_slot(slots[i]) for i in missing):
+        return None
+
+    positions: list[tuple[int, int]] = []
+    for idx in missing:
+        frac = _relative_position(masked_source, idx)
+        raw_pos = max(0, min(len(translated_raw), int(round(frac * len(translated_raw)))))
+        positions.append((_snap_newline_pos(translated_raw, raw_pos), idx))
+
+    # 同一位置上的多个记号（极短的多行文本）按编号顺序一起插。
+    by_pos: dict[int, list[int]] = {}
+    for pos, idx in positions:
+        by_pos.setdefault(pos, []).append(idx)
+    if not by_pos:
+        return None
+
+    out = translated_raw
+    for pos in sorted(by_pos, reverse=True):
+        marks = "".join(f"⟦{i}⟧" for i in sorted(by_pos[pos]))
+        out = out[:pos] + marks + out[pos:]
+    return out
+
+
 def _mask_anchors(masked_source: str) -> dict[int, tuple[str, str]]:
     """``{记号编号: (左邻文本, 右邻文本)}``。
 

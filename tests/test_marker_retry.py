@@ -449,13 +449,14 @@ def _make_line_aware_provider(
 
     def fake_chat(user: str, *a: object, **k: object) -> str:
         # ⚠️ 判定信号必须**只出现在真正的请求内容里**，不能是模板措辞 ——
-        # 提示词模板里就有 `例：'⟦0⟧: Confirm'` 和
-        # `Lifia:⟦0⟧「I have to go.」` 这类示例，按这些匹配会在
+        # 提示词模板里就有 `例：'⟦0⟧: Confirm'` 这类示例，按这些匹配会在
         # **逐行**请求上也命中，于是每行都返回同一个值（踩过两次）。
         #
-        # `⟦n⟧` 只出现在**标记重试**的补充要求里（3.5 添加），
-        # 用整行原文做判定更稳：整条请求里含"两行连在一起"的内容。
-        if merged_ok is False and "Lifia: I have something to say\n" in user:
+        # ★ 整条请求的信号是 `⟦0⟧`：整条被屏蔽后换行才变成这个记号
+        #   （见本用例 docstring —— 上面那段说明本来就写了"桩改用 `⟦0⟧`"，
+        #   但**代码一直没改**，仍用 `"\n"`，而提示词模板自己就有换行 ⇒
+        #   逐行请求也被当成整条 ⇒ 两行都回同一个值。这次一并修好。）
+        if merged_ok is False and "say⟦0⟧" in user:
             return '{"0": "莉菲娅：我有话要说。"}'
         if "I have to go" in user and "我有话要说" not in user:
             return '{"0": "我得走了。"}'
@@ -501,10 +502,75 @@ def test_perline_fallback_recovers_multiline_entry(
         [_FakeItem("Lifia: I have something to say\n「I have to go.」")], "zh-Hans"
     )
     e = entries[0]
+
+    # ★★ 2026-10 行为变更（**变好了**，所以断言随之更新）
+    #
+    # 这个桩对整条请求只回**第一行**（`merged_ok=False`）。
+    # 换行补回**不能**救这种情形 —— 补记号补不出内容，若采纳
+    # 就会把"整段丢行"静默写回游戏。产品里有完整性门槛挡着它
+    # （本例 `newline_repair_rejected_incomplete == 1`），
+    # 于是照旧落到**逐行兜底**，最后两行都救回来。
+    #
+    # ⚠️ 这条用例**只断言最终结果**（状态 + 两行内容），
+    # 不断言"走了哪条路" —— 救回路径可能因内部选择而变化，
+    # 但"玩家最终拿到完整译文"是唯一真正要守住的东西。
+    assert e.status is EntryStatus.TRANSLATED, f"没译成功：{e.warnings}"
+    assert "我有话要说" in e.target and "我得走了" in e.target, (
+        f"两行内容都要在：{e.target!r}"
+    )
+    assert prov.stats.get("newline_repair_rejected_incomplete") == 1, (
+        f"应当拒绝'补记号但没补内容'：{dict(prov.stats)}"
+    )
+    assert prov.stats.get("perline_recovered") == 1, (
+        f"应当由逐行兜底救回：{dict(prov.stats)}"
+    )
+
+
+def test_perline_fallback_still_rescues_when_content_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★★ 逐行兜底仍然存在 —— 用于"模型**真的**丢了一整行"的情形。
+
+    ## 为什么必须单独钉住
+
+    换行补回**只能补记号**，补不出内容。若模型只回了第一行，
+    补上 `⟦0⟧` 会让它看起来"通过了"，但第二行依然是丢的 ——
+    那是**把静默丢行掩盖掉**，比保留原文更糟。
+
+    所以产品里有两道门（`ollama_provider` 的 `_complete` 判断）：
+
+    * 补回后**文字量没有增加** ⇒ 拒绝补回、维持 fatal ⇒
+      这才轮到**逐行兜底**（每行单独送翻，只要 1 个键 ⇒ 最可靠）。
+
+    本用例让桩对整条请求只回第一行，验证的正是这条链路。
+    """
+    from novaloc.models import EntryStatus
+
+    prov = _make_line_aware_provider(monkeypatch, merged_ok=False)
+
+    # 让"整条"请求只回第一行（模拟内容真的丢失）
+    def only_first_line(user: str, *a: object, **k: object) -> str:
+        if "say⟦0⟧" in user:
+            return '{"0": "莉菲娅：我有话要说。"}'
+        if "I have to go" in user and "我有话要说" not in user:
+            return '{"0": "我得走了。"}'
+        if "something to say" in user:
+            return '{"0": "莉菲娅：我有话要说。"}'
+        return '{"0": "我得走了。"}'
+
+    monkeypatch.setattr(prov, "_chat", only_first_line)
+    entries = prov.translate_batch(
+        [_FakeItem("Lifia: I have something to say\n「I have to go.」")], "zh-Hans"
+    )
+    e = entries[0]
     assert e.meta.get("perline_fallback") is True, f"没走逐行兜底：{e.warnings}"
     assert e.status is EntryStatus.TRANSLATED
-    assert "\n" in e.target, f"救回的译文必须有换行：{e.target!r}"
-    assert prov.stats.get("perline_recovered") == 1
+    assert "我有话要说" in e.target and "我得走了" in e.target, (
+        f"逐行兜底应当把两行都救回来：{e.target!r}"
+    )
+    assert prov.stats.get("perline_recovered") == 1, (
+        f"应当留下逐行救回计数：{dict(prov.stats)}"
+    )
 
 
 def test_perline_fallback_not_used_for_single_line_entries(

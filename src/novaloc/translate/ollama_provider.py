@@ -1175,6 +1175,104 @@ class OllamaTranslationProvider:
                         slots_all[local_i],
                         masked_source=masked_all[local_i],
                     )
+                    # ★★★ 换行补回必须**独立于 `ph_check.fatal` 判断**。
+                    #
+                    # 这里有一个**真正**的漏洞（实测发现）：
+                    # `verify_restored` 的占位符计数是拿"还原后文本里的记号"
+                    # 与 **`masked_source`** 比的；而模型丢掉 `⟦n⟧` 之后，
+                    # 还原函数找不到记号可换，**还原后文本里一个记号都没有**
+                    # ⇒ 计数 `0 == 0` 两侧相等、**顺序校验也被跳过**
+                    # ⇒ `ph_check.fatal` 是 **False**。
+                    #
+                    # 实测（`Lifia: I have something to say\n「I have to go.」`，
+                    # 模型只回第一行）：
+                    #
+                    #     verify_restored(masked_source=掩码) → fatal=True  ✅ 抓到
+                    #     verify_restored(masked_source=原文) → fatal=False ❌ 漏掉
+                    #
+                    # 也就是说：**"丢了整行"这件事只在一种调用口径下可见**。
+                    # 早先我把补回逻辑放在 `if ph_check.fatal:` 里面，
+                    # 于是"该抓的情形恰好不 fatal"⇒ 补回**从不执行**。
+                    #
+                    # 所以下面**无条件**试补换行，再看结果变好还是变坏。
+                    _nl_fixed = ph.repair_missing_newlines(
+                        masked_all[local_i], raw_masked, slots_all[local_i]
+                    )
+                    if _nl_fixed is not None:
+                        _nl_restored, _nl_check = ph.verify_restored(
+                            item.unit.source,
+                            _nl_fixed,
+                            slots_all[local_i],
+                            masked_source=masked_all[local_i],
+                        )
+                        # ⚠️ 两道门槛，缺一不可：
+                        #
+                        # ① **原本必须 fatal** —— 原本就通过的情况不能动
+                        #    （那是既有正确路径，尤其不能丢掉 `_call_single`
+                        #    已经拼好的多段结果）；
+                        # ② **补后必须真的更完整** —— 见下。
+                        #
+                        # 为什么需要 ②：`verify_restored` 对"内容整段丢失"
+                        # **看不见**。实测：
+                        #
+                        #     源  'Lifia: I have something to say\n「I have to go.」'
+                        #     模型 '莉菲娅：我有话要说。'          ← 第二行整段没了
+                        #     补后 '莉菲娅：我有话要说。⟦0⟧'      ← 记号补上了
+                        #     verify_restored(补后) → fatal=False  ❌ 它只看记号
+                        #
+                        # 也就是说"补上记号"会让原本 fatal 的结果变成不 fatal，
+                        # 但**第二行依然是丢的**。若直接采用，就把一个
+                        # 静默丢行写进了游戏 —— 比保留原文更糟。
+                        #
+                        # ⚠️ 判据用**结构性**口径：补回后是否**真的补进了内容**。
+                        #
+                        # 用"和原文比"当口径是错的 —— 实测一条**完全正确**的
+                        # 多行译文被它挡住：
+                        #
+                        #     源     'Lifia: I have something to say\n「I have to go.」'
+                        #     模型   '{"0": "莉菲娅：我有话要说。", "1": "我得走了。"}'  ← 两行都在
+                        #     拼回   '莉菲娅：我有话要说。⟦0⟧我得走了。'                ← 正确
+                        #     非空白 17 字符 vs 原文 32 字符 ⇒ 比值 0.53
+                        #
+                        # 中文本来就比英文短（这个项目的既定事实，`num_predict`
+                        # 的系数 2.2 就是为此而设），拿"和原文比"会把好译文误杀。
+                        #
+                        # 改用**"补回后比模型原始输出多了多少"**：补回只加记号，
+                        # 所以若补后还原出的**文字**明显多于模型原始输出，
+                        # 就说明原本的 fatal 是"记号缺失"而非"内容缺失"。
+                        # 反之（`'莉菲娅：我有话要说。'` 补成 `'…。⟦0⟧'`，
+                        # 文字量几乎没变）说明第二行**根本没被翻译**，
+                        # 补记号只是把丢行**掩盖**掉 —— 必须拒绝。
+                        _raw_n = len("".join((raw_masked or "").split()))
+                        _tgt_n = len("".join((_nl_restored or "").split()))
+                        _complete = _tgt_n > _raw_n
+                        if ph_check.fatal and not _nl_check.fatal and _complete:
+                            self.stats["newline_repaired"] = (
+                                self.stats.get("newline_repaired", 0) + 1
+                            )
+                            log.debug(
+                                "补回换行占位符：%s → %r",
+                                ph_check.describe(),
+                                _nl_fixed[:80],
+                            )
+                            restored, ph_check = _nl_restored, _nl_check
+                            raw_masked = _nl_fixed
+                        elif ph_check.fatal and not _nl_check.fatal:
+                            # 记号补上了但内容明显不全 ⇒ 明确记一笔，
+                            # 否则这种"看起来修好了"的情形无从追查。
+                            self.stats["newline_repair_rejected_incomplete"] = (
+                                self.stats.get(
+                                    "newline_repair_rejected_incomplete", 0
+                                )
+                                + 1
+                            )
+                            log.debug(
+                                "补回换行会掩盖丢内容（模型原始输出 %d 字符 → "
+                                "补后还原 %d 字符，文字量没有增加），已拒绝：%r",
+                                _raw_n,
+                                _tgt_n,
+                                _nl_fixed[:60],
+                            )
                     if ph_check.fatal:
                         # 占位符被破坏。先试**补回**再决定是否放弃：
                         # 实测 translategemma:4b 会把 `\C[6]`、`\N[2]`、`\n`
@@ -1232,6 +1330,22 @@ class OllamaTranslationProvider:
                             )
                             restored, ph_check = cleaned2, check3
                             raw_masked = cleaned
+                    # ★★ 这里**原本还有第二段**换行补回（无任何完整性门槛，
+                    # 直接采纳），它会把上面那段带门槛的版本**覆盖掉** ——
+                    # 于是"补上记号但第二行整段丢失"的结果照样被写回游戏。
+                    #
+                    # 实测（`_rescue_trace2.py`）：
+                    #
+                    #     源     'Lifia: I have something to say\n「I have to go.」'
+                    #     模型   '莉菲娅：我有话要说。'      ← 第二行整段没了
+                    #     补后   '莉菲娅：我有话要说。⟦0⟧'  ← 记号补上
+                    #     verify_restored(补后) → fatal=False  ❌ 它只数记号
+                    #     ⇒ 条目被判为"已翻译"，**丢行静默写回**
+                    #
+                    # 两段重复代码里**只有一段**能生效，而生效的是错的那段。
+                    # 这类"看似都在工作、实则互相抵消"的重复是本项目
+                    # 反复踩到的坑（见 ROADMAP §10 的"我自己错了两次"）。
+                    # ⇒ 只保留上面那一份带完整性判据的实现，此处不再重复。
                     if ph_check.fatal:
                         # 补不回来 —— 硬错误，绝不能写回游戏
                         self.stats["placeholder_fatal"] += 1
