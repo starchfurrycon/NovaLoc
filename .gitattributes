@@ -10,6 +10,30 @@
 # 从而让 diff 只反映真实改动。
 * text=auto eol=lf
 
+# ★★ 例外：`.cmd` / `.bat` **必须 CRLF**，必须覆盖上面的 `*` 规则。
+#
+# ## 为什么这条不能省（实测，而且很隐蔽）
+#
+# `cmd.exe` 解析 `LF-only` 的批处理文件时会**按字节偏移错位地读每一行**，
+# 把行首几个字符吃掉：
+#
+#     REM NovaLoc busy-watcher launcher (ASCII ONLY).
+#       -> 'sy-watcher' is not recognized as an internal or external command
+#     setlocal
+#       -> 'use' is not recognized ...
+#
+# 看起来像文件损坏，实际只是行尾不对。我为此绕了很久
+# （先怀疑中文路径、再怀疑 `%~dp0`、再怀疑变量展开）。
+#
+# ## 为什么本地测不出来
+#
+# 本机 `core.autocrlf=false`，而我是在工作区里**手工写成 CRLF** 的，
+# 所以一切正常。但 `* text=auto eol=lf` 会在**提交时把它归一化成 LF**，
+# 于是**新克隆 / CI 上检出的就是 LF-only** —— 故障只在别人那里出现。
+# `git commit` 时的 "CRLF will be replaced by LF" 警告就是这个信号。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
 # 二进制资源不要做任何换行/文本处理
 *.png binary
 *.jpg binary
