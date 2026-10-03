@@ -1350,11 +1350,21 @@ def run(
         help="翻译时是否跳过已有译文的条目（默认只翻待翻的）。",
     ),
     force: bool = typer.Option(False, "--force", help="强制重做字体注入与贴图汉化（忽略已有产物）。"),
+    bundles: bool = typer.Option(
+        False,
+        "--bundles",
+        help="抽取时也读 UnityFS 包里的文本（默认关：多数游戏包里没文本，且扫描有耗时）。",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="只做安全检查并打印将要执行的阶段，不写任何文件。"),
 ) -> None:
     """跑完整汉化流水线，实时显示进度与日志。"""
     ws = _open_ws(project_id)
     cfg = load_config()
+    if bundles:
+        # 只改这一次运行的配置，不落盘 —— 免得用户下次忘了关。
+        cfg = cfg.model_copy(
+            update={"pack": cfg.pack.model_copy(update={"scan_bundles": True})}
+        )
 
     bus = EventBus()
     ctx = Context(config=cfg, events=bus, workspace=ws, logger=None)
@@ -2217,6 +2227,11 @@ def auto(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="只列出将要处理哪些游戏，不做任何写入。"
     ),
+    bundles: bool = typer.Option(
+        False,
+        "--bundles",
+        help="抽取时也读 UnityFS 包里的文本（默认关：多数游戏包里没文本，且扫描有耗时）。",
+    ),
     json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
 ) -> None:
     """批量汉化整个游戏库；**就地写回**原游戏目录（先自动备份）。
@@ -2246,6 +2261,11 @@ def auto(
     from .engines import detect_engine  # noqa: PLC0415
 
     cfg = load_config()
+    if bundles:
+        # 只改这一次运行的配置，不落盘 —— 免得用户下次忘了关。
+        cfg = cfg.model_copy(
+            update={"pack": cfg.pack.model_copy(update={"scan_bundles": True})}
+        )
     # 用 paths.data_root() 而不是 cfg.paths —— 数据根是**派生值**，
     # 由 paths 模块按环境决定（见 config_path() 与 load_config()）。
     data_root = paths.data_root()

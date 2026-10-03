@@ -444,8 +444,101 @@ class UnityAdapter(EngineAdapter):
         except Exception as exc:  # noqa: BLE001
             report.errors.append(f"二进制资源字符串提取失败：{exc}")
 
+        # ---- UnityFS 包内文本（**可回写**，与上面的"原地等长"是两条路）----
+        #
+        # 默认关：实测本库 46 个含 UnityFS 的游戏里 25 个包里没文本，
+        # 有文本的绝大多数已官方汉化 ⇒ 打开它多数时候只增加耗时。
+        # 详见 `PackConfig.scan_bundles` 的 docstring。
+        if bool(getattr(self.cfg.pack, "scan_bundles", False)):
+            try:
+                units.extend(self._extract_bundles(game_dir, report))
+            except Exception as exc:  # noqa: BLE001
+                # 一个坏包不该让整条抽取失败（#41 的教训：异常别逃出去）
+                report.errors.append(f"UnityFS 包内文本提取失败：{exc}")
+
         report.units = len(units)
         return units, report
+
+    def _extract_bundles(self, game_dir: Path, report: ExtractReport) -> list[TextUnit]:
+        """从 UnityFS 包里提取**该翻的**文本，产出可回写的 `TextUnit`。
+
+        ## 与 `_extract_serialized` 的关键区别
+
+        * `_extract_serialized`：**原地等长**改写，译文装不下就跳过
+          （因为改长度会让内部偏移量失效）；
+        * 本方法：走 UnityPy 解析 typetree，**定点改写字段**再重打包
+          ⇒ 译文**不受原长度限制**。代价是重打包耗时（实测 188 MB 包约 7 s）。
+
+        ## `location`
+
+        * ``file``：包相对于游戏根目录的路径（apply 阶段据此在 `out/` 里找）；
+        * ``pointer``：`BundleSlot.pointer()` 的串（``包名:path_id:字段路径``），
+          **回写定位的唯一依据**（实测资产名常为空，不能用它当锚）。
+        """
+        from .unity_bundle import (  # noqa: PLC0415
+            BundleScanReport,
+            find_bundles,
+            scan_bundle,
+        )
+
+        limit = int(getattr(self.cfg.pack, "bundle_scan_limit", 0) or 0)
+        bundles = find_bundles(game_dir, limit=limit or None)
+        if not bundles:
+            return []
+
+        brep = BundleScanReport()
+        out: list[TextUnit] = []
+        for b in bundles:
+            brep.bundles_seen += 1
+            try:
+                slots = scan_bundle(b, report=brep)
+            except Exception as exc:  # noqa: BLE001
+                brep.errors.append(f"{b.name}: {exc}")
+                continue
+            for s in slots:
+                tag, src = s.source_text()
+                if not src.strip():
+                    continue
+                try:
+                    rel = str(b.relative_to(game_dir)).replace("\\", "/")
+                except ValueError:
+                    rel = b.name
+                out.append(
+                    TextUnit(
+                        uid=f"unitybundle:{s.pointer()}",
+                        source=src,
+                        # 槽位型是策划写的对白/旁白；裸字段多是 UI 文本。
+                        # 不细分是**故意**的：实测无法从字段名可靠区分
+                        # （`m_text` 既用于对白也用于按钮），细分只会猜错。
+                        kind=TextKind.UNKNOWN,
+                        context=f"UnityFS 包内字段 {s.field_path}（源语言 tag={tag}）",
+                        location=TextLocation(file=rel, pointer=s.pointer()),
+                        tags=["unity_bundle", f"bundle:{b.name}"],
+                        engine=self.id,
+                        adapter=self.id,
+                    )
+                )
+
+        report.skipped["unity_bundle_scanned"] = brep.bundles_seen
+        if out:
+            report.skipped["unity_bundle_units"] = len(out)
+        # ★ 跳过统计要**如实报出** —— 这是"为什么只找到这么几条"的依据，
+        #   也是"没有覆盖官方中文"的证明。
+        report.skipped["unity_bundle_has_target"] = brep.skipped_has_target
+        report.skipped["unity_bundle_bare_is_chinese"] = brep.skipped_bare_is_chinese
+        report.skipped["unity_bundle_no_source"] = brep.skipped_no_source
+        report.skipped["unity_bundle_punctuation"] = brep.skipped_bare_punctuation
+        if brep.errors:
+            report.errors.append(
+                f"UnityFS 扫描：{len(brep.errors)} 个包读取失败"
+                f"（首个：{brep.errors[0]}）"
+            )
+        log.info(
+            "UnityFS 包内文本：%s ⇒ 产出 %d 条可翻条目",
+            brep.summary(),
+            len(out),
+        )
+        return out
 
     def _slot_sidecar(self) -> Path | None:
         """记录"字符串在文件里的精确位置"的边车文件路径。
@@ -880,10 +973,87 @@ class UnityAdapter(EngineAdapter):
             res.warnings.extend(patch_note["warnings"])
             res.warnings.append(patch_note["summary"])
 
+        # ---- UnityFS 包内文本：定点改写 + 重打包 ----
+        #
+        # 同样只改 `out/` 里的**副本**（`bundle_paths` 显式给出路径，
+        # 绝不猜原游戏路径）。重打包耗时，所以只处理**真的有译文**的包。
+        try:
+            bundle_note = self._apply_bundles(out_dir, units, translations)
+        except Exception as exc:  # noqa: BLE001
+            bundle_note = None
+            res.warnings.append(f"UnityFS 包回写失败：{exc}")
+        if bundle_note:
+            res.files_written += bundle_note["files"]
+            res.warnings.extend(bundle_note["warnings"])
+            res.warnings.append(bundle_note["summary"])
+
         res.ok = res.files_written > 0 or not by_file
         if not res.ok and not res.error:
             res.error = "没有任何文件被写入"
         return res
+
+    def _apply_bundles(
+        self,
+        out_dir: Path,
+        units: list[TextUnit],
+        translations: dict[str, str],
+    ) -> dict[str, Any] | None:
+        """把译文写回 UnityFS 包（**只写 `out_dir` 里的副本**）。
+
+        只在"确实有译文要写"时才加载包 —— 实测一个 188 MB 包的
+        `env.save()` 要 6.83 s，对"包里没翻到东西"的游戏必须零代价。
+        """
+        from .unity_bundle import BundleApplyReport, apply_translations  # noqa: PLC0415
+
+        # {pointer: 译文}，并记下每个 pointer 属于哪个包
+        want: dict[str, str] = {}
+        bundle_paths: dict[str, Path] = {}
+        missing: dict[str, int] = {}
+        for u in units:
+            ptr = u.location.pointer
+            if not ptr or ":" not in ptr:
+                continue
+            tr = translations.get(u.uid)
+            if tr is None or not tr.strip():
+                continue
+            bname = ptr.split(":", 1)[0]
+            cand = out_dir / u.location.file
+            if cand.is_file():
+                want[ptr] = tr
+                bundle_paths.setdefault(bname, cand)
+            else:
+                # ★ 不静默：文件不在 out/ 里 ⇒ 这条**永远写不进去**，
+                #   必须报出来，否则用户以为"跑完了"但译文丢了。
+                missing[bname] = missing.get(bname, 0) + 1
+
+        if not want:
+            if not missing:
+                return None
+            # 有译文要写、但一个包都没找到 —— 这是**必须报**的情况
+            return {
+                "files": 0,
+                "warnings": [
+                    f"！UnityFS：{sum(missing.values())} 条译文找不到对应的包"
+                    f"（{len(missing)} 个包不在 out/ 里），这些译文**没有写入**"
+                ],
+                "summary": (
+                    f"UnityFS 包回写：0 个包（{sum(missing.values())} 条译文丢失）"
+                ),
+            }
+
+        rep = BundleApplyReport()
+        apply_translations(want, bundle_paths=bundle_paths, report=rep)
+        warnings = [f"! {e}" for e in rep.errors[:5]]
+        if rep.slots_skipped:
+            warnings.append(
+                f"UnityFS：{rep.slots_skipped} 条未能写入"
+                f"（目标字段非字符串 / 找不到 path_id）"
+            )
+        return {
+            "files": rep.bundles_written,
+            "warnings": warnings,
+            "summary": f"UnityFS 包回写：{rep.summary()}",
+        }
 
     def _apply_serialized(
         self,
