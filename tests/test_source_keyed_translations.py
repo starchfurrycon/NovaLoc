@@ -153,3 +153,62 @@ def test_single_char_keys_never_enable_the_new_rule(key: str) -> None:
     实测立刻红了。
     """
     assert _looks_useful({key: "译文"}) is False
+
+
+# ---------------------------------------------------------------------------
+# 6. ★★ 真正的断点：调用方**必须传 `sources`**
+#
+# 这是本缺陷的第二层，也是真正让现场失败的那一层。
+#
+# `to_translation_map` 靠 `sources` 做"原文 → 编号"反查。
+# `_call_single`（单条重试路径）原本写的是：
+#
+#     parse_translations(raw, expect_indices=[0])      # 没传 sources
+#
+# 于是键停在 ``"vigilance requirements"``、而查找用 ``0`` ⇒ 查不到
+# ⇒ `mapping` 为空 ⇒ 报"解析得到空映射" ⇒ 单条重试连续 3 次全败。
+#
+# ⚠️ **只修 `_looks_useful` 不够** —— 那样 `parse_json_loose` 会 ok=True，
+# 但 `mapping` 仍是空的。这个"双层"性质是本次最值得记住的一点：
+# 解析层放行了，**归位层**还得有依据才能真的拿到译文。
+# ---------------------------------------------------------------------------
+
+
+def test_without_sources_source_keyed_cannot_be_indexed() -> None:
+    """★ 不传 `sources` ⇒ 以原文为键的返回**无法**归位（空映射）。
+
+    这一条**故意**断言"坏行为"，用来固定"为什么必须传 sources"的因果。
+    """
+    mapping, res = parse_translations(
+        '{"vigilance requirements": "警戒要求"}', expect_indices=[0]
+    )
+    assert res.ok is True, "解析层应该放行（_looks_useful 已修）"
+    assert mapping == {}, "没有 sources 就反查不到 ⇒ 归位失败（这正是 bug）"
+
+
+def test_with_sources_same_payload_succeeds() -> None:
+    """★ 传了 `sources` ⇒ 同一份 payload 立刻能用。两相对照即因果。"""
+    mapping, _res = parse_translations(
+        '{"vigilance requirements": "警戒要求"}',
+        expect_indices=[0],
+        sources=["vigilance requirements"],
+    )
+    assert mapping == {0: "警戒要求"}
+
+
+def test_call_single_passes_sources() -> None:
+    """★★ **源码级**回归：`_call_single` 必须把 `sources` 传下去。
+
+    行为级测试要造一个带 `masked` 的 `TranslateItem` 并打桩 `_chat`，
+    代价大且脆；这里直接钉住**调用点**，因为断点就是"少传一个参数"，
+    而它没有任何运行时报错 —— 只会让译文静默丢失。
+    """
+    import inspect
+
+    from novaloc.translate import ollama_provider as op
+
+    src = inspect.getsource(op.OllamaTranslationProvider._call_single)
+    assert "sources=[masked]" in src or "sources=list(masked)" in src, (
+        "_call_single 没有把 sources 传给 parse_translations —— "
+        "以原文为键的返回会变成空映射，译文静默丢失"
+    )

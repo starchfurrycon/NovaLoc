@@ -722,7 +722,24 @@ class OllamaTranslationProvider:
         raw = self._chat(
             user, system=prompts.SYSTEM_PROMPT, n_items=1, src_chars=len(masked or "")
         )
-        mapping, res = parse_translations(raw, expect_indices=[0])
+        # ★ **必须传 `sources=[masked]`**（2026-10 修的第二个 bug）。
+        #
+        # `to_translation_map` 支持"以原文为键"的返回形态
+        # （``{"vigilance requirements": "警戒要求"}``），但那要靠 `sources`
+        # 反查"原文 → 编号"。这里原来**没传** `sources`，于是键是
+        # ``"vigilance requirements"``、而查找用的是 ``0`` ⇒ 查不到
+        # ⇒ `mapping` 为空 ⇒ 报"解析得到空映射"。
+        #
+        # 实测现场（真实游戏库 ``auto``，单条重试路径连续 3 次全败）：
+        #
+        #     批 0（1 条）第 1/2/3 次失败：单条翻译失败（无法解析为 JSON）
+        #         ：解析得到空映射：'{"vigilance requirements": "警戒要求"}'
+        #
+        # ⚠️ 单条请求的 `sources` 就是 **`masked`**（屏蔽换行后的原文）——
+        # 模型看到的就是它，所以它回吐的键也应该是它。
+        mapping, res = parse_translations(
+            raw, expect_indices=[0], sources=[masked]
+        )
         # ⚠️ 这里的处理**必须**认得出"模型按批格式回答单条请求"这一形态。
         #
         # ## 实测形态（真实游戏，ITEM_DESC）
@@ -1652,7 +1669,15 @@ class OllamaTranslationProvider:
                 n_items=len(sources),
                 src_chars=sum(len(s or "") for s in sources),
             )
-            mapping, res = parse_translations(raw, expect_indices=list(range(len(sources))))
+            # ★ 同样要传 `sources`：模型可能以**原文为键**回答，
+            # 不传就查不到编号 ⇒ 整批被当成"没解析出东西"而静默丢弃。
+            # 这里传的是它**实际看到**的文本（开了掩码就是掩码后的）。
+            seen_sources = masked_all if use_mask else sources
+            mapping, res = parse_translations(
+                raw,
+                expect_indices=list(range(len(sources))),
+                sources=list(seen_sources),
+            )
             if not mapping:
                 return targets
 
