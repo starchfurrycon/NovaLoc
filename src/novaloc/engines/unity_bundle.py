@@ -304,6 +304,20 @@ class BundleSlot:
     bare: bool = False
     """True 表示这是"裸文本字段"（无多语言结构）。"""
 
+    path_id: int = 0
+    """Unity 对象的 ``m_PathID`` —— **回写定位的唯一锚**。
+
+    ## 为什么必须用它（实测事故）
+
+    最初用**资产名**（``m_Name``）当锚，结果回写**全部失败**：
+    实测 ``.m_text`` 有 286 处分散在**不同对象**上，而这些对象的
+    ``m_Name`` **都是空字符串** ⇒ ``pointer`` 形如
+    ``包: :.m_text`` —— 286 条**指针完全相同**，
+    写回时无法区分是哪一个对象。
+
+    ``m_PathID`` 在包内唯一，是真正的身份。
+    """
+
     def source_text(self) -> tuple[str, str]:
         """挑出**源文**，返回 ``(tag, text)``；没有源文则 ``("", "")``。
 
@@ -327,13 +341,14 @@ class BundleSlot:
         )
 
     def pointer(self) -> str:
-        """回写定位串：``<包名>:<资产名>:<字段路径>``。
+        """回写定位串：``<包名>:<path_id>:<字段路径>``。
 
-        用**资产名**而不是 path_id 作锚：path_id 是 64 位有符号数，
-        在 JSON 里易失真；资产名在实测样本里唯一且稳定。
-        资产名为空时退化用 ``-``，此时靠字段路径在包内唯一匹配。
+        ⚠️ 用 ``path_id`` 而**不是**资产名 —— 实测资产名常为空
+        （286 处 ``.m_text`` 的 ``m_Name`` 都是 ``''``），
+        用它当锚会产出 286 条**相同**的指针，回写时无法区分。
+        见 `path_id` 字段的 docstring。
         """
-        return f"{self.bundle.name}:{self.asset or '-'}:{self.field_path}"
+        return f"{self.bundle.name}:{self.path_id}:{self.field_path}"
 
 
 def _text_is_chinese(text: str) -> bool:
@@ -520,6 +535,10 @@ def scan_bundle(
         v = tree.get("m_Name") if isinstance(tree, dict) else None
         if isinstance(v, str):
             asset_name = v
+        try:
+            obj_path_id = int(obj.path_id)
+        except (AttributeError, TypeError, ValueError):
+            obj_path_id = 0
 
         for fpath, items in _walk_containers(tree):
             variants: dict[str, str] = {}
@@ -532,7 +551,9 @@ def scan_bundle(
             if not variants:
                 continue
             rep.slot_groups += 1
-            slot = BundleSlot(bundle, asset_name, fpath, variants, bare=False)
+            slot = BundleSlot(
+                bundle, asset_name, fpath, variants, bare=False, path_id=obj_path_id
+            )
             if slot_needs_translation(slot):
                 rep.needs_translation += 1
                 slots.append(slot)
@@ -547,7 +568,10 @@ def scan_bundle(
 
         for fpath, text in _walk_bare(tree):
             rep.bare_fields += 1
-            slot = BundleSlot(bundle, asset_name, fpath, {"__bare__": text}, bare=True)
+            slot = BundleSlot(
+                bundle, asset_name, fpath, {"__bare__": text}, bare=True,
+                path_id=obj_path_id,
+            )
             if slot_needs_translation(slot):
                 rep.needs_translation += 1
                 slots.append(slot)
@@ -639,7 +663,7 @@ class BundleApplyReport:
 def apply_translations(
     translations: dict[str, str],
     *,
-    asset_names: dict[str, str] | None = None,
+    bundle_paths: dict[str, Path],
     backup_root: Path | None = None,
     pack: str = "lz4",
     report: BundleApplyReport | None = None,
@@ -647,16 +671,27 @@ def apply_translations(
     """把 ``{pointer: 译文}`` 回写进各自的 UnityFS 包。
 
     ``pointer`` 就是 `BundleSlot.pointer()` 的格式
-    （``<包名>:<资产名>:<字段路径>``）。**按包分组**后，每个包只
-    load/save 一次 —— 这一点很关键：实测单个 188 MB 包 save 要 6.83 s，
+    （``<包名>:<path_id>:<字段路径>``）。
+
+    ``bundle_paths`` 是 ``{包名: 实际文件路径}`` —— **必须由调用方给出**，
+    因为这里有个安全约束：流水线里应该写 ``out/`` 里的**副本**，
+    而不是原游戏目录（`prepare_out` 已经把游戏拷过去了）。
+
+    本函数**不做**"猜路径"，避免任何情况下误改原游戏。
+
+    ## 为什么按包分组
+
+    每个包只 load/save 一次 —— 实测单个 188 MB 包 save 要 6.83 s，
     逐条 save 会慢到不可接受。
 
     ## 安全侧（宁可不写）
 
     * 写之前校验目标字段**当前是 str**（`_set_path`），否则跳过并计数；
     * 译文为空 ⇒ 跳过（不把已有内容清成空）；
+    * 按 ``path_id`` **精确定位对象** —— 用资产名会撞车（实测 286 处
+      ``.m_text`` 的 ``m_Name`` 都是空串，指针会全部相同）；
     * 每个包写之前先备份到 ``backup_root``（若给了）；
-    * `env.save()` 的产物**先写临时文件**，成功后再替换原包 ——
+    * `env.save()` 的产物**先写临时文件**，再替换原包 ——
       避免中途失败留下半个包（那会让游戏**彻底打不开**）。
 
     ⚠️ 本函数**不保证**写出的包能被真实游戏加载。实测只验证到
@@ -666,14 +701,19 @@ def apply_translations(
     if not translations:
         return rep
 
-    # pointer -> (包名, 资产名, 字段路径)
-    groups: dict[str, list[tuple[str, str, str]]] = {}
+    # pointer -> (包名, path_id, 字段路径)
+    groups: dict[str, list[tuple[str, int, str]]] = {}
     for ptr in translations:
         parts = ptr.split(":", 2)
         if len(parts) != 3:
             rep.errors.append(f"pointer 格式不对，跳过：{ptr!r}")
             continue
-        groups.setdefault(parts[0], []).append((ptr, parts[1], parts[2]))
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            rep.errors.append(f"pointer 的 path_id 不是整数，跳过：{ptr!r}")
+            continue
+        groups.setdefault(parts[0], []).append((ptr, pid, parts[2]))
     rep.bundles_total = len(groups)
 
     try:
@@ -682,17 +722,10 @@ def apply_translations(
         rep.errors.append(f"UnityPy 不可用：{exc}")
         return rep
 
-    # 包名 -> 实际路径（由调用方通过 asset_names 提供，或在本目录里找）
-    name_to_path: dict[str, Path] = {}
-    for _bname, items in groups.items():
-        for _ptr, asset, _fp in items:
-            if asset_names and asset in asset_names:
-                name_to_path[_bname] = Path(asset_names[asset])
-
     for bname, items in groups.items():
-        bpath = name_to_path.get(bname)
-        if bpath is None or not bpath.exists():
-            rep.errors.append(f"{bname}: 找不到包文件，跳过 {len(items)} 条")
+        bpath = bundle_paths.get(bname)
+        if bpath is None or not bpath.is_file():
+            rep.errors.append(f"{bname}: 未提供包路径或文件不存在，跳过 {len(items)} 条")
             rep.slots_skipped += len(items)
             continue
         try:
@@ -702,44 +735,45 @@ def apply_translations(
             rep.slots_skipped += len(items)
             continue
 
-        # 资产名 -> 对象（同名时全部尝试）
-        by_asset: dict[str, list[Any]] = {}
+        # path_id -> 对象（★ 唯一锚，见 BundleSlot.path_id 的 docstring）
+        by_pid: dict[int, Any] = {}
         for obj in env.objects:
             if obj.type.name != "MonoBehaviour":
                 continue
             try:
-                tree = obj.read_typetree()
-            except Exception:  # noqa: BLE001
+                by_pid[int(obj.path_id)] = obj
+            except (AttributeError, TypeError, ValueError):
                 continue
-            nm = tree.get("m_Name") if isinstance(tree, dict) else None
-            by_asset.setdefault(nm if isinstance(nm, str) else "", []).append(obj)
 
         touched = 0
-        for ptr, asset, fpath in items:
+        for ptr, pid, fpath in items:
             text = translations.get(ptr, "")
             if not text.strip():
                 rep.slots_skipped += 1
                 continue
-            done = False
-            for obj in by_asset.get(asset, []):
-                try:
-                    tree = obj.read_typetree()
-                except Exception:  # noqa: BLE001
-                    continue
-                if not _set_path(tree, fpath, text):
-                    continue
-                try:
-                    obj.save_typetree(tree)
-                except Exception as exc:  # noqa: BLE001
-                    rep.errors.append(f"{ptr}: save_typetree 失败 {type(exc).__name__}")
-                    continue
-                done = True
-                break
-            if done:
-                touched += 1
-                rep.slots_written += 1
-            else:
+            obj = by_pid.get(pid)
+            if obj is None:
+                rep.errors.append(f"{ptr}: 找不到 path_id={pid} 的对象")
                 rep.slots_skipped += 1
+                continue
+            try:
+                tree = obj.read_typetree()
+            except Exception as exc:  # noqa: BLE001
+                rep.errors.append(f"{ptr}: read_typetree 失败 {type(exc).__name__}")
+                rep.slots_skipped += 1
+                continue
+            if not _set_path(tree, fpath, text):
+                rep.errors.append(f"{ptr}: 目标字段不是字符串或路径不存在")
+                rep.slots_skipped += 1
+                continue
+            try:
+                obj.save_typetree(tree)
+            except Exception as exc:  # noqa: BLE001
+                rep.errors.append(f"{ptr}: save_typetree 失败 {type(exc).__name__}")
+                rep.slots_skipped += 1
+                continue
+            touched += 1
+            rep.slots_written += 1
 
         if not touched:
             continue

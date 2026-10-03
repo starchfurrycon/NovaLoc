@@ -765,6 +765,147 @@ def unity_strings_cmd(
         console.print(f"  [yellow]! {e}[/yellow]")
 
 
+@app.command("bundle-strings")
+def bundle_strings_cmd(
+    game_dir: str = typer.Argument(..., help="Unity 游戏根目录（含 *_Data 的那一层）。"),
+    output: str = typer.Option(
+        "", "--out", "-o", help="清单输出路径（CSV）。默认写到数据根目录下的 exports/。"
+    ),
+    limit: int = typer.Option(
+        0, "--limit", help="最多扫描多少个包（0 = 全部，按文件从大到小）。"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON。"),
+) -> None:
+    r"""从 Unity 的 **AssetBundle（UnityFS）** 里只读找出**该翻的**文本。
+
+    ## 为什么单独一个命令（而不是混进 `unity-strings`）
+
+    两者读的是**完全不同的**东西：
+
+    * `unity-strings` 读 ``.assets`` / ``level*`` 这类**序列化资源**，
+      用长度前缀找候选串，**不改写**（改长度会让偏移量失效）；
+    * 本命令读 **UnityFS 包**，用 UnityPy 解析 typetree，
+      **能安全回写**（`apply` 阶段定点改写单个字符串）。
+
+    混在一起会让"能不能改"这件事变得含糊。
+
+    ## ⚠️ 先说清期望值（实测，不是保守估计）
+
+    本库 46 个含 UnityFS 的游戏里，**25 个包里根本没有文本**、
+    11 个"仅少量"，只有约 10 个有真文本。原因通常是：
+
+    * 文本在 ``.assets`` 里（`unity-strings` 已经覆盖）；
+    * 包里只有贴图/音频/字体（实测 ``Isekai Sex Boutique`` 的 5857 个包
+      只有 ``'Enter Your Name'`` 这类 UI 标签与字体名）；
+    * 内容**已经是中文**（实测 ``Jerez's Arena`` 的 9619 个槽位组里
+      8708 个自带中文 ⇒ 只有 300 条真需翻译，且多为 UI 标签）。
+
+    ⇒ **本命令很可能报 0 条，那是正确答案，不是故障。**
+
+    ## 跳过规则（这是本命令的核心价值）
+
+    每个槽位都会检查"**是不是已经有中文了**"：
+
+    * 有 ⇒ **跳过**（实测某些游戏 90% 以上的槽位自带官方汉化，
+      再翻一遍会**覆盖官方译文**）；
+    * 裸字段（``m_text`` 等）同样检查，且**纯标点/极短碎片**也跳过
+      （``'……'``、``'喀。'`` 没有可翻译内容）。
+
+    清单会写明跳过原因与数量，便于核对。
+    """
+    global _JSON_MODE
+    _JSON_MODE = json_output
+
+    from .engines.unity_bundle import (  # noqa: PLC0415
+        BundleScanReport,
+        find_bundles,
+        scan_bundle,
+    )
+
+    root = Path(game_dir).expanduser()
+    if not root.is_dir():
+        _fail(f"游戏目录不存在或不是目录：{root}")
+
+    with console.status("只读扫描 UnityFS 包…", spinner="dots"):
+        bundles = find_bundles(root, limit=limit or None)
+        rep = BundleScanReport()
+        slots: list = []
+        for b in bundles:
+            rep.bundles_seen += 1
+            slots.extend(scan_bundle(b, report=rep))
+
+    if json_output:
+        _echo_json(
+            {
+                "ok": True,
+                "bundles": rep.bundles_seen,
+                "bundles_with_text": rep.bundles_with_text,
+                "slot_groups": rep.slot_groups,
+                "bare_fields": rep.bare_fields,
+                "needs_translation": len(slots),
+                "skipped": {
+                    "has_target": rep.skipped_has_target,
+                    "no_source": rep.skipped_no_source,
+                    "source_is_target": rep.skipped_source_is_target,
+                    "bare_is_chinese": rep.skipped_bare_is_chinese,
+                    "bare_punctuation": rep.skipped_bare_punctuation,
+                },
+                "errors": rep.errors,
+            }
+        )
+        return
+
+    if not bundles:
+        console.print("[yellow]这个游戏目录里没有 UnityFS 包。[/yellow]")
+        console.print(
+            "[dim]若文本在 `.assets` / `level*` 里，用 `novaloc unity-strings`。[/dim]"
+        )
+        return
+
+    console.print(f"[bold]UnityFS 包 {rep.bundles_seen} 个[/bold]（含文本 {rep.bundles_with_text} 个）")
+    console.print(f"[dim]{rep.summary()}[/dim]")
+
+    if not slots:
+        console.print(
+            "[yellow]没有需要翻译的包内文本。[/yellow]\n"
+            "[dim]这通常是**正确答案**：文本不在包里、或者**已经是中文**。"
+            "上面的跳过统计就是依据。[/dim]"
+        )
+        for e in rep.errors[:5]:
+            console.print(f"  [yellow]! {e}[/yellow]")
+        return
+
+    # 写清单（只读命令，不碰游戏目录）
+    import csv as _csv  # noqa: PLC0415
+
+    dest = (
+        Path(output).expanduser()
+        if output
+        else paths.data_root() / "exports" / "unity_bundles.csv"
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("w", encoding="utf-8-sig", newline="") as fh:
+        w = _csv.writer(fh)
+        w.writerow(["bundle", "asset", "field_path", "source_tag", "source", "pointer"])
+        for s in slots:
+            tag, src = s.source_text()
+            w.writerow([s.bundle.name, s.asset, s.field_path, tag, src, s.pointer()])
+
+    console.print(
+        f"[green]✅ 找到 [bold]{len(slots)}[/bold] 条**需要翻译**的包内文本[/green]"
+    )
+    console.print(f"清单已写到 [bold]{dest}[/bold]")
+    console.print(
+        "[dim]跳过原因（这些是**故意**跳过的，不是漏掉）：[/dim]\n"
+        f"[dim]  已有中文 {rep.skipped_has_target}　"
+        f"无源文 {rep.skipped_no_source}　"
+        f"裸字段已是中文 {rep.skipped_bare_is_chinese}　"
+        f"纯标点/极短 {rep.skipped_bare_punctuation}[/dim]"
+    )
+    for e in rep.errors[:5]:
+        console.print(f"  [yellow]! {e}[/yellow]")
+
+
 @app.command("scan")
 def scan(
     game_dir: str = typer.Argument(..., help="游戏根目录（不是 data/ ，是包含 data/ 的那一层）。"),

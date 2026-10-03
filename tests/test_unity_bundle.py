@@ -344,21 +344,45 @@ def test_pointer_round_trips_through_parsing() -> None:
         Path("scriptableobjects_assets_all.bundle"),
         "MyAsset",
         ".csvLines[0].localizeText[3]",
+        path_id=1234567890123456789,
     )
     ptr = s.pointer()
-    assert ptr == "scriptableobjects_assets_all.bundle:MyAsset:.csvLines[0].localizeText[3]"
+    assert ptr == (
+        "scriptableobjects_assets_all.bundle:1234567890123456789:"
+        ".csvLines[0].localizeText[3]"
+    )
     parts = ptr.split(":", 2)
     assert len(parts) == 3
     assert parts[0] == "scriptableobjects_assets_all.bundle"
-    assert parts[1] == "MyAsset"
+    assert int(parts[1]) == 1234567890123456789, "path_id 必须能无损还原为整数"
     assert parts[2] == ".csvLines[0].localizeText[3]"
 
 
-def test_pointer_tolerates_empty_asset_name() -> None:
+def test_pointer_is_unique_across_slots_in_different_objects() -> None:
+    """★ **回归**：不同对象上的同名字段必须产出**不同**指针。
+
+    实测事故：最初用**资产名**当锚，而 286 处 ``.m_text`` 所在对象的
+    ``m_Name`` **都是空字符串** ⇒ 指针全部相同（``包: :.m_text``），
+    回写时无法区分、整批失败。改用 ``path_id`` 后解决。
+    """
     from pathlib import Path
 
-    s = BundleSlot(Path("a.bundle"), "", ".m_text")
-    assert s.pointer() == "a.bundle:-:.m_text"
+    b = Path("a.bundle")
+    s1 = BundleSlot(b, 111, ".m_text", {"__bare__": "A"}, bare=True, path_id=111)
+    s2 = BundleSlot(b, 111, ".m_text", {"__bare__": "B"}, bare=True, path_id=222)
+    assert s1.pointer() != s2.pointer(), "同名字段在不同对象上必须可区分"
+    assert s1.pointer() == "a.bundle:111:.m_text"
+    assert s2.pointer() == "a.bundle:222:.m_text"
+
+
+def test_pointer_with_zero_path_id_still_parses() -> None:
+    """``path_id`` 取不到时退化为 0，指针仍须可解析（不然会静默丢条目）。"""
+    from pathlib import Path
+
+    s = BundleSlot(Path("a.bundle"), "", ".m_text", path_id=0)
+    ptr = s.pointer()
+    assert ptr == "a.bundle:0:.m_text"
+    assert int(ptr.split(":", 2)[1]) == 0
 
 
 def test_src_tags_are_lowercase() -> None:
