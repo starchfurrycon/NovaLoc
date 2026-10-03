@@ -51,7 +51,10 @@ param(
     [string]$DataRoot = $(if ($env:NOVALOC_DATA_ROOT) { $env:NOVALOC_DATA_ROOT } else { 'D:\NovaLoc' }),
 
     # 只跑一轮就退出（用于自检；正常常驻时为 $false）。
-    [switch]$Once
+    [switch]$Once,
+
+    # 只做启动前预检并退出（用于"启动前先量一下"）。
+    [switch]$Preflight
 )
 
 $ErrorActionPreference = 'Continue'
@@ -100,6 +103,12 @@ $exe = Join-Path $repoRoot '.venv\Scripts\novaloc.exe'
 $outLog = Join-Path $DataRoot 'watch-service.out.log'
 $errLog = Join-Path $DataRoot 'watch-service.err.log'
 
+# ★ 数据根必须**在这里**就建出来，不能等到下面。
+#   原先 `New-Item` 在 `$Preflight` 分支**之后** ⇒ `-Preflight` 退出时
+#   目录还不存在 ⇒ `Write-ServiceLog` 抛
+#   `IOException`（文件路径的一部分不存在）⇒ 预检什么都写不出来。
+New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
+
 function Write-ServiceLog {
     param([string]$Message)
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -109,6 +118,47 @@ function Write-ServiceLog {
     [System.IO.File]::AppendAllText(
         $outLog, $line, (New-Object System.Text.UTF8Encoding($false))
     )
+}
+
+# ---- ★ 预扫描：大库的"第一轮"会很久，必须先跟用户说清 ------------------------
+#
+# ## 为什么要有这一步
+#
+# `--watch-only` 启动时会把**库里现有的游戏全部记为"已见"**（`bootstrap`），
+# 然后才进守望循环。在大库上这一步可能要好几分钟 ——
+# 期间服务**看起来像卡住了**（没有任何输出）。
+#
+# ⚠️ 这里**不能只看目录数**就下结论：实测 `E:\lush\1\newlytransport` 的
+#    `resolve()` 只要 **0.05 秒**（NTFS 的目录项缓存很快），
+#    而有 1.2 万个文件的树也只要 **0.8 秒**。
+#    真正的耗时在**其它**环节（`bootstrap` 逐个建 `.novaloc.json` 等）。
+#    所以这一段的产物是"**给用户一个可对照的基线**"，
+#    而不是"预测要跑多久" —— 后者我量不出来，就不假装能量。
+if ($Preflight) {
+    if (-not (Test-Path $Library)) {
+        Write-ServiceLog "FATAL: 游戏库不存在（$Library）"
+        exit 1
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $top = @(Get-ChildItem -LiteralPath $Library -Directory -ErrorAction SilentlyContinue)
+    $sw.Stop()
+    Write-ServiceLog (
+        "预检：库={0} 顶层目录={1} 列举耗时={2:N0}ms" -f `
+        $Library, $top.Count, $sw.ElapsedMilliseconds
+    )
+    Write-ServiceLog (
+        "预检结论：启动时要先把这 {0} 个目录全部记为'已见'；" -f $top.Count
+    )
+    Write-ServiceLog (
+        "  之后只处理**此后新出现**的游戏。若这一步很久，是正常现象，不是卡住。"
+    )
+    if ($top.Count -gt 500) {
+        Write-ServiceLog (
+            "  ⚠️ 库较大（>{0} 个目录），首轮 bootstrap 可能需要几分钟。" -f 500
+        )
+    }
+    Write-ServiceLog "预检完成（ExitCode=0）"
+    exit 0
 }
 
 if (-not (Test-Path $exe)) {
@@ -126,6 +176,8 @@ New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
 Write-ServiceLog "守望服务启动：库=$Library 间隔=${IntervalSeconds}s 数据根=$DataRoot"
 
 $round = 0
+#: 连续"秒退"的轮次计数。见下面快速退出检测的说明。
+$quickExits = 0
 while ($true) {
     $round++
     Write-ServiceLog "第 $round 轮：开始扫描（--watch-only，不重跑现有游戏）"
@@ -159,10 +211,55 @@ while ($true) {
     # 而且 `>>` 是**追加**，不截断。
     $cmdLine = '"{0}" auto "{1}" --watch-only --interval {2} >> "{3}" 2>> "{4}"' -f `
         $exe, $Library, $IntervalSeconds, $outLog, $errLog
+    $roundStart = Get-Date
     & cmd.exe /c $cmdLine
     $code = $LASTEXITCODE
+    $ranSec = [Math]::Round(((Get-Date) - $roundStart).TotalSeconds, 1)
 
-    Write-ServiceLog "第 $round 轮退出（code=$code），5 秒后重启"
+    Write-ServiceLog "第 $round 轮退出（code=$code，运行了 ${ranSec}s），5 秒后重启"
+
+    # ---- ★ 快速退出检测：别把"每 5 秒空转"当成正常 ---------------------------
+    #
+    # ## 为什么必须检测
+    #
+    # 曾经有一个 bug：`if not todo: return` 在守望循环**之前**无条件返回
+    # （见 `tests/test_watch_cli_blocks.py` 的 docstring）。
+    # 后果是子进程 0.9 秒就退出（**退出码 0**，完全"成功"），
+    # 而这个 while 循环忠实地"5 秒后重启" ⇒ 日志刷成一片
+    #
+    #     第 N 轮：开始扫描 … 第 N 轮退出（code=0），5 秒后重启
+    #
+    # **看起来服务一直在工作**，实际每 5 秒空转一轮，新游戏永远等不到处理。
+    # 光看日志根本发现不了 —— 直到我实测"这个命令会不会阻塞"才暴露。
+    #
+    # ## 判据
+    #
+    # 一轮"正常运行"必然**至少跑满一个扫描间隔**（子进程会在
+    # `time.sleep(interval)` 上待着）。所以：
+    #
+    #   运行时长 < 间隔的一半  ⇒ 子进程没进循环 ⇒ **异常**
+    #
+    # 连续 3 次异常就**停手并大声报错**，不再无脑重启 ——
+    # 免得把一个真 bug 掩盖成"服务在跑"。
+    if ($ranSec -lt ($IntervalSeconds / 2)) {
+        $quickExits++
+        Write-ServiceLog (
+            "  ⚠️ 异常：本轮只运行了 ${ranSec}s（应 ≥{0}s）—— 子进程似乎没进守望循环。" -f `
+            [int]($IntervalSeconds / 2)
+        )
+        Write-ServiceLog "  ⚠️ 连续异常次数：$quickExits / 3"
+        if ($quickExits -ge 3) {
+            Write-ServiceLog (
+                "  ✗ 连续 3 轮都是秒退 ⇒ 停手，不再重启。" +
+                "请检查 `novaloc auto <库> --watch-only` 是否能正常阻塞（它不该立刻退出）。"
+            )
+            Write-ServiceLog "  提示：本仓库有专门的守卫测试 —— tests/test_watch_cli_blocks.py"
+            exit 2
+        }
+    } else {
+        $quickExits = 0
+    }
+
     if ($Once) { exit $code }
     Start-Sleep -Seconds 5
 }

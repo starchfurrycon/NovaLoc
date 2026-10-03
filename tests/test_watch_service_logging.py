@@ -331,3 +331,72 @@ def test_ps1_scripts_parse_cleanly() -> None:
         if " 个错误" in ln and "PARSE_DONE" not in ln
     ]
     assert not bad, "有 .ps1 存在语法错误（中文脚本常见原因是缺 BOM）：" + "; ".join(bad)
+
+
+# ---------------------------------------------------------------------------
+# 4) ★ 别再让"秒退"冒充"服务在跑"
+#
+# ## 为什么需要这组测试
+#
+# 曾经有一个 bug：CLI 里 `if not todo: return` 在守望循环**之前**
+# 无条件返回 ⇒ `--watch-only` 0.9 秒就退出，**退出码 0**（完全"成功"）。
+# 而服务脚本忠实地"5 秒后重启" ⇒ 日志刷成一片
+#
+#     第 N 轮：开始扫描 … 第 N 轮退出（code=0），5 秒后重启
+#
+# **看起来服务一直在工作**，实际每 5 秒空转一轮，新游戏永远等不到处理。
+# 这条缺陷喂给"日志内容正确性"那组测试**完全测不出来** ——
+# 日志内容确实是对的，它只是毫无意义。
+#
+# ⇒ 判据必须是"**这一轮跑了多久**"，而不是"日志写了什么"。
+# ---------------------------------------------------------------------------
+def _ps1_code_without_comments() -> str:
+    """脚本源码，**去掉注释块**后再做结构断言。
+
+    ⚠️ 必须去注释：我在脚本里为了让后人看懂，**引用了**那段出问题的
+    日志文本（`第 N 轮：开始扫描` / `5 秒后重启`），
+    第一版守卫把注释当代码而误报。
+    """
+    text = PS1.read_text(encoding="utf-8-sig")
+    # 去掉 <# ... #> 块注释（脚本开头的 .SYNOPSIS 就是一大块）
+    import re
+
+    text = re.sub(r"<#.*?#>", "", text, flags=re.DOTALL)
+    # 去掉行注释（注意别把 `#:` 这类也当成代码；这里一并去掉，够用）
+    return "\n".join(
+        re.sub(r"(?<![:#])#.*$", "", ln) for ln in text.splitlines()
+    )
+
+
+def test_service_measures_round_duration() -> None:
+    """★★ 服务必须**量每一轮跑了多久** —— 这是"秒退"的唯一判据。
+
+    只比较退出码是没用的：那个 bug 的退出码就是 0。
+    """
+    src = _ps1_code_without_comments()
+    assert "Stopwatch" in src or "roundStart" in src, (
+        "服务没有测量本轮运行时长 ⇒ 无法区分'正常守望'与'秒退空转'"
+    )
+    assert "$ranSec" in src, "应当把本轮运行秒数算出来再判断"
+    assert "($Get-Date) - $roundStart" in src or "(Get-Date) - $roundStart" in src
+
+
+def test_service_detects_quick_exit() -> None:
+    """★★ 秒退必须被判定为**异常**，而且要能停手，不能无脑重启。"""
+    src = _ps1_code_without_comments()
+    assert "$quickExits" in src, "缺少连续秒退计数"
+    assert "$quickExits++" in src, "没有在秒退时累加"
+    assert "$quickExits = 0" in src, "正常一轮后必须清零（否则会误判）"
+    # 必须有"停手"的分支（exit 非 0），而不是永远 Start-Sleep 5 重启
+    assert "exit 2" in src, "连续秒退后应当停手并返回非 0，别把 bug 掩盖成'在跑'"
+    assert "tests/test_watch_cli_blocks.py" in src, (
+        "报错信息里应当指向那个守卫测试，方便后来人定位"
+    )
+
+
+def test_service_reports_interval_in_guard_message() -> None:
+    """守卫的阈值要与 `-IntervalSeconds` 相关，不能写死一个魔数。"""
+    src = _ps1_code_without_comments()
+    assert "$IntervalSeconds / 2" in src, (
+        "秒退阈值应当从扫描间隔推导（一轮正常运行至少跑满一个间隔）"
+    )

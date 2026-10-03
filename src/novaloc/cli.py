@@ -2375,10 +2375,33 @@ def auto(
     if limit > 0:
         todo = todo[:limit]
     if not todo:
-        console.print("[green]没有需要处理的游戏。[/green]")
+        # ★★ 这里**不能**直接 return —— 必须先让守望模式接管。
+        #
+        # ## 这个 bug（实测，守望服务从未真正工作过）
+        #
+        # `--watch-only` 的语义是"不处理现有游戏，只等新游戏"，
+        # 于是它进到这个分支时 `todo` **本来就是空的**（这正是它要的效果）。
+        # 而原先这里无条件 `return` ⇒ 进程立刻退出 ⇒
+        # **守望循环从来没被执行过**。
+        #
+        # 现象很有迷惑性：`watch-new-games.ps1` 看到子进程退出（code=0）
+        # 就"5 秒后重启"，日志里刷出一片
+        #     第 N 轮：开始扫描 … 第 N 轮退出（code=0）
+        # 看起来"服务在正常工作"，实际**每 5 秒空转一轮**，
+        # 新游戏永远等不到处理。
+        #
+        # 直接证据（`.scratch/run/watch_e2e.log` + 服务日志）：
+        #     novaloc auto <空库> --watch-only --interval 20
+        #     实际耗时 0.9 秒（应当 ≥20 秒才说明循环在 sleep）
+        console.print("[green]没有需要处理的现有游戏。[/green]")
         if json_output:
-            _echo_json({"library": str(root), "done": [], "skipped": [e.to_dict() for e in skipped]})
-        return
+            _echo_json({"library": str(root), "done": [],
+                        "skipped": [e.to_dict() for e in skipped]})
+        if not (watch or watch_only):
+            return
+        console.print(
+            "[dim]（--watch-only/--watch：跳到守望循环，继续等新游戏。）[/dim]"
+        )
 
     # ---------------------------------------------------------------
     # 逐个游戏：建项目 → 跑流水线 → 写回
