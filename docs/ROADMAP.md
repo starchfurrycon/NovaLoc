@@ -1758,4 +1758,168 @@ got='【被动效果】最大生命值增加 5%。 需要等级：1'          �
 
 ---
 
+## 15. #49 ★★★ 颜色码丢失被判"占位符崩掉" —— 一个游戏 **47% 的对话被丢成空白**
+
+### 15.1 现象
+
+工作区 `f4b03ca791a9`（9,777 条的游戏）失败记录：
+
+| 项 | 值 |
+| --- | --- |
+| 失败 | 2,245 条 |
+| 其中同一原因 | **2,239 条** |
+| 原因 | `placeholder_broken: 丢失占位符：['\c[0]', '\c[2]', '⟦0⟧', '⟦1⟧', '⟦2⟧']` |
+
+而模型输出是**完整可用的中文**，只是没保留颜色码：
+
+    源    '\c[2]【Passive】\c[0]Chance to hold on when receiving fatal damage. \nRequired LV:30.'
+    模型  '【被动】当受到致命伤害时，有几率保持防御。'
+
+判死 ⇒ `target = ''` 写回 ⇒ **玩家看到空对话框**。
+47% 的对话就这么没了 —— 而它们本可显示成"没有颜色的正常中文"。
+
+### 15.2 根因：两处判据**完全相反**，错的那处更早生效
+
+| 位置 | 对 `\c[n]` / `\i[n]` 的判定 |
+| --- | --- |
+| `guards._STYLE_ONLY_PLACEHOLDER_RE` | **样式** |
+| `placeholders._is_style_only_mark` | **内容** |
+
+`guards.py` 那里甚至**写明了**理由：
+
+> `\c[0]`（颜色）、`\i[4]`（图标）、`\|`（停顿）—— 只是**配色/停顿**变了，
+> 文字一个字不少 ⇒ **不该判死**
+
+但 `placeholders` 的判定**更早生效**（`verify_restored(...).fatal`
+在 `guards.guard()` **之前**）⇒ 那条宽容规则**永远没机会执行**。
+
+⇒ 又一个"同一条判据在两个地方实现、结论相反、只有一个能生效"的坑
+（与 §10 记的那两个同类）。
+
+### 15.3 还有一层：同一个槽位被**判了两次、结论相反**
+
+`verify_restored` 第 4 层校验算的是
+`_is_droppable_mark(slots[i])`，**只对内容类**报缺失。
+但它把结果写成 ``⟦i⟧`` 塞进 `check.missing`，
+接着 `fatal_missing` 又拿 ``⟦i⟧`` 去问 `_is_droppable_mark`：
+``⟦1⟧`` 既不在样式表里、也不匹配 `\[cCiI]\[\d+\]`
+⇒ 被判成**内容类** ⇒ 致命。
+
+直接后果：`repair_dropped_masks` 已把 `\c[2]` 和换行补回、
+只剩 `⟦1⟧`（= `\c[0]`）没补 ⇒ 判死 ⇒ 对话变空白。
+
+### 15.4 修法（三处，缺一不可）
+
+1. `_is_style_only_mark` 认颜色/图标（`\c[n]` `\C[n]` `\i[n]` `\I[n]`），
+   与 `guards` 对齐。⚠️ `\V[n]` `\N[n]` `\S[n]` `\P[n]` `\D` `\R` `\$` `\G`
+   **仍判内容** —— 游戏会把它们替换成真实数据。
+2. `fatal_missing` 改用 `_is_droppable_mark`（顺带放过 `%%`）；
+   两处判据从此走**同一个函数**。
+3. `PlaceholderCheck` 记住 `slots`，把 ``⟦i⟧`` 解回 `slots[i]` 再判；
+   解不开或越界时**保守判死**。
+
+### 15.5 验证：拿**真实失败条目**重放（`.scratch/_replay_failures.py`）
+
+用每条失败记录里存下的 `meta.raw_model_output` 重放当前判定链：
+
+    失败条目：2,035
+    ✅ 可救回     : 1,960   （96.3%）
+    ❌ 仍判死     : 70
+    （没有 raw 输出、无法重放）：5
+
+    ✅ 安全检查通过：救回的条目里**没有**一条丢内容类记号
+
+★ **最后那条才是最要紧的。**"救回得多"不等于"修对了" ——
+  如果救回的条目里混着"真的丢了 `\V[1]`"的，那就是把判据废掉了。
+  所以这份统计里专门加了这一项，它必须是 **0**。
+
+剩下 70 条逐条看过，属于**应该**判死的两类：
+
+* 模型回了垃圾（源是长插件标签，输出就俩字 `'确认'`）；
+* 真的丢了内容类记号，或 `order_changed`（`\mhp[3]`/`\atk[2]` 这组
+  被剥掉后编号顺序乱了）。
+
+### 15.6 ★ 顺带修掉一个"测试之间互相污染"（全量套件红 9 条）
+
+`tests/test_unity_nested_data_dir.py`（§16 那个 Unity 修复的测试）
+第一版在**模块级**写了：
+
+    os.environ.setdefault("NOVALOC_DATA_ROOT", r"D:\NovaLoc\_unity_nested_test")
+
+`os.environ` 是**进程全局**的，而 pytest 整个套件跑在**同一进程**里 ⇒
+这条之后的所有测试都以为数据根是那个临时目录：
+
+    E  处理失败：缺少 2 个离线模型：PP-OCRv6_det_medium.onnx…；
+       请放到 D:\NovaLoc\_unity_nested_test\models\rapidocr
+
+⇒ `test_image_alpha_preserved.py` / `test_ocr_cache.py` 共 **9 条**
+  在**全量套件**里必挂、单独跑全绿；而失败信息指向 OCR 模型，
+  **和 Unity 毫无关系** —— 极难从失败信息反推到真凶。
+
+改成 `monkeypatch.setenv`（自动复原）+ `tmp_path_factory` 隔离。
+
+★ 我一开始把它误判成"与后台 `auto` 抢 GPU 导致的资源竞争"，
+  因为**停掉后台任务后仍然失败**才排除这个解释。
+  教训：**"单独跑绿、全量跑红"首先要怀疑顺序污染，不是资源。**
+
+---
+
+## 16. #50 ❌ 嵌套一层的 Unity 工程被判成 `unknown`（已修）
+
+### 16.1 现象：7 个游戏被漏掉
+
+`unknown` 桶里 11 个"有已知封包"的游戏，其中 **7 个是 Unity**，
+特征文件**一个不缺**：
+
+    Dusk City Uncensored\Dusk City_Data\    globalgamemanagers/resources.assets/level0/app.info  ✅
+    Escape Dungeon 2 …\EscapeDungeon2_Data\                                                  ✅
+    Sisters Connect\imokone_Data\                                                            ✅
+    amusement parklust\AmusementPark-lust_Data\                                              ✅
+    Succubus Affection\SuccubusAffection1.09E_Data\                                          ✅
+    UdonGame\UdonGame_Data\                                                                  ✅
+    Witch of Eclipse-v1.0.3-Steam\Witch of Eclipse_Data\                                     ✅
+
+却判成 `unknown`（conf **0.0**）⇒ **连抽取都不跑**。
+
+### 16.2 根因：`detect` 用 `game_dir.iterdir()`，只扫顶层
+
+这些游戏**多套了一层包装目录**：
+
+    Dusk City Uncensored\Dusk City_Data\resources.assets
+    ^^^^^^^^^^^^^^^^^^^^ ← 发布者名/包装目录；顶层看不到 *_Data
+
+这类"解包后又套一层"在搬运/自制发布里非常常见。
+
+### 16.3 修法：限定层数的递归查找（`_find_unity_dirs`）
+
+* 显式栈按层下潜，**上限 4 层** —— 库里存在 4 GB 级的 `resources.assets`，
+  不能为了找 `_Data` 把整个游戏遍历一遍；
+* 跳过 `backup`/`save`/`node_modules`/`.git` 等目录；
+* 命中后**不再往下**；
+* 层数用尽时记 `log.debug`，**不静默截断**。
+
+### 16.4 ★ 三处必须一起改，只改检测会更难排查
+
+| 位置 | 原实现 | 修后 |
+| --- | --- | --- |
+| `detect` | `iterdir()` | `_find_unity_dirs` |
+| `extract_text` 收集扫描根 | `iterdir()` | `_find_unity_dirs` |
+| `_extract_serialized` | `iterdir()` | `_find_unity_dirs` |
+
+**只修 `detect` 会把状态变成"认出了引擎、却一条文本都没抽到"** ——
+那比原来（判成 `unknown`）**更难排查**，因为状态字段显示成功了。
+
+### 16.5 实测效果
+
+    修复前  7/7 判定 = unknown   conf = 0.0
+    修复后  7/7 判定 = unity
+              6 个 Mono 后端  conf = 0.85
+              Dusk_City（IL2CPP）conf = 0.60
+
+`detect` 的 `evidence` 现在会明确写出嵌套位置。
+回写**不需要**改：`location.file` 一直是相对游戏根的路径，
+嵌套路径在 `out/` 下会落在与源相同的位置（回归测试专门钉住这一点）。
+
+---
+
 本文档应随代码变更同步更新。**如果你发现某处描述与代码不符，以代码为准并修本文档。**
