@@ -346,7 +346,46 @@ class LooseFilesAdapter(EngineAdapter):
                         )
                         res.files_written += 1
                 else:
-                    lines = target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+                    # ★★ `newline=""` 必须**两边都加**，否则会把 CRLF 悄悄改成 LF。
+                    #
+                    # ## 实测（`.scratch/_ini_change_probe.py`）
+                    #
+                    # GameMaker 游戏的 `options.ini`，跑一次 `auto` 之后：
+                    #
+                    #     跑之前  b'[Windows]\r\nSleepMargin=10\r\nUsex64=True\r\n'  40 字节
+                    #     跑之后  b'[Windows]\nSleepMargin=10\nUsex64=True\n'       37 字节
+                    #
+                    # 差的 3 个字节**全是 `\r`**。文件内容一字未改，
+                    # 但行尾从 CRLF 变成了 LF。
+                    #
+                    # ## 根因：`read_text` 默认做**通用换行翻译**
+                    #
+                    # `Path.read_text()` 没传 `newline=` 时，底层 `open()` 用
+                    # `newline=None` ⇒ **读进来时 `\r\n` 就被翻译成 `\n`**。
+                    # 之后 `splitlines(keepends=True)` 拿到的行尾已经是 `\n`，
+                    # 最后 `write_text(newline="")`（正确地）不做翻译地写出 ——
+                    # 于是 `\r` **在读取那一步就已经丢了**。
+                    #
+                    # 最小复现（不依赖任何本项目代码）：
+                    #
+                    #     p.write_bytes(b'a\r\nb\r\n')
+                    #     p.read_text().splitlines(keepends=True)   # ['a\n', 'b\n']
+                    #
+                    # ## 为什么必须修
+                    #
+                    # ① 这是**与翻译无关的改动**：`.ini`/`.cfg` 里一条译文都没有，
+                    #    文件却被改了 ⇒ 用户拿到的是"没汉化、配置还被动了"；
+                    # ② 某些程序（尤其 Windows 原生 / C# 写的启动器）**依赖 CRLF**，
+                    #    LF 可能导致配置解析异常；
+                    # ③ 它会让"文件是否被改"的校验出现**假阳性** ——
+                    #    哈希变了但内容没变，排查时极易被带偏。
+                    #
+                    # ⚠️ 影响面**不止 `.ini`**：`loose` 引擎走这条 `else` 分支的
+                    #    所有非 JSON 文本文件（`.txt`/`.cfg`/`.xml`/…）都在丢 CRLF。
+                    #    这可能是本仓库里影响面最广的一处静默改动。
+                    lines = target.read_text(
+                        encoding="utf-8", errors="replace", newline=""
+                    ).splitlines(keepends=True)
                     n = 0
                     for u in us:
                         ln = int(u.location.line or 0)
@@ -354,6 +393,8 @@ class LooseFilesAdapter(EngineAdapter):
                             lines[ln - 1] = lines[ln - 1].replace(u.source, translations[u.uid], 1)
                             n += 1
                     if n:
+                        # `newline=""` 与上面的读取**成对**：读时不翻译、写时也不翻译，
+                        # 这样原文的 `\r\n` 会**原样**保留（只改被替换的那段文字）。
                         target.write_text("".join(lines), encoding="utf-8", newline="")
                         res.files_written += 1
             except Exception as exc:  # noqa: BLE001

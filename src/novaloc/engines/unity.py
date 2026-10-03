@@ -1186,7 +1186,13 @@ class UnityAdapter(EngineAdapter):
         return False
 
     def _apply_lines(self, path: Path, units: list[TextUnit], tr: dict[str, str]) -> int:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        # ⚠️ `newline=""` 必须与下面的写入**成对**：`read_text()` 默认做
+        # **通用换行翻译**（`\r\n` → `\n`），不加这个参数会把原文的 CRLF
+        # 静默改成 LF —— 内容一字未改、字节数却变了。实测见
+        # `.scratch/_ini_change_probe.py`（`options.ini` 40 → 37 字节）。
+        lines = path.read_text(
+            encoding="utf-8", errors="replace", newline=""
+        ).splitlines(keepends=True)
         n = 0
         for u in units:
             ln = int(u.location.line or 0)
@@ -1202,7 +1208,9 @@ class UnityAdapter(EngineAdapter):
 
         最简做法：给每个被抽出的 msgid 在其后插入/替换 msgstr。
         """
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # ⚠️ 同上：不加 `newline=""` 会把 CRLF 改成 LF。PO 文件尤其要紧 ——
+        # gettext 工具链对行尾敏感。
+        text = path.read_text(encoding="utf-8", errors="replace", newline="")
         n = 0
         for u in units:
             src = u.source
@@ -1221,7 +1229,10 @@ class UnityAdapter(EngineAdapter):
         return n
 
     def _apply_kv(self, path: Path, units: list[TextUnit], tr: dict[str, str]) -> int:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        # ⚠️ 见 `_apply_lines` 的说明：`newline=""` 保住原文的 CRLF。
+        lines = path.read_text(
+            encoding="utf-8", errors="replace", newline=""
+        ).splitlines(keepends=True)
         n = 0
         for u in units:
             ln = int(u.location.line or 0)
@@ -1230,7 +1241,13 @@ class UnityAdapter(EngineAdapter):
             m = re.match(r"^([^=:]+[=:])(.*)$", lines[ln - 1].rstrip("\r\n"))
             if not m:
                 continue
-            tail = "\n" if lines[ln - 1].endswith("\n") else ""
+            # ★ 行尾必须**原样搬过来**，不能硬写成 `"\n"`。
+            #   原先写的是 `tail = "\n" if ... else ""`，于是原文的 `\r\n`
+            #   被换成了 `\n` —— 即便读取那一步修好了，这里仍会丢 `\r`。
+            #   改成从原行里**切出**真实的行尾。
+            raw_line = lines[ln - 1]
+            body_len = len(raw_line) - len(raw_line.rstrip("\r\n"))
+            tail = raw_line[len(raw_line) - body_len:] if body_len else ""
             lines[ln - 1] = f"{m.group(1)}{tr[u.uid]}{tail}"
             n += 1
         if n:

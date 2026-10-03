@@ -430,7 +430,13 @@ class RenPyAdapter(EngineAdapter):
                 res.files_skipped += 1
                 continue
             try:
-                lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+                # ⚠️ `newline=""` 必须与下面的写入**成对**：`read_text()` 默认做
+                # **通用换行翻译**（`\r\n` → `\n`），不加这个参数会把 `.rpy`
+                # 原文的 CRLF 静默改成 LF —— 内容一字未改、字节数却变了。
+                # 实测（同机制）：`.scratch/_ini_change_probe.py`，40 → 37 字节。
+                lines = target.read_text(
+                    encoding="utf-8", newline=""
+                ).splitlines(keepends=True)
             except Exception as exc:  # noqa: BLE001
                 res.warnings.append(f"{rel} 读取失败：{exc}")
                 res.files_skipped += 1
