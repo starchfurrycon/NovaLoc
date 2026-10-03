@@ -1731,10 +1731,55 @@ class OllamaTranslationProvider:
                         bad = True
                         why = "mask_left"
                         break
+                    # ★★ 补回被模型**整段丢掉**的样式记号（颜色/停顿等）。
+                    #
+                    # ## 为什么这里必须补（实测）
+                    #
+                    # `_call_single` **不做** `repair_dropped_masks` ——
+                    # 那是整条路径（§3 的 `if ph_check.fatal` 分支）才有的步骤。
+                    # 于是同一个输入在两条路径上结果不同（实测
+                    # `.scratch/_single_vs_batch_color.py`，3/3 轮一致）：
+                    #
+                    #     输入        '\c[0]Suck it.'
+                    #     模型原样    '{"0": "吃不了就别来!"}'   ← 压根没回 ⟦0⟧
+                    #     _call_single → '吃不了就别过来。'       ← 颜色码没了
+                    #     translate_batch → '\c[0]吃不了就别过来。' ← 颜色码**保住了**
+                    #
+                    # 差别就在整条路径调了 `repair_dropped_masks`：
+                    # 它按"记号在原文里的左邻字符/相对位置"把 `⟦0⟧` 插回去，
+                    # 位置**确定**时才算成功（见它的 docstring），
+                    # 所以不是猜。
+                    #
+                    # ⇒ 逐行救援路径漏了这一步，导致救回的译文**丢配色**。
+                    #    补上它，救回的译文才与整条路径同样完整。
+                    #
+                    # ⚠️ 只在**能确定位置**时补（函数内部保证，否则返回 None）；
+                    #    补完仍要过下面的 `guard`，数量/内容是否齐全照样复查。
+                    repaired_one = ph.repair_dropped_masks(
+                        line_mask.text, got_one, line_mask.slots
+                    )
+                    if repaired_one is not None:
+                        # 采用前必须确认**所有**槽位都真的补回来了。
+                        #
+                        # ⚠️ `_call_single` 返回的是**掩码形态**（带 `⟦i⟧`），
+                        #    不是还原后的文本 —— 这一点我从它的返回路径确认过
+                        #    （`return parts[0]` 等分支返回的都是 `mapping` 里的
+                        #    值，而 `mapping` 来自模型原始输出）。
+                        #    所以这里比的是"记号是否齐全"，与整条路径一致。
+                        restored_one = ph.unmask(repaired_one, line_mask.slots)
+                        if not ph.remaining_masks(restored_one) and all(
+                            s in restored_one for s in line_mask.slots
+                        ):
+                            got_one = repaired_one
+                            self.stats["perline_style_repaired"] = (
+                                self.stats.get("perline_style_repaired", 0) + 1
+                            )
                     # ★ **逐行**过守卫 —— 见上面"代价与安全"的说明
                     r_one = guard(
                         one,
-                        got_one,
+                        ph.unmask(got_one, line_mask.slots)
+                        if line_mask.slots
+                        else got_one,
                         max_chars=None,
                         length_ratio=self.cfg.translate.max_chars_ratio,
                         target_lang=target_lang,
