@@ -2484,7 +2484,9 @@ def auto(
     from .core.events import EventBus  # noqa: PLC0415
     from .pipeline.stages import Pipeline  # noqa: PLC0415
 
-    def run_pipeline(pipe: Pipeline, ws: Workspace) -> bool:
+    def run_pipeline(
+        pipe: Pipeline, ws: Workspace, *, skip_extract_if_cached: bool = False
+    ) -> bool:
         r"""跑九个阶段；**抽不到文本就立刻掉头**，不白跑后面七个。
 
         返回 ``False`` 表示"这个游戏没有可译文本"（调用方标 `no_text`）。
@@ -2504,11 +2506,40 @@ def auto(
         实测这个库里有 4 个游戏是"引擎不认识"、另外还有若干"认得出但抽不到"
         （见 `.scratch/_which_unsupported.py`）。190 个待处理游戏里这类占一部分，
         每个白烧几分钟 ~ 十几分钟，累计是可观的。
+
+        ## ★ 续跑时为什么可以跳过抽取（`--backlog` 每轮的代价）
+
+        `--backlog` 让自启的守望服务每轮都**重扫全库待办**，于是
+        `stage_extract` 会对**每一个**待办游戏重跑一遍。
+
+        实测抽取不便宜（`.scratch/_eta_sample.py`，12 个游戏真抽）：
+
+            Alien maze                        39.7 s
+            amusement parklust                59.1 s
+            [WaterRing] ZZZ_Game (2025.01)   339.9 s
+            rpgmaker 层                        0.5 ~ 6 s
+
+        按这个量级，174 个游戏重扫一轮要**1~3 小时**，而其中
+        **已经抽好的游戏完全没必要再抽** —— 抽取产物就在
+        `extracted/units.jsonl` 里。
+
+        所以：workarea 里**已经有 units** 且是我们自己在续跑
+        （`skip_extract_if_cached=True`）时，直接跳过抽取。
+        这既省掉每轮的重扫，也让"重启一次"真正接近"秒过"。
+
+        ⚠️ 只在 `--backlog` 路径上传 True。手工跑
+        `novaloc run` / `auto`（不带 `--backlog`）时**不**跳过 ——
+        那时用户的意图可能就是"源文件变了，重新抽一遍"。
         """
+        units_already = bool(ws.load_units())
         for sid, _label in _stage_order():
             if sid == "images_scan" and not ws.load_units():
                 # 还没抽到文本就轮到扫贴图 ⇒ 直接跳出去（下面统一判 no_text）
                 break
+            if sid == "extract" and units_already and skip_extract_if_cached:
+                # 续跑：抽取产物已在本地，跳过（见 docstring 的成本实测）
+                log.debug("已有 %d 条抽取产物，跳过重新抽取", len(ws.load_units()))
+                continue
             if sid == "detect":
                 pipe.stage_detect()
             elif sid == "extract":
@@ -2550,7 +2581,11 @@ def auto(
             ctx = Context(config=cfg, events=bus, workspace=ws, logger=None)
             pipe = Pipeline(ws, ctx)
             with ws.lock(what="auto"):
-                has_units = run_pipeline(pipe, ws)
+                # ★ 只有 `--backlog` 路径允许跳过已缓存的抽取结果：
+                #   它是"续跑"语义，而重扫全库的代价实测 1~3 小时/轮。
+                has_units = run_pipeline(
+                    pipe, ws, skip_extract_if_cached=backlog
+                )
 
             units = ws.load_units()
             ent.units = len(units)

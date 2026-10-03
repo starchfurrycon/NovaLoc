@@ -192,3 +192,141 @@ def test_source_does_not_return_before_watch_block() -> None:
         f"`if not todo:` 分支里还有无条件的 return（行 {offenders}）—— "
         "这会让 `--watch-only` 永远进不了守望循环（见本测试的 docstring）"
     )
+
+
+# ----------------------------------------------------------------------
+# `--backlog`：让自启的单一服务同时覆盖「积压」和「新游戏」
+# ----------------------------------------------------------------------
+
+
+def test_backlog_blocks_on_empty_library(tmp_path: Path) -> None:
+    """`--watch-only --backlog` 空库时也必须等（不能立刻退出）。
+
+    它比 `--watch-only` 多了一段"先补积压"的逻辑，
+    而那段逻辑同样不能把守望循环吃掉。
+    """
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (tmp_path / "data").mkdir()
+    log = tmp_path / "out.log"
+
+    proc = _spawn(
+        ["auto", str(lib), "--watch-only", "--backlog", "--interval", "5"],
+        tmp_path,
+        log,
+    )
+    try:
+        time.sleep(12)
+        assert proc.poll() is None, (
+            f"`--backlog` 在空库上退出了（退出码={proc.returncode}）\n"
+            f"{log.read_text(encoding='utf-8', errors='replace')[-1200:]}"
+        )
+    finally:
+        _kill(proc)
+
+
+def test_backlog_clears_todo_so_the_loop_processes_it() -> None:
+    r"""★ 结构守卫：`--backlog` 必须**阻止** `todo` 被清空。
+
+    ## 为什么这条必须存在
+
+    缺口原文：自启清单里只有守望服务，而它跑 `--watch-only`，
+    其语义是"不重跑库里现有游戏"。于是"关机 → 开机"之后：
+
+        * 全库翻译进程没了（手工起的，不在自启清单里）；
+        * 唯一自启的服务**明确拒绝**处理积压；
+        * 而且完全不报错 —— 守望日志一切正常。
+
+    `--backlog` 的作用就是让 `todo` **不被清空**（从而被下面的
+    `for i, ent in enumerate(todo, 1)` 处理）。
+
+    行为测试覆盖不到"重启"这个场景，所以这里钉住结构：
+    清空 `todo` 的那句必须**同时**受 `not backlog` 约束。
+    """
+    import ast
+    import inspect
+
+    import novaloc.cli as climod
+
+    src = inspect.getsource(climod)
+    tree = ast.parse(src)
+
+    # 找出给 todo 赋 [] 的语句，看它所在的 if 条件里有没有 backlog
+    offending: list[int] = []
+    guards_ok = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if "backlog" in names and "watch_only" in names:
+            guards_ok = True
+        # 这个 if 的 body 里有没有 `todo = []`
+        for stmt in node.body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "todo" for t in stmt.targets
+                )
+                and isinstance(stmt.value, ast.List)
+                and not stmt.value.elts
+            ):
+                if "backlog" not in names:
+                    offending.append(node.lineno)
+
+    assert not offending, (
+        f"有 `todo = []` 没有同时受 `not backlog` 约束（行 {offending}）—— "
+        "这会让 `--backlog` 形同虚设，重启后积压永远不被处理"
+    )
+    assert guards_ok, "找不到同时判断 watch_only 与 backlog 的条件 —— 结构可能被改坏了"
+
+
+def test_skip_extract_is_only_enabled_for_backlog() -> None:
+    r"""★ 结构守卫：跳过抽取只允许在 `--backlog` 路径上开启。
+
+    ## 为什么必须限定
+
+    `run_pipeline(skip_extract_if_cached=True)` 会**完全跳过抽取**。
+    如果对手工 `novaloc auto` 也开，那用户的"我改了源文件，重抽一遍"
+    就会被静默忽略 —— 属于"优化吃掉功能"。
+
+    只在 `--backlog`（续跑语义）上开，才是安全的。
+
+    ▲ 注意：判据必须**先去掉 docstring** 再搜。第一版直接搜原文，
+    结果被本测试自己的文档字符串里那句 `skip_extract_if_cached=True`
+    命中了 —— 测试抓到的是自己的说明文字。
+    """
+    import ast
+    import inspect
+    import re
+
+    import novaloc.cli as climod
+
+    tree = ast.parse(inspect.getsource(climod))
+
+    # 把模块/函数/类的 docstring 行号收集起来，等会儿按行剔除
+    doc_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            body = getattr(node, "body", None)
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                first, last = body[0].lineno, body[0].end_lineno or body[0].lineno
+                doc_lines.update(range(first, last + 1))
+
+    lines = inspect.getsource(climod).splitlines()
+    code = "\n".join(
+        ln for i, ln in enumerate(lines, 1) if i not in doc_lines
+    )
+
+    assert "skip_extract_if_cached=backlog" in code, (
+        "跳过抽取没有绑定到 backlog —— 可能被无条件开启了"
+    )
+    # 去掉 docstring 后，不该再有无条件 True 的写法
+    bad = re.findall(r"skip_extract_if_cached\s*=\s*True", code)
+    assert not bad, f"发现无条件开启跳过抽取的写法 {len(bad)} 处"
