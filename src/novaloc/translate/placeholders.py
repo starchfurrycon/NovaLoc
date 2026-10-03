@@ -531,12 +531,43 @@ def remaining_masks(text: str) -> list[str]:
 #: * ``\>`` ``\<`` ``\^`` —— 快速显示 / 立即显示 / 不等待
 #: * ``\\`` —— 转义出一个真正的反斜杠字符
 #:
-#: 对应的**内容类**是 ``\V[n]`` ``\N[n]`` ``\P[n]`` ``\C[n]`` ``\I[n]``
-#: ``\S[n]``（带编号，值会变）、``\D`` ``\R``（插件表达式）、
-#: ``\$`` ``\G``（货币）。这些丢了游戏会显示错东西，必须判死。
+#: 对应的**内容类**是 ``\V[n]`` ``\N[n]`` ``\P[n]`` ``\S[n]``（带编号且
+#: 值会变）、``\D`` ``\R``（插件表达式）、``\$`` ``\G``（货币）。
+#: 这些丢了游戏会显示错东西，必须判死。
 _STYLE_ONLY_MARKS: frozenset[str] = frozenset(
     {"\\{", "\\}", "\\!", "\\.", "\\|", "\\>", "\\<", "\\^", "\\\\"}
 )
+
+#: 带编号、但**只影响外观**的标记（`\c[N]` 颜色、`\i[N]` 图标）。
+#:
+#: ## ★ 为什么要和 `guards._STYLE_ONLY_PLACEHOLDER_RE` 保持一致（实测）
+#:
+#: 这两处原先**判定相反**，后果在真实游戏上被放大：
+#:
+#: * `guards.py` 把 `\c[n]`/`\i[n]` 当**样式**（它写明"只是配色变了，
+#:   文字一个字不少 ⇒ 不该判死"）；
+#: * 这里把"带 `[数字]` 的一律当内容"⇒ `fatal_missing` 判死。
+#:
+#: 而这里的判定**更早生效**（`verify_restored(...).fatal` 在
+#: `guards.guard()` **之前**），于是 `guards.py` 那条宽容规则**永远没机会执行**。
+#:
+#: 直接证据（工作区 `f4b03ca791a9`，9,777 条的那个游戏）：
+#:
+#:     失败 2,245 条，其中 **2,239 条**都是同一个原因：
+#:         placeholder_broken: 丢失占位符：['\\c[0]', '\\c[2]', '⟦0⟧', '⟦1⟧', '⟦2⟧']
+#:     而模型输出是**完整可用**的中文，只是没保留颜色码：
+#:         源    '\c[2]【Passive】\c[0]Chance to hold on when receiving fatal damage. \nRequired LV:30.'
+#:         模型  '【被动】当受到致命伤害时，有几率保持防御。'
+#:
+#: 47% 的对话被整条丢弃、对话框变**空白** —— 而它们本可显示成
+#: "没有颜色的正常中文"。**丢装饰远好于丢内容。**
+#:
+#: ## 哪些仍然必须判死
+#:
+#: ``\V[n]`` ``\N[n]`` ``\P[n]`` ``\S[n]`` —— 游戏会把它们**替换成真实数据**
+#: （变量值、角色名…），丢了玩家就看到错的东西；```\D`` ``\R`` ``\$`` ``\G```
+#: 同理。**只有颜色与图标算样式。**
+_STYLE_ONLY_INDEXED_RE = re.compile(r"\\[cCiI]\[\d+\]")
 
 #: 内容类的单字符命令（不带编号的那些）。
 _CONTENT_SINGLE_MARKS: frozenset[str] = frozenset(
@@ -547,16 +578,24 @@ _CONTENT_SINGLE_MARKS: frozenset[str] = frozenset(
 def _is_style_only_mark(mark: str) -> bool:
     """这个占位符是不是**纯样式**记号（丢了不算坏）。
 
-    带编号的（``\\V[1]`` / ``\\S[3]`` …）一律算内容类 —— 值会变，
-    丢了游戏就显示错东西。只有明确列在 :data:`_STYLE_ONLY_MARKS`
-    里的单字符命令才算样式。
+    三类算样式：
+
+    1. 明确列在 :data:`_STYLE_ONLY_MARKS` 里的单字符命令
+       （``\\{`` ``\\|`` ``\\!`` …）；
+    2. **颜色/图标**（``\\c[N]`` ``\\C[N]`` ``\\i[N]`` ``\\I[N]``）——
+       只影响外观，文字一个字不少（见 :data:`_STYLE_ONLY_INDEXED_RE`）；
+    3. ``%%``（写回时被渲染成一个字面百分号）。
+
+    ⚠️ ``\\V[n]`` ``\\N[n]`` ``\\S[n]`` ``\\P[n]`` ``\\D`` ``\\R`` ``\\$``
+    ``\\G`` **不算**样式 —— 游戏会把它们替换成真实数据，丢了就显示错东西。
     """
     if mark in _STYLE_ONLY_MARKS:
         return True
     if mark in _CONTENT_SINGLE_MARKS:
         return False
-    # 带 `[...]` 的（含嵌套形式）都是内容类
-    return False
+    # ★ 带编号的颜色/图标算样式（与 guards._STYLE_ONLY_PLACEHOLDER_RE 一致）；
+    #   其余带 `[...]` 的（`\V[1]` `\N[2]` `\S[3]` `\P[4]`）仍是内容类。
+    return bool(_STYLE_ONLY_INDEXED_RE.fullmatch(mark))
 
 
 def _is_droppable_mark(mark: str) -> bool:
@@ -595,6 +634,32 @@ class PlaceholderCheck:
     这是**必须拦掉**的情况：成对标签（``<color>`` / ``</color>``）一旦被
     模型交换，还原后会得到 ``</color>警告！<color=#f00>`` —— 多重集完全正确、
     文本看着也通顺，但游戏渲染必然出错。这类"沉默的损坏"比丢字更危险。
+    """
+
+    slots: list[str] = field(default_factory=list)
+    """本次校验用的槽位表（``mask`` 的 ``slots``）。
+
+    ## ★ 为什么 `missing` 里会有两种形态，以及为什么必须能解开
+
+    `missing` 里混着**两种**东西：
+
+    1. **原始记号** —— 来自 `compare_restored`，长这样 `\\c[0]`；
+    2. **屏蔽记号** —— 来自下面第 4 层校验，长这样 ``⟦1⟧``。
+
+    而"丢了算不算坏"的判据（`_is_droppable_mark`）只认**原始记号**：
+    ``⟦1⟧`` 不在样式表里，也不匹配 `\\[cCiI]\\[\\d+\\]`，
+    于是被判成**内容类** ⇒ 致命。
+
+    ⚠️ 这直接把第 4 层自己刚做过的判断推翻了：那一层刚刚算过
+    `_is_droppable_mark(slots[i])` 并**只对内容类**报缺失（见其注释），
+    接着却把结果写成 ``⟦i⟧`` 形态塞进 `missing`，
+    让 `fatal_missing` **再判一次**、并且判反。
+
+    真实后果（工作区 `f4b03ca791a9`）：模型输出完整可用的中文、
+    只丢了颜色码，`repair_dropped_masks` 已把 `\\c[2]` 和换行补回，
+    只剩 `⟦1⟧`（= `\\c[0]`）没补 ⇒ 被判死 ⇒ **对话变空白**。
+
+    有了 `slots` 就能把 ``⟦i⟧`` 解回 `slots[i]` 再判，两处口径就一致了。
     """
 
     runs_split: list[tuple[int, ...]] = field(default_factory=list)
@@ -656,8 +721,30 @@ class PlaceholderCheck:
 
         怎么区分：内容类在 `find_placeholders` 的匹配结果里一定带
         `[数字]` 或属于 `\\D \\R \\$ \\G`；其余单字符命令都是样式。
+
+        ★ 两种形态都要能判（见 :attr:`slots` 的说明）：
+        `missing` 里既有**原始记号**（`\\c[0]`），也有**屏蔽记号**（``⟦1⟧``）。
+        后者必须**解回** `slots[i]` 再判 —— 否则同一个槽位会被
+        第 4 层判成"可丢"、又被这里判成"致命"，而后者赢。
         """
-        return [p for p in self.missing if not _is_style_only_mark(p)]
+        # ★ 用 `_is_droppable_mark` 而不是 `_is_style_only_mark`：
+        #   前者额外放过 `%%`（写回时渲染成字面百分号，模型写成 `％`
+        #   或省掉都算可接受，历史上从没为它判过错）。
+        #   两处判据必须走**同一个函数**，否则又会出现
+        #   "一个地方说可以、另一个地方说不行"的矛盾 —— 而这次
+        #   那个矛盾的代价是 2,239 条对话被丢空。
+        out: list[str] = []
+        for p in self.missing:
+            m = _MASK_RE.fullmatch(p)
+            if m is not None:
+                idx = int(m.group(1))
+                if 0 <= idx < len(self.slots) and _is_droppable_mark(self.slots[idx]):
+                    continue
+                out.append(p)  # 解不开、或解出来是内容类 ⇒ 照旧上报
+                continue
+            if not _is_droppable_mark(p):
+                out.append(p)
+        return out
 
     def describe(self) -> str:
         bits: list[str] = []
@@ -768,6 +855,9 @@ def verify_restored(
     restored = unmask(translated_raw, slots)
     left = remaining_masks(restored)
     check = compare_restored(original, restored)
+    # ★ 把槽位表交给校验结果：`missing` 里会出现屏蔽记号（``⟦i⟧``），
+    #   判"能不能丢"时必须能解回真实记号（见 `PlaceholderCheck.slots`）。
+    check.slots = list(slots)
 
     if masked_source:
         # ★ 第四层：**记号个数**（这一层是实测补出来的，前面三层都漏）

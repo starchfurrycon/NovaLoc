@@ -452,19 +452,114 @@ def test_style_only_mark_loss_is_not_fatal(token: str) -> None:
     assert token in chk.missing, "记一笔 missing 是可以的（便于观察），但不该致命"
 
 
-@pytest.mark.parametrize("token", ["\\V[1]", "\\N[2]", "\\I[96]", "\\C[3]", "\\S[5]"])
+@pytest.mark.parametrize("token", ["\\V[1]", "\\N[2]", "\\S[5]", "\\P[3]", "%s"])
 def test_content_mark_loss_is_still_fatal(token: str) -> None:
     r"""★ **反例必须同批存在**：内容类记号丢了必须照样判死。
 
     没有这一条，"修复"很容易退化成"把判据废掉"。
-    `\V[1]`（变量值）丢了游戏会显示错东西；`\I[96]`（图标）丢了
-    玩家的武器类型图标就没了。
+    `\V[1]`（变量值）丢了游戏会显示错东西；`%s`（参数）丢了
+    格式化会出错。
+
+    ⚠️ `\C[3]` / `\I[96]` **不在这个列表里**（它们已改判为样式类）——
+    理由见 `test_color_and_icon_loss_is_not_fatal`。
     """
     src = f"Weapon: {token}"
     translated = "武器："  # 记号丢了
     _restored, chk = ph.verify_restored(src, translated, [token], masked_source="Weapon: ⟦0⟧")
     assert chk.fatal, f"{token!r} 丢了却没判死 —— 判据被废掉了"
     assert token in chk.missing
+
+
+@pytest.mark.parametrize("token", ["\\C[3]", "\\c[0]", "\\I[96]", "\\i[4]"])
+def test_color_and_icon_loss_is_not_fatal(token: str) -> None:
+    r"""★★ 颜色码与图标丢了**不该**判死（实测 2,239 条对话因此变空白）。
+
+    ## 现场（工作区 `f4b03ca791a9`，9,777 条的游戏）
+
+        失败 2,245 条，其中 **2,239 条**都是同一个原因：
+            placeholder_broken: 丢失占位符：['\\c[0]', '\\c[2]', '⟦0⟧', '⟦1⟧', '⟦2⟧']
+        而模型输出是**完整可用**的中文，只是没保留颜色码：
+            源    '\c[2]【Passive】\c[0]…fatal damage. \nRequired LV:30.'
+            模型  '【被动】当受到致命伤害时，有几率保持防御。'
+
+    47% 的对话被整条丢弃 ⇒ `target = ''` ⇒ 玩家看到**空对话框**。
+
+    ## 为什么改判是对的
+
+    `\C[n]`（颜色）与 `\I[n]`（图标）只改变**外观**，文字一个字不少。
+    `guards.py` 的 `_STYLE_ONLY_PLACEHOLDER_RE` **一直都**把它们算样式
+    （那里写明"只是配色变了，文字一个字不少 ⇒ 不该判死"），
+    但 `placeholders._is_style_only_mark` 判成内容类，
+    而它**更早生效** ⇒ 那条宽容规则永远没机会执行。
+
+    ⇒ 丢装饰远好于丢内容：没有颜色的正常中文 ≫ 空白对话框。
+
+    ## 与它的镜像用例必须成对存在
+
+    `test_content_mark_loss_is_still_fatal` 守住"别把判据废掉"。
+    """
+    src = f"Weapon: {token}"
+    translated = "武器："  # 只丢了样式码，文字完整
+    _restored, chk = ph.verify_restored(src, translated, [token], masked_source="Weapon: ⟦0⟧")
+    assert not chk.fatal, (
+        f"{token!r} 丢了就被判死 —— 这条可用的译文会被整条丢弃、对话框变空白："
+        f"{chk.describe()}"
+    )
+
+
+def test_mask_form_of_droppable_slot_is_not_fatal() -> None:
+    r"""★★ `missing` 里的**屏蔽记号**形态也必须按"能否丢"判。
+
+    ## 这个 bug 很隐蔽（同一个槽位被判了两次、结论相反）
+
+    `verify_restored` 第 4 层校验算的是
+    `_is_droppable_mark(slots[i])` —— **只对内容类**报缺失。
+    但它把结果写成 ``⟦i⟧`` 塞进 `check.missing`，
+    接着 `fatal_missing` 又拿 ``⟦i⟧`` 去问 `_is_droppable_mark`：
+    ``⟦1⟧`` 既不在样式表里、也不匹配 `\[cCiI]\[\d+\]`
+    ⇒ 被判成**内容类** ⇒ 致命。
+
+    ⇒ 同一个槽位：第 4 层说"可以丢"、`fatal_missing` 说"致命"，
+      而**后者赢**。真实代价见 `test_color_and_icon_loss_is_not_fatal`。
+
+    这里直接构造那种 `missing` 形态（``⟦1⟧``），断言它不再致命。
+    `PlaceholderCheck` 现在记住 `slots`，能把 ``⟦i⟧`` 解回 `slots[i]` 再判。
+    """
+    from novaloc.translate.placeholders import PlaceholderCheck
+
+    slots = ["\\c[2]", "\\c[0]"]
+    # 形态 1：屏蔽记号指向**可丢**的槽位 ⇒ 必须不致命
+    chk = PlaceholderCheck(missing=["⟦1⟧"], slots=slots)
+    assert not chk.fatal_missing, (
+        f"⟦1⟧ 对应的槽位是 {slots[1]!r}（颜色码，可丢），不该致命："
+        f"{chk.describe()}"
+    )
+    assert not chk.fatal
+    # ⚠️ 但要**留在 missing 里**（便于观察），别把它删掉
+    assert "⟦1⟧" in chk.missing
+
+    # 形态 2：屏蔽记号指向**内容类**槽位 ⇒ 必须致命
+    content = PlaceholderCheck(missing=["⟦0⟧"], slots=["\\V[1]"])
+    assert content.fatal_missing, "解出来是 \\V[1]（内容类）⇒ 必须致命"
+    assert content.fatal
+
+    # 形态 3：没有 slots 可解 ⇒ 保守判致命（宁可拒绝，不可误放）
+    blind = PlaceholderCheck(missing=["⟦0⟧"], slots=[])
+    assert blind.fatal_missing, "解不开时应当保守判死"
+
+    # 形态 4：越界下标 ⇒ 同样保守判死
+    oob = PlaceholderCheck(missing=["⟦9⟧"], slots=slots)
+    assert oob.fatal_missing, "越界下标应当保守判死"
+
+
+def test_mask_form_of_content_slot_is_still_fatal() -> None:
+    r"""★ 镜像：``⟦i⟧`` 解出来是**内容类**时必须照旧判死。"""
+    src = "HP: \\V[1]"
+    slots = ["\\V[1]"]
+    _restored, chk = ph.verify_restored(src, "生命值：", slots, masked_source="HP: ⟦0⟧")
+    assert "⟦0⟧" in chk.missing
+    assert chk.fatal_missing, "解出来是 \\V[1]（内容类）⇒ 必须致命"
+    assert chk.fatal
 
 
 def test_style_and_content_marks_are_both_masked() -> None:

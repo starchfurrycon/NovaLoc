@@ -24,19 +24,42 @@ r"""★ 嵌套的 Unity 工程：**检测、抽取、回写**三处必须都看�
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-os.environ.setdefault("NOVALOC_DATA_ROOT", r"D:\NovaLoc\_unity_nested_test")
-
-from novaloc.engines.unity import (  # noqa: E402
+from novaloc.engines.unity import (
     _UNITY_DATA_MAX_DEPTH,
     UnityAdapter,
     _find_unity_dirs,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_data_root(monkeypatch: pytest.MonkeyPatch, tmp_path_factory) -> None:
+    """★ 数据根必须**按测试**隔离，绝不能污染进程级环境。
+
+    ## 我在这里踩过一个真坑（全量套件里 9 条 image/OCR 用例挂掉）
+
+    第一版是**模块级**：
+
+        os.environ.setdefault("NOVALOC_DATA_ROOT", r"D:\\NovaLoc\\_unity_nested_test")
+
+    `os.environ` 是**进程全局**的，而 pytest 整个套件跑在同一个进程里。
+    于是这条 `setdefault` 之后的所有测试都以为数据根是那个临时目录：
+
+        E  处理失败：缺少 2 个离线模型：PP-OCRv6_det_medium.onnx、…；
+           请放到 D:\\NovaLoc\\_unity_nested_test\\models\\rapidocr
+
+    ⇒ `test_image_alpha_preserved.py` / `test_ocr_cache.py` 共 **9 条**
+      在**全量套件**里必挂，单独跑却全绿（因为那时没人设过这个变量）。
+
+    ⚠️ 这正是一个"**测试之间互相污染**"的典型：单跑绿、全跑红，
+       而失败信息指向的是 OCR 模型缺失 —— 与 Unity 毫无关系，
+       极难从失败信息反推到真凶。⇒ 只能用 `monkeypatch`（自动复原）。
+    """
+    monkeypatch.setenv("NOVALOC_DATA_ROOT", str(tmp_path_factory.mktemp("data")))
 
 
 def _ctx(tmp_path: Path) -> SimpleNamespace:
