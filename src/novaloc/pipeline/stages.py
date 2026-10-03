@@ -72,6 +72,31 @@ STAGE_LABELS = dict(STAGES)
 #: 在千条量级上只要几毫秒，相对于单批 1~3 秒的模型耗时可以忽略。
 _CHECKPOINT_INTERVAL_S = 15.0
 
+#: 连续失败多少次之后**放弃**这条（不再排进待办）。
+#:
+#: ## 为什么需要：`FAILED` 会被**每一轮**重新排进待办
+#:
+#: `stage_translate` 的跳过判据是
+#: `prev is not None and prev.is_done and prev.target.strip()`，
+#: 而 `is_done` 只认 `TRANSLATED/REVIEWED/LOCKED`。
+#: `FAILED` **不满足** ⇒ 每跑一次 `translate` 就重试一次，永远如此。
+#:
+#: 而这些失败里有一部分是**模型真的做不到**的。实测失败原因分布中，
+#: 几百条是长插件标签（`<SG説明:…\I[34]…>` 这种把插件元数据拼进文本的），
+#: 模型对它们一律回 `'确认'`、或者把整段标签吞掉 ——
+#: **重试一万次也是同一个结果**。
+#:
+#: 代价不只是浪费：全库 174 个游戏、单条约 20~60 秒，
+#: 一轮下来这些条目要吃掉大量时间；而"后续新加游戏"的守望服务
+#: 还在等**同一个热模型**（实测两个进程并行会让 `POST /api/chat`
+#: 大面积 300 秒超时）。
+#:
+#: ## 为什么是 2 而不是 1
+#:
+#: `provider_error`（`空响应`、`单条翻译返回的编号不连续`）是**真会自愈**的
+#: 瞬时故障，给一次重试是合理的。2 次之后仍失败，就认定是内容本身的问题。
+_MAX_FAIL_STREAK = 2
+
 
 def _clear_dir(path: Path) -> int:
     """删掉目录里的**全部内容**（保留目录本身），返回删掉的文件数。
@@ -473,10 +498,38 @@ class Pipeline:
 
             todo: list[TextUnit] = []
             drift_retried = 0
+            fail_skipped = 0
             for u in units:
                 if not u.source.strip():
                     continue
                 prev = existing.get(u.uid)
+
+                # ---- ★ 放弃那些**反复失败**的条目 ----
+                #
+                # `FAILED` 不满足 `prev.is_done` ⇒ 上面那条 `continue` 拦不住它
+                # ⇒ **每一轮 translate 都会把它重新排进待办**。
+                # 而这些条目里有相当一部分是**模型真的做不到**的：
+                # 实测失败原因分布里，几百条是长插件标签
+                # （`<SG説明:…\\I[34]…>`）—— 模型对它们一律回 `'确认'` 或者
+                # 干脆把整段标签吞掉。**重试一万次也是同一个结果。**
+                #
+                # 代价不只是浪费：全库 174 个游戏、单条约 20~60 秒，
+                # 一轮下来这些条目要吃掉大量时间，而"后续新加游戏"的
+                # 守望服务也在等同一个热模型。
+                #
+                # 所以记一个**跨轮次**的失败计数，连续 2 次失败就不再碰。
+                # 用 2 而不是 1：`provider_error`（空响应、编号不连续）
+                # 是**真的会自愈**的瞬时故障，给一次重试是合理的。
+                #
+                # ⚠️ 计数存在 `meta`（会落盘），不是 `entry.retries`
+                #    （那个被 provider 在每次重试时**重置为 0/1**，
+                #    实测 1,140 条失败条目里全是 0，完全无法累积）。
+                if only_pending and prev is not None and prev.status == EntryStatus.FAILED:
+                    streak = int((prev.meta or {}).get("fail_streak", 0))
+                    if streak >= _MAX_FAIL_STREAK:
+                        fail_skipped += 1
+                        continue
+
                 if only_pending and prev is not None and prev.is_done and prev.target.strip():
                     # ---- 「已完成」也要能被推翻：旧坏值必须有机会重译 ----
                     #
@@ -544,6 +597,19 @@ class Pipeline:
 
             entries = self._translate_units(todo, glossary, on_progress=_checkpoint)
             n_overridden = self._apply_engine_labels(entries)
+            # ---- ★ 累积**跨轮次**的失败计数（见 `_MAX_FAIL_STREAK`）----
+            #
+            # 必须在这里做：`existing` 里还留着**上一轮**的 `meta`，
+            # 而 `entries` 是这一轮的**新**对象。等下面 `{**existing, **entries}`
+            # 合并完，旧 `meta` 就被覆盖掉了，再也读不到历史计数。
+            #
+            # 注意用 `existing` 而不是合并后的结果 —— 后者此刻已经不含旧值。
+            for e in entries:
+                if e.status != EntryStatus.FAILED:
+                    continue
+                prev_e = existing.get(e.uid)
+                prior = int(((prev_e.meta if prev_e else None) or {}).get("fail_streak", 0))
+                e.meta = {**(e.meta or {}), "fail_streak": prior + 1}
             # 已有条目要合并保留：用户手工改过的译文不能被流水线覆盖
             merged = {**existing, **{e.uid: e for e in entries}}
             self.ws.save_entries(list(merged.values()))
@@ -553,6 +619,14 @@ class Pipeline:
             if failed:
                 self.bus.log(
                     f"{len(failed)} 条翻译失败，可在文本审校页重试",
+                    stage="translate",
+                    severity=Severity.WARN,
+                )
+            if fail_skipped:
+                self.bus.log(
+                    f"跳过 {fail_skipped} 条已连续失败 {_MAX_FAIL_STREAK} 次的条目"
+                    "（模型对这类内容反复给不出合格译文；已记在条目里，"
+                    f"修好后可清掉 meta.fail_streak 重试）",
                     stage="translate",
                     severity=Severity.WARN,
                 )
