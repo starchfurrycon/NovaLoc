@@ -2213,6 +2213,14 @@ def auto(
     watch: bool = typer.Option(
         False, "--watch", help="守望模式：处理完现有游戏后继续等新游戏出现。"
     ),
+    watch_only: bool = typer.Option(
+        False,
+        "--watch-only",
+        help=(
+            "只守望：不重跑库里现有游戏，只等新游戏出现后自动汉化。"
+            "适合让它一直在后台待着（--watch 会先把现有游戏跑完）。"
+        ),
+    ),
     interval: float = typer.Option(
         60.0, "--interval", help="守望模式的扫描间隔（秒）。"
     ),
@@ -2437,6 +2445,18 @@ def auto(
             ent.message = f"{type(exc).__name__}: {exc}"
             log.debug("批量处理失败", exc_info=True)
 
+    if watch_only:
+        # ★ `--watch-only`：**不重跑库里现有游戏**，直接进守望循环。
+        #
+        # 为什么不复用下面的 `for i, ent in enumerate(todo, 1):` 然后
+        # "把 todo 清空" —— 那样汇总表/清单会打出一份**空报告**，
+        # 让人误以为"什么都没做"。这里直接说明白：本次不处理现有游戏。
+        console.print(
+            f"\n[dim]--watch-only：跳过库里现有 {len(todo)} 个待处理游戏，"
+            "只等新游戏出现。[/dim]"
+        )
+        todo = []
+
     for i, ent in enumerate(todo, 1):
         console.rule(f"[{i}/{len(todo)}] {ent.name}")
         console.print(f"  引擎 [cyan]{ent.engine_id or 'unknown'}[/cyan]　{ent.path}")
@@ -2493,75 +2513,50 @@ def auto(
     except OSError as exc:
         console.print(f"[yellow]清单写不出去：{exc}[/yellow]")
 
-    if watch:
+    if watch or watch_only:
         # ---------------------------------------------------------------
-        # 守望状态**落盘**
+        # 守望状态**落盘**（逻辑在 `novaloc.watch`，那里有单测）
         #
         # 原来 `seen` 只在内存里 —— 重启一次，**库里所有游戏**都会被当成
         # "新出现"而重跑一遍（实测全库跑一次要很久）。
         # 状态虽然也在各项目的 `.novaloc.json` 里，但守望模式**应该**
         # 自己也记住，否则"重启后空了"这件事会静默发生。
+        #
+        # ▲ 抽成 `WatchState` 的原因：这段原本内联在这里，而这里
+        #   下面就是 `while True: sleep()` ⇒ **一个测试都写不了**。
         # ---------------------------------------------------------------
-        state_path = data_root / "watch-state.json"
-        seen: set[str] = {str(g).lower() for g in games}
-        if state_path.is_file():
-            try:
-                saved = json.loads(state_path.read_text(encoding="utf-8"))
-                names = saved.get("seen") or []
-                if isinstance(names, list):
-                    before = len(seen)
-                    seen.update(str(x).lower() for x in names if isinstance(x, str))
-                    log.info(
-                        "守望状态：从 %s 读回 %d 条（本次新增 %d）",
-                        state_path.name,
-                        len(seen) - before,
-                        len(seen),
-                    )
-            except (OSError, ValueError) as exc:
-                console.print(
-                    f"[yellow]守望状态文件读不出来（{exc}），"
-                    "本次会把库里现有游戏当作已见。[/yellow]"
-                )
+        from .watch import STATE_NAME, WatchState
 
-        def _save_seen() -> None:
-            try:
-                state_path.parent.mkdir(parents=True, exist_ok=True)
-                state_path.write_text(
-                    json.dumps(
-                        {
-                            "library": str(root),
-                            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-                            "seen": sorted(seen),
-                        },
-                        ensure_ascii=False,
-                        indent=1,
-                    ),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                log.warning("守望状态写不出去：%s", exc)
+        state = WatchState.load(data_root / STATE_NAME, library=root)
+        # ★ 第一次跑、或状态文件读坏了 ⇒ 必须把**现有游戏**全部记为已见。
+        #   否则 `seen` 为空 ⇒ 整库都被当成"新出现"⇒ 重跑一遍。
+        if state.fresh or state.load_error:
+            state.bootstrap(games)
+            console.print(f"[dim]{state.describe()}[/dim]")
+        else:
+            log.info("守望状态：%s", state.describe())
+        state.save()
 
-        _save_seen()
         console.print(
             f"\n[bold]守望模式[/bold]：每 {interval:.0f} 秒扫一次 {root}，"
             "新出现的游戏会自动处理。按 Ctrl+C 停止。\n"
-            f"[dim]已记住 {len(seen)} 个游戏（{state_path}）—— "
+            f"[dim]已记住 {len(state.seen)} 个游戏（{state.path}）—— "
             "重启不会把整库重跑一遍。[/dim]"
         )
+        if watch_only:
+            console.print(
+                "[dim]--watch-only：不重跑库里现有游戏，只等新游戏。[/dim]"
+            )
         try:
             while True:
                 time.sleep(max(5.0, interval))
-                fresh = [
-                    g for g in find_games(root, max_depth=depth)
-                    if str(g).lower() not in seen
-                ]
+                fresh = state.new_games(find_games(root, max_depth=depth))
                 if not fresh:
                     continue
-                for g in fresh:
-                    seen.add(str(g).lower())
                 # ★ 先落盘再处理：万一处理中崩了/断电，
                 #   重启后不会把"已经看过的"又当新游戏。
-                _save_seen()
+                state.remember(fresh)
+                state.save()
                 console.print(f"\n发现 {len(fresh)} 个新游戏：")
                 for g in fresh:
                     ent = scan_one(g)
@@ -2577,7 +2572,7 @@ def auto(
                     else:
                         console.print(f"    → {ent.status}　[dim]{ent.message}[/dim]")
         except KeyboardInterrupt:
-            _save_seen()
+            state.save()
             console.print("\n[yellow]已停止守望。[/yellow]")
         return
 
