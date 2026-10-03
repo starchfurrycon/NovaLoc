@@ -726,6 +726,60 @@ class OllamaTranslationProvider:
         marker_warning: str = "",
         slots: list[str] | None = None,
     ) -> str:
+        """单条翻译，**对"模型回空 JSON"做一次额外重试**。
+
+        ## 为什么要多一层（实测，两次跑结果不同 ⇒ 偶发）
+
+        `translategemma:4b` 偶尔对**完全正常**的单行文本回一个空对象 `{}`：
+
+            原始输出前 200 字符：'{}'）：解析得到空映射：'{}'
+
+        同一输入重复 5 次的实测（`.scratch/_brace_retry.py`）：
+
+        | 输入 | 成功 |
+        | --- | --- |
+        | `'Wayland:'` | **5/5** |
+        | `'Boy:'` | **5/5** |
+        | `'.............'`（纯标点、无可译内容） | **0/5** |
+
+        ⇒ 分两类：**真内容**的空回是**偶发**（再问一次就好），
+        **无内容**的空回是**必然**（浪费一次请求也无妨，反正它本来译不出）。
+
+        ⚠️ 不要为 `'.............'` 这类做特殊处理：它**确实没有可译内容**，
+        判失败是正确行为（只是原因不显眼，见 ROADMAP）。
+
+        重试只加 **1 次**：实测偶发类的两次内成功率已接近 100%，
+        加更多次数只是拖慢"必然失败"的那些。
+        """
+        last: Exception | None = None
+        for attempt in range(2):
+            try:
+                return self._call_single_once(
+                    item, masked, marker_warning=marker_warning, slots=slots
+                )
+            except ProviderError as exc:
+                last = exc
+                # 只对"空映射"重试：其它 ProviderError 是内容/格式问题，
+                # 再问一次不会变好（那正是 `per_item_failed` 记录的教训）。
+                if "解析得到空映射" not in str(exc):
+                    raise
+                if attempt == 0:
+                    self.stats["empty_mapping_retry"] = (
+                        self.stats.get("empty_mapping_retry", 0) + 1
+                    )
+                    log.debug("单条回空 JSON，重试一次：%s", str(exc)[:120])
+                    continue
+                raise
+        raise last if last else ProviderError("单条翻译失败")
+
+    def _call_single_once(
+        self,
+        item: TranslateItem,
+        masked: str,
+        *,
+        marker_warning: str = "",
+        slots: list[str] | None = None,
+    ) -> str:
         """单条翻译。
 
         ``marker_warning`` 会**追加到用户提示词末尾**，用于"上一次把

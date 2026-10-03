@@ -202,13 +202,27 @@ def test_call_single_passes_sources() -> None:
     行为级测试要造一个带 `masked` 的 `TranslateItem` 并打桩 `_chat`，
     代价大且脆；这里直接钉住**调用点**，因为断点就是"少传一个参数"，
     而它没有任何运行时报错 —— 只会让译文静默丢失。
+
+    ⚠️ 检查的是 `_call_single_once`：`_call_single` 现在是**对"模型回空
+    JSON"做一次重试的外壳**（实测 `{}` 是偶发，见
+    `.scratch/_brace_retry.py` 的 5/5 vs 0/5 对照），真正的调用体在
+    `_call_single_once`。断点性质不变，所以判据跟着移到真正的方法上 ——
+    但**两处都查**，这样万一以后有人把重试外壳去掉也不会漏。
     """
     import inspect
 
     from novaloc.translate import ollama_provider as op
 
-    src = inspect.getsource(op.OllamaTranslationProvider._call_single)
-    assert "sources=[masked]" in src or "sources=list(masked)" in src, (
-        "_call_single 没有把 sources 传给 parse_translations —— "
+    bodies = {
+        "wrapper": inspect.getsource(op.OllamaTranslationProvider._call_single),
+        "once": inspect.getsource(op.OllamaTranslationProvider._call_single_once),
+    }
+    target = bodies["once"] if "parse_translations" in bodies["once"] else bodies["wrapper"]
+    assert "sources=[masked]" in target or "sources=list(masked)" in target, (
+        "_call_single_once 没有把 sources 传给 parse_translations —— "
         "以原文为键的返回会变成空映射，译文静默丢失"
+    )
+    # 重试外壳必须真的调用带 sources 的那个方法（别把逻辑复制成两份）
+    assert "_call_single_once" in bodies["wrapper"], (
+        "_call_single 应当委托给 _call_single_once，而不是自己再抄一份解析逻辑"
     )

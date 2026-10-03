@@ -171,20 +171,53 @@ def _code_only(fn: object) -> str:
 
 
 def test_call_single_retries_with_raw_source() -> None:
-    """★ 源码级断言：`_call_single` 必须在**取不到**时用原文再解析一次。
+    """★ 源码级断言：单条路径必须在**取不到**时用原文再解析一次。
 
     这里用源码断言而不是跑一遍 provider —— 真正要钉住的是"第二遍解析
     存在、且用的是 `item.unit.source`"这个**结构**，跑一遍会引入
     模型/网络依赖。项目里对 `_call_single` 已有同类断言
     （见 `test_source_keyed_translations.py`）。
+
+    ⚠️ 检查 `_call_single_once`：`_call_single` 现在是"对空 JSON 重试一次"
+    的外壳（见其 docstring 的实测数据），解析体在 `_call_single_once`。
     """
-    code = _code_only(OllamaTranslationProvider._call_single)
+    code = _code_only(OllamaTranslationProvider._call_single_once)
     assert "if not mapping" in code, "必须只在第一遍取不到时才走第二遍"
     assert "item . unit . source" in code, "第二遍必须用未掩码原文"
     # 两次**单元素** sources 解析；合并成一个列表会编号错位
     assert code.count("sources = [ masked ]") == 1, "第一遍用掩码形态"
     assert code.count("sources = [ item . unit . source ]") == 1, (
         "第二遍用原文形态（单元素，不能与掩码合并）"
+    )
+
+
+def test_call_single_wrapper_retries_empty_mapping() -> None:
+    """★ 外壳必须只对"空映射"重试，且只重试一次。
+
+    实测（`.scratch/_brace_retry.py`）：`{}` 对**真内容**是偶发
+    （`'Wayland:'` 5/5 成功），对**纯标点**是必然（`'.............'` 0/5）。
+    ⇒ 重试一次即可；重试更多只是拖慢必然失败的那些。
+
+    ⚠️ 也钉住"只对空映射重试"：对别的 ProviderError 重试是浪费 ——
+    那正是 `per_item_failed` 记录的教训（内容触发的失败重试不会变好）。
+    """
+    code = _code_only(OllamaTranslationProvider._call_single)
+    assert "_call_single_once" in code, "外壳必须委托给真正的实现"
+    # ⚠️ `_code_only` 用空格连接 token ⇒ `range(2)` 变成 `range ( 2 )`。
+    #    这是第二次踩同一个坑（第一次是找字符串字面量）：用这个辅助函数
+    #    时，判据必须写成**token 序列**的样子。
+    assert "range ( 2 )" in code, "只重试一次（共两次尝试）"
+
+    # ⚠️ 这条判据要看**字符串字面量**，所以必须用原始源码 ——
+    #    `_code_only` 会连 STRING 一起剥掉（它本来的用途是"别把注释/
+    #    文档里提到的名字当成代码"），拿它找字面量必然找不到。
+    #    这个坑我当场踩了一次。
+    import inspect
+
+    raw = inspect.getsource(OllamaTranslationProvider._call_single)
+    assert "解析得到空映射" in raw, (
+        "必须只对「空映射」这一类失败重试 —— 别的 ProviderError 是内容/格式"
+        "问题，重试不会变好（`per_item_failed` 的教训）"
     )
 
 

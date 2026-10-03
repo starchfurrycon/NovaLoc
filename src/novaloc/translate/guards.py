@@ -112,6 +112,101 @@ _LEAK_GAP_MARKUP_RE = re.compile(
 
 _MD_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
 
+#: 判断一个占位符是不是**纯展示样式**（不含任何玩家可见内容）。
+#:
+#: ## 为什么必须把"样式记号"和"内容记号"分开（实测）
+#:
+#: RPG Maker 的对话大量长这样：
+#:
+#:     \c[17]Lynn:\n\c[0]Oh! ♡Oh! ♡\nOops, oops♡This guy is not good♡
+#:
+#: `\c[0]`/`\c[17]` 只决定**颜色**，玩家一个字都看不到它。
+#: 而模型（尤其 4B 量级）**经常把它丢掉** —— 实测：
+#:
+#:     _call_single('\c[0]Hmm...♡')            → '嗯…♡'        ← 颜色码没了
+#:     translate_batch(['\c[0]Hmm...♡'])       → '\c[0]嗯…♡'   ← 保住了
+#:
+#: 于是 `check_placeholders` 报 `placeholder_count:1->0`，而它被列进
+#: **致命**清单 ⇒ 整条判死。后果在逐行救援路径上被放大（实测
+#: `.scratch/_why_perline_fails.py`）：
+#:
+#:     拒绝原因汇总：3 call ／ **2 guard:placeholder_count:1->0** ／ 1 ok
+#:
+#: **两条本来内容完整的译文被这一条判据拒掉**，逐行救援救回率被压到
+#: 三分之一。而它们的文字是**完全正确的**。
+#:
+#: ## 为什么"丢样式码"和"丢内容码"性质完全不同
+#:
+#: | 记号 | 丢了会怎样 | 该不该判死 |
+#: | --- | --- | --- |
+#: | `\V[1]`（变量）、`%s`（参数）、`\N[1]`（角色名） | 游戏里显示不出该有的**内容** | **必须判死** |
+#: | `\c[0]`（颜色）、`\i[4]`（图标）、`\|`（停顿） | 只是**配色/停顿**变了，文字一个字不少 | 不该判死 |
+#:
+#: 前者丢的是信息，后者丢的是装饰。把它俩混在一起，就是用"装饰"
+#: 去否决"内容"。
+#:
+#: ⚠️ **换行不在本判据的管辖范围内** —— 这一点很容易搞错（我当场搞错过）：
+#: `extract_placeholders` 对**真实换行**返回 `[]`（实测），换行是靠
+#: `mask_newlines=True` 变成记号 ``⟦n⟧`` 之后，由 provider 侧的
+#: `repair_missing_newlines` / `verify_restored` 单独把关的。
+#: 所以这里**既不该**把 `\n` 列进样式表，也**不能**声称"换行由本判据保护"。
+#:
+#: ⚠️ **只用于判定"能不能放行"，不用于"补回位置"**。
+#: 位置**不能**按比例猜：实测颜色码位置偏差中位数 0.196、
+#: P90 0.640（见 `.scratch/_colors_only_count.py` 与 ROADMAP §12.4），
+#: 按比例插会把颜色插到半个词中间。丢掉的样式码就让它**保持丢失** ——
+#: 游戏里显示为默认颜色，文字仍是完整可读的中文。
+#:
+#: 判据用**结构**（这个记号本身的形状），不用长度/比例这类阈值。
+_STYLE_ONLY_PLACEHOLDER_RE = re.compile(
+    # RPG Maker / VX / MV 颜色与图标：`\c[0]` `\C[6]` `\i[4]` `\I[4]`
+    r"\\[cCiI]\[\d+\]"
+    # 不带参数的样式：`\C` `\I`（少见但存在）
+    r"|\\[cCiI](?!\[)"
+    # 停顿 / 等待 / 瞬间显示 / 加速：`\|` `\.` `\!` `\>` `\<` `\^` `\$`
+    r"|\\[|.!><^$]"
+    # 富文本标签：`<color=#ff0000>` `</color>` `[b]` `{w=0.5}`
+    r"|</?[A-Za-z][^<>]{0,60}?/?>"
+    r"|\[/?[A-Za-z_][^\]]{0,30}\]"
+    r"|\{[^}]{0,30}\}"
+)
+
+
+def is_style_only_placeholder(token: str) -> bool:
+    """这个占位符是不是**纯展示样式**（丢了不影响玩家读到的文字）？
+
+    见 :data:`_STYLE_ONLY_PLACEHOLDER_RE` 的说明与实测数据。
+    """
+    return bool(_STYLE_ONLY_PLACEHOLDER_RE.fullmatch((token or "").strip()))
+
+
+def placeholders_lost(source: str, target: str) -> tuple[list[str], list[str]]:
+    """返回 ``(丢失的, 多出的)`` 占位符列表。
+
+    与 :func:`check_placeholders` 不同：这里**不比较总数**，
+    而是直接给多重集差，调用方才能判断"丢的是不是只有样式码"。
+    """
+    cs, ct = Counter(extract_placeholders(source)), Counter(extract_placeholders(target))
+    return list((cs - ct).elements()), list((ct - cs).elements())
+
+
+def style_only_placeholder_loss(
+    source: str, target: str, *, ignore: frozenset[str] | None = None
+) -> bool:
+    """``target`` 相对 ``source`` **只**丢了纯样式占位符（且没多出任何东西）。
+
+    `ignore` 用于排除调用方已经单独校验过的记号（例如换行 `\\n`）。
+    没有丢任何占位符时返回 ``False``（那不是"只丢样式"，是"没丢"）。
+    """
+    lost, extra = placeholders_lost(source, target)
+    if not lost:
+        return False
+    if extra:
+        return False
+    return all(
+        is_style_only_placeholder(x) for x in lost if not (ignore and x in ignore)
+    )
+
 
 @dataclass
 class GuardResult:
@@ -847,13 +942,32 @@ def guard(
     #  * 混进别的文字系统 —— 玩家看到的是一句夹杂阿拉伯/泰文的乱码；
     #  * 空译文。
     # 其余（过长、像是没翻）只警告，交给用户在审校界面判断。
+    #
+    # ★ 例外：**只丢样式码**时 `placeholder_*` 不判死（见下）。
+    placeholder_warnings = [
+        w
+        for w in warnings
+        if w.startswith(
+            ("placeholder_count", "placeholder_missing", "placeholder_extra")
+        )
+    ]
+    # ★★ "只丢了颜色/停顿这类**纯样式**记号"不算致命。
+    #
+    # 理由与实测数据全在 `_STYLE_ONLY_PLACEHOLDER_RE` 的注释里。要点：
+    # `\c[0]Hmm...♡` → `嗯…♡` 丢掉的是**颜色**，文字一个字不少，
+    # 而原先的判据把它当"占位符崩掉"整条否决 —— 实测在逐行救援路径上
+    # 直接拒掉了三分之二本可救回的条目。
+    #
+    # ⚠️ 只在**没有多出任何记号**、且丢的**全部**是样式码时才放过。
+    # 只要混进一个内容类记号（`\V[1]`、`%s`、`\n`）就照旧判死 ——
+    # 那才是真的丢信息。
+    style_only_loss = bool(placeholder_warnings) and style_only_placeholder_loss(
+        source, target
+    )
     fatal = (
         any(
             w.startswith(
                 (
-                    "placeholder_count",
-                    "placeholder_missing",
-                    "placeholder_extra",
                     "percent_var_missing",
                     "percent_var_changed",
                     "repetition",
@@ -862,6 +976,7 @@ def guard(
             )
             for w in warnings
         )
+        or (bool(placeholder_warnings) and not style_only_loss)
         or not target
     )
     return GuardResult(text=target, warnings=warnings, fatal=fatal)
