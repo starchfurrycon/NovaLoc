@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 import time
 from collections.abc import Callable, Iterator
@@ -174,6 +175,111 @@ def _blob_of_strings(obj: object, *, limit: int = 4000) -> str:
     return "".join(out)[:limit]
 
 
+def _zh_lang_dir_names() -> set[str]:
+    """被认作"中文语言目录"的名字（小写比较）。
+
+    覆盖面故意放宽：漏判的代价是**白烧几小时 GPU + 把好好的中文游戏改掉**，
+    误判的代价只是"少翻一个游戏"（用户还能用 `--force` 强制翻）。
+    这个不对称决定了门槛该松还是该紧。
+    """
+    return {
+        "zh", "zh-cn", "zh_cn", "zh-hans", "zh_hans", "zh-sg",
+        "zh-tw", "zh_tw", "zh-hant", "zh_hant", "zh-hk", "zhhk",
+        "chinese", "chs", "cht", "sc", "tc", "cn",
+        "chinese(simplified)", "chinese(traditional)",
+        "简体", "繁体", "中文", "简中", "繁中",
+    }
+
+
+#: 用来确认"目录里真有中文"的文本类扩展名
+_ZH_TEXT_EXT = {
+    ".txt", ".json", ".csv", ".xml", ".yml", ".yaml",
+    ".bytes", ".tsv", ".ini", ".po", ".resx", ".strings",
+}
+
+_ZH_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def detect_builtin_chinese_assets(
+    game_dir: Path, *, max_depth: int = 6, min_zh_files: int = 3
+) -> tuple[bool, str]:
+    r"""游戏里有没有**自带的、可直接切换的中文语言资产**。
+
+    ## ★ 为什么需要这个判据（实测漏判，代价很大）
+
+    用户指正：
+
+    > 有可能很多支持中文的游戏被你误处理了，因为支持中文的同时支持别的语言，
+    > 导致游戏里有别的语言的资产，而你就进行了多余操作。
+    > 比如 Alice in Cradle 就支持中文，可是你依旧在翻译。
+    > 支持中文的游戏只需要将其换为其自带的中文就行了（比如在其设置里）。
+
+    实测确认 `AliceInCradle_ver029`：
+
+        AliceInCradle_Data\StreamingAssets\localization\
+            en/  ko-kr/  th/  zh-cn/  zh-tc/  _/  __AdditionalFonts/
+        zh-cn\ 里 70 个文件、`ev_book.txt` 内容就是中文对白
+        （「好痛……」诺艾儿用手捂着肿胀的皮肤。）
+
+    ⇒ **官方中文一直在那里**，玩家在设置里选一下就有。
+    而我给它翻了 127,693 条，白烧几个小时 GPU。
+
+    ## 为什么 `detect_already_chinese` 原来抓不到
+
+    它只查两样：RPG Maker 的 `System.json` 里 `terms` 的汉字占比、
+    以及有没有中文字体文件。**"多语言资产"这种形态它完全看不见** ——
+    Unity 游戏把每种语言放进独立目录，主配置里一个中文都没有，
+    字体还往往是共用/自定义的。
+
+    ## 判据（两个条件都要满足）
+
+    1. **目录名是语言码**（`zh-cn`/`chn`/`简体`…）；
+    2. **该目录里确有一批文件含汉字**（默认 ≥3 个）。
+
+    第 2 条不能省：只看目录名会把"预留了但没填内容"的空壳语言目录
+    误判成有中文。
+    """
+    names = _zh_lang_dir_names()
+    base_depth = len(game_dir.parts)
+    try:
+        candidates = [
+            d
+            for d in game_dir.rglob("*")
+            if d.is_dir()
+            and len(d.parts) - base_depth <= max_depth
+            and d.name.strip().lower() in names
+        ]
+    except OSError:
+        return False, ""
+
+    for d in candidates:
+        n_zh = 0
+        try:
+            for f in d.rglob("*"):
+                if not f.is_file() or f.suffix.lower() not in _ZH_TEXT_EXT:
+                    continue
+                try:
+                    if f.stat().st_size > 4 * 1024 * 1024:
+                        continue
+                    blob = f.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if _ZH_RE.search(blob):
+                    n_zh += 1
+                    if n_zh >= min_zh_files:
+                        break
+        except OSError:
+            continue
+        if n_zh >= min_zh_files:
+            try:
+                rel = d.relative_to(game_dir)
+            except ValueError:
+                rel = d
+            return True, f"自带中文语言资产：{rel}（{n_zh}+ 个含汉字文件）"
+
+    return False, ""
+
+
 def detect_already_chinese(game_dir: Path, engine_id: str) -> tuple[bool, str]:
     """判断这个游戏**本身已经是中文**，不需要再翻。
 
@@ -181,6 +287,10 @@ def detect_already_chinese(game_dir: Path, engine_id: str) -> tuple[bool, str]:
 
     * RPG Maker MV/MZ：``www/data/System.json`` 的 ``terms`` 里汉字占比已经
       很高（界面文案本来就是中文），或 ``locale`` 是 zh；
+    * 通用：游戏里存在**自带的、可直接切换的中文语言资产**
+      （见 :func:`detect_builtin_chinese_assets`）——
+      这一条是本轮补上的，原来漏判导致把 Alice in Cradle 这类
+      官方支持中文的游戏重翻了一遍；
     * 通用：游戏目录里存在**中文字体**文件（``*zh*``/``*sc*``/``*cn*``
       之类的 ttf/otf）说明发布方已经处理过中文；
     * 通用：已经由本工具处理过（存在 ``*novaloc*`` 字体）。
@@ -209,6 +319,11 @@ def detect_already_chinese(game_dir: Path, engine_id: str) -> tuple[bool, str]:
                 loc = str(d.get("locale", "")).lower()
                 if loc.startswith("zh"):
                     return True, f"{sub}/System.json locale={loc}"
+
+    # ①b ★ 自带的、可切换的中文语言资产（多语言游戏的主力形态）
+    hit, why = detect_builtin_chinese_assets(game_dir)
+    if hit:
+        return True, why
 
     # ② 中文字体文件
     try:
