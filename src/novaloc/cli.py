@@ -2689,6 +2689,36 @@ def auto(
                 )
                 if rep.failed:
                     ent.message += f"；{len(rep.failed)} 个失败"
+
+                # ★ 写回成功后回收 `out/` 里的冗余副本。
+                #
+                # `prepare_out` 是整目录复制（那是为了"少复制一个资源就可能
+                # 启动失败"），于是 `out/` = 整个游戏的副本。实测 `out/`
+                # 占 11.5 GB，其中 **94% 是从未被修改的原样文件**
+                # （`.resS`/`.png`/`.dll`），而备份只有 1.7 GB。
+                #
+                # 只在**这次写回成功**时回收，而且**只删同时有备份的文件** ——
+                # 没有备份的那些可能是唯一的"改后版本"，一律保留。
+                if rep.written and not rep.failed and rep.backup_dir:
+                    from .batch import prune_written_out  # noqa: PLC0415
+
+                    # `safe_to_clear`：写回**零失败、零中止**才整目录清空。
+                    # 实测依据：`changed_files()` 用大小+哈希判定，
+                    # 所以没进 `written` 的文件在 `out/` 里就是原样副本，
+                    # 与现盘逐字节相同（抽 40 个文件验证：40/40 相同）。
+                    n_rm, freed, kept = prune_written_out(
+                        ws.out_dir,
+                        Path(rep.backup_dir),
+                        rep.written,
+                        safe_to_clear=not rep.aborted,
+                    )
+                    if n_rm:
+                        ent.message += (
+                            f"；回收 out/ 冗余 {n_rm} 个文件"
+                            f"（{freed / 1024 / 1024:.1f} MB）"
+                        )
+                    if kept:
+                        log.info("%d 个文件没有备份，已保留在 out/", len(kept))
             else:
                 ent.message = f"产物在 {ws.out_dir}（未写回）"
             ent.status = "done"

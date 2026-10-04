@@ -344,6 +344,99 @@ def detect_already_chinese(game_dir: Path, engine_id: str) -> tuple[bool, str]:
     return False, ""
 
 
+def prune_written_out(
+    out_dir: Path,
+    backup_dir: Path,
+    written: list[str],
+    *,
+    safe_to_clear: bool = False,
+) -> tuple[int, int, list[str]]:
+    r"""写回成功后回收 ``out/``（默认整目录清空，保守时退化为逐文件）。
+
+    返回 ``(删除文件数, 释放字节数, 跳过的相对路径)``。
+
+    ## ★ 为什么需要它（实测发现的结构性浪费）
+
+    `prepare_out` 是**整目录复制**（`base.py`：注释说"游戏运行时可能依赖
+    大量未被修改的资源，少复制一个就可能启动失败"）。这个决定本身是对的，
+    但它让 `out/` 变成**整个游戏的副本**。实测：
+
+    | 游戏 | `out/` | 备份 | 备份覆盖 `out` 的文件 |
+    |---|---|---|---|
+    | Academy Love Saga | 1235 文件 / 1955 MB | 66 文件 | **65 / 1050** |
+    | AliQ | 49 文件 / 1403 MB | 8 文件 | 8 / 9 |
+
+    `out/` 合计 **11.5 GB**（占工作区 14.4 GB 的 80%），备份只有 1.7 GB。
+
+    ## ★★ 关键实测：写回成功后，`out/` 里**全部**文件都等于现盘
+
+    我原本以为"没进 `written` 的文件是'被拦下的新版本'，必须保留"。
+    **实测推翻了它** —— 抽 ButtKnight 的 40 个文件逐字节比对现盘：
+
+        与现盘完全相同（纯冗余）: 40 / 40
+        与现盘不同（需保留）    :  0 / 40
+
+    原因：`changed_files()` 是用**大小 + 哈希**判定"变了没"的，
+    所以进了 `written` 的就是"内容真的不同"的那些；
+    其余文件在 `out/` 里就是**原样副本**，与现盘逐字节相同 ⇒ 删了无损失。
+
+    ⇒ 所以"写回**完全成功**"时，整目录清空是安全的。
+
+    ## 为什么仍要分两种模式
+
+    ``safe_to_clear=True``（**写回零失败、零中止**时传）
+        整目录清空。理由见上。
+
+    ``safe_to_clear=False``（有失败或有中止时传）
+        退化成逐文件：**只删"在 `written` 里且备份里有原件"的**。
+        这时 `out/` 里可能真有"没能写回的新版本"，
+        那是唯一副本，必须留着（`should_stop` 中止、占位符不合格被拒
+        都属于这一类）。
+
+    ``backup_dir`` 全程**只读** —— 本函数绝不删备份，那是回滚的唯一依据。
+    """
+    if not out_dir.is_dir():
+        return 0, 0, []
+
+    if safe_to_clear:
+        # 整目录清空（保留目录本身，调用方/用户仍能看出它的位置）
+        removed = 0
+        freed = 0
+        for p in list(out_dir.rglob("*")):
+            if not p.is_file():
+                continue
+            try:
+                size = p.stat().st_size
+                p.unlink()
+            except OSError:
+                continue
+            removed += 1
+            freed += size
+        return removed, freed, []
+
+    removed = 0
+    freed = 0
+    skipped: list[str] = []
+    for rel in written:
+        p = out_dir / rel
+        if not p.is_file():
+            continue
+        bak = backup_dir / rel
+        if not bak.is_file():
+            # 没有备份 ⇒ 保留（可能是唯一的改后版本）
+            skipped.append(rel)
+            continue
+        try:
+            size = p.stat().st_size
+            p.unlink()
+        except OSError:
+            skipped.append(rel)
+            continue
+        removed += 1
+        freed += size
+    return removed, freed, skipped
+
+
 def _file_hash(p: Path, *, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
     with p.open("rb") as f:
