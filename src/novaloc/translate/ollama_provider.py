@@ -1506,11 +1506,11 @@ class OllamaTranslationProvider:
 
             return raw_by_index, err, masked_all, slots_all
 
-        # ---- 2a. 并发派发所有批次 ---- ★ 吞吐关键
+        # ---- 2a. 并发派发批次（**窗口式**，带背压） ---- ★ 吞吐关键
         #
         # 原实现把「发请求」和「校验」写在同一个 `for` 里 ⇒ 每批都要
-        # 等 Ollama 往返结束才发下一批 ⇒ `OLLAMA_NUM_PARALLEL=4` 的
-        # 4 个槽位**永远用不满**。
+        # 等 Ollama 往返结束才发下一批 ⇒ `OLLAMA_NUM_PARALLEL` 的
+        # 多个槽位**永远用不满**。
         #
         # 实测（`.scratch/_probe_concurrency.py`，25 条批）：
         #
@@ -1520,27 +1520,64 @@ class OllamaTranslationProvider:
         # | 4 | **655** |
         # | 5 | 416（超出槽位，排队） |
         #
-        # ⇒ 并发数应与 `OLLAMA_NUM_PARALLEL` 相等（本机 4）。
+        # ## ★★ 为什么必须是"窗口式"而不是"一次性 submit 全部"
+        #
+        # 我第一版写的是 `ThreadPoolExecutor` + **一次性把所有批次
+        # submit 进去**（`{_bi: pool.submit(...) for _bi, _bt in enumerate(batches)}`）。
+        # 那等于**同时**向 Ollama 发几百个请求（一个 49,733 条的游戏
+        # 会切出上千个批）。后果实测：
+        #
+        # ```
+        # [err] Ollama 请求过慢：POST /api/chat 用了 300.0s（失败）超时
+        # [err] 批 0（1 条）第 1 次失败：请求 Ollama 超时
+        # ```
+        #
+        # **每个请求的 300 秒超时从"提交时刻"开始算**，而 Ollama 只有
+        # `-np N` 个槽 ⇒ 排在队尾的请求**必然超时**（还没轮到它就到期了）。
+        # 表现出来就是"连 1 条的批都超时"、worker 攒到 **102 个线程**、
+        # 而 `llama-server` 的 CPU 很低（它在慢慢处理队首）。
+        #
+        # ⇒ 需要的是**背压**：最多 `_workers` 个在飞，回来一个补一个。
+        #   这样任何请求的等待时间都被限制在 O(_workers) 个批次的时长内。
+        #
+        # ⚠️ 教训：`ThreadPoolExecutor.map` / 一次性 submit 都会把
+        #    **全部**任务立即开始等待 —— 对"下游有并发上限"的场景，
+        #    必须自己控制提交节奏。
         _workers = max(1, int(getattr(self.cfg.ollama, "concurrency", 1) or 1))
         _results: dict[int, tuple[dict[int, str], str | None, list[str], list[list[str]]]] = {}
         if _workers > 1 and len(batches) > 1:
-            log.debug("并发派发 %d 个批次（concurrency=%d）", len(batches), _workers)
-            from concurrent.futures import ThreadPoolExecutor
+            log.debug(
+                "窗口式并发派发 %d 个批次（concurrency=%d）", len(batches), _workers
+            )
+            from collections import deque
+            from concurrent.futures import ThreadPoolExecutor, wait
 
+            def _take(_bi: int, _fut: object) -> None:
+                try:
+                    _results[_bi] = _fut.result()  # type: ignore[attr-defined]
+                except _RETRYABLE as _exc:
+                    _results[_bi] = ({}, str(_exc), [], [])
+                except Exception as _exc:  # noqa: BLE001
+                    # 单批的意外异常不该毁掉整轮翻译
+                    log.warning("批次 %d 派发异常：%s", _bi, _exc)
+                    _results[_bi] = ({}, str(_exc), [], [])
+
+            _queue = deque(enumerate(batches))
             with ThreadPoolExecutor(max_workers=_workers) as _pool:
-                _futs = {
-                    _bi: _pool.submit(_one_batch, _bi, _bt)
-                    for _bi, _bt in enumerate(batches)
-                }
-                for _bi in sorted(_futs):
-                    try:
-                        _results[_bi] = _futs[_bi].result()
-                    except _RETRYABLE as _exc:
-                        _results[_bi] = ({}, str(_exc), [], [])
-                    except Exception as _exc:  # noqa: BLE001
-                        # 单批的意外异常不该毁掉整轮翻译
-                        log.warning("批次 %d 派发异常：%s", _bi, _exc)
-                        _results[_bi] = ({}, str(_exc), [], [])
+                # 先填满窗口
+                _inflight: dict[object, int] = {}
+                while _queue and len(_inflight) < _workers:
+                    _bi, _bt = _queue.popleft()
+                    _inflight[_pool.submit(_one_batch, _bi, _bt)] = _bi
+                # 回来一个补一个
+                while _inflight:
+                    _done, _ = wait(list(_inflight), return_when="FIRST_COMPLETED")
+                    for _fut in _done:
+                        _bi = _inflight.pop(_fut)
+                        _take(_bi, _fut)
+                        if _queue:
+                            _nbi, _nbt = _queue.popleft()
+                            _inflight[_pool.submit(_one_batch, _nbi, _nbt)] = _nbi
         else:
             for _bi, _bt in enumerate(batches):
                 _results[_bi] = _one_batch(_bi, _bt)

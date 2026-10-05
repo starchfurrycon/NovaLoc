@@ -143,6 +143,57 @@ def test_serial_never_overlaps() -> None:
     )
 
 
+def test_inflight_never_exceeds_workers() -> None:
+    r"""★★ 背压：**同时在飞的批次数**不得超过并发数。
+
+    ## 为什么这是必须钉住的约束
+
+    我第一版用 `ThreadPoolExecutor` **一次性 submit 全部批次**
+    （`{_bi: pool.submit(...) for _bi, _bt in enumerate(batches)}`）。
+    那等于同时向 Ollama 发几百个请求（一个 49,733 条的游戏会切出
+    上千个批），而**每个请求的 300 秒超时从"提交时刻"开始算** ⇒
+    排在队尾的请求**必然超时**。实测就是这么挂死的：
+
+    ```
+    [err] Ollama 请求过慢：POST /api/chat 用了 300.0s（失败）超时
+    [err] 批 0（1 条）第 1 次失败：请求 Ollama 超时
+    ```
+
+    （worker 攒到 102 个线程、`llama-server` CPU 很低 —— 它在慢慢处理队首。）
+
+    ## 判据
+
+    用 `concurrent_peak`（峰值同时进行的请求数）而不是耗时：
+    **只要峰值 ≤ concurrency，任何请求的等待时间就被限制在
+    O(concurrency) 个批次时长内**，不会出现"排队到超时"。
+    """
+    workers = 3
+    p = _Slow(_ctx(workers), delay=0.05)
+    p.translate_batch(_items(N), "zh-CN")
+    # 先确认确实并发了（否则这条测试在串行实现上也会绿）
+    assert p.concurrent_peak >= 2, f"没并发（峰值 {p.concurrent_peak}）"
+    # ★ 核心：不超过并发数
+    assert p.concurrent_peak <= workers, (
+        f"同时在飞 {p.concurrent_peak} 个批次 > 并发数 {workers} —— "
+        "没有背压，请求会堆到超时"
+    )
+
+
+def test_windowed_dispatch_keeps_all_results_in_order() -> None:
+    r"""窗口式派发**不能**打乱结果顺序（背压改造的等价性守卫）。
+
+    一次提交全部 vs 窗口式的差别只在**提交节奏**，不该影响结果。
+    但顺序错了会让译文串到别的条目上 —— 比漏译更糟。
+    """
+    workers = 3
+    serial = _Slow(_ctx(1), delay=0.0)
+    out_s = [e.target for e in serial.translate_batch(_items(N), "zh-CN")]
+    par = _Slow(_ctx(workers), delay=0.0)
+    out_p = [e.target for e in par.translate_batch(_items(N), "zh-CN")]
+    assert out_s == out_p, "窗口式并发的结果顺序与串行不一致"
+    assert all(t.strip() for t in out_p), "有漏译"
+
+
 def test_concurrency_one_still_works() -> None:
     """并发=1 是合法配置（小显存机器），必须照常出译文。"""
     p = _Slow(_ctx(1), delay=0.0)
