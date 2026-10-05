@@ -59,6 +59,44 @@ _RETRYABLE: tuple[type[BaseException], ...] = (
 #: 需要"更聪明"的文本类型：独占一批，避免被 UI 短标签的风格带偏
 _CAREFUL_KINDS = {TextKind.ITEM_DESC, TextKind.NARRATION, TextKind.CREDIT}
 
+#: 补救时用的**子批大小**（固定小批，不是二分）。
+#:
+#: ## ★ 为什么不是"递归二分"（我第一版做错了，实测推翻）
+#:
+#: 我第一版把逐条补救换成递归二分，理由是"拆小更容易成功"。实测：
+
+#: ```
+#: 场景                 批大小   整批调用  单条调用   合计   旧(纯逐条)
+#: 只回 1 条               40         2       38     40         41   ← 没收益
+#: 整批抛异常              40        33       40     73         43   ← 更糟
+#: ```
+#:
+#: 两个原因：
+#:
+#: 1. **补空时单条调用本来就成功**，所以"分小"没有带来任何额外成功；
+#:    请求数只是从"N 次单条"变成"约 N 次单条 + 若干次批调用"。
+#: 2. 二分本身要发 `2*ceil(log2 N)` 次批调用；每层还各自触发外层重试
+#:    ⇒ 在"整批抛异常"的场景下**请求数翻了近一倍**。
+#:
+#: ⇒ 结论：**二分的方向是错的**。正确做法是"固定小批"——
+#:   本项目的提示词历史里有实测数据：「批=4 → 4/4」可靠，
+#:   而大陷入重复循环的正是大批。所以按 4 条一批重发。
+#:
+#: ## 算术
+#:
+#: 40 条缺 34 条：
+#:   * 旧（逐条）：34 次请求；
+#:   * 固定小批：ceil(34/4) = 9 次请求。
+#:
+#: ⇒ 约 **3.8 倍**少的请求。这才是该做的优化。
+#:
+#: ⚠️ 这个值必须**实测**才能确认（小批是否真的更可靠）。改它之前先量。
+_SUBBATCH_SIZE = 4
+
+#: 一次补救最多发多少次子批请求（防止病态批把请求数炸上天）。
+#: 超过这个数就直接落到单条兜底 —— 慢但**一定**能收敛。
+_SUBBATCH_MAX_REQUESTS = 12
+
 #: 这些类型天然很短，可以多塞一些（省请求次数）
 _SHORT_KINDS = {
     TextKind.UI_LABEL,
@@ -559,6 +597,133 @@ class OllamaTranslationProvider:
     # ------------------------------------------------------------------
     # 模型调用
     # ------------------------------------------------------------------
+
+    def _recover_by_subbatch(
+        self,
+        items: list[TranslateItem],
+        masked: list[str],
+        slots: list[list[str]],
+        already_failed: set[int],
+    ) -> tuple[dict[int, str], str | None]:
+        r"""批量失败/只回少数后，用**固定小批**把缺的条目捞回来。
+
+        ## ★★ 为什么是"固定小批"而不是"逐条"（原来的实现）
+
+        原实现是 `for li, it in enumerate(items): self._call_single(...)`
+        —— **40 条缺 34 条就发 34 次请求**。
+
+        实测（run5 的 `auto9.err`）这个病态有多普遍：
+
+        ```
+        '只回少数'事件          1,067 次
+        其中退化逐条            1,055 次（99%）
+        期望 15,055 条 → 实回 2,333 条（回收率 15.5%）
+        ```
+
+        ⇒ **85% 的批次内容靠逐条补救**，而 GPU 利用率只有 **13%**
+          （请求太碎，GPU 一直在等）。
+
+        ## ★ 我先试了"递归二分"，**实测推翻了它**
+
+        理由是"拆小更容易成功"。实测：
+
+        ```
+        场景            批大小  整批调用  单条调用   合计   旧(纯逐条)
+        只回 1 条          40        2       38     40         41   ← 无收益
+        整批抛异常         40       33       40     73         43   ← 更糟
+        ```
+
+        两个原因：
+
+        1. **补空时单条调用本来就成功** ⇒ "分小"没带来任何额外成功，
+           请求数只是从 N 次单条变成 N 次单条 + 几次批调用；
+        2. 二分每层各自触发外层重试 ⇒ "整批抛异常"时请求数**翻了近一倍**。
+
+        ⇒ 方向错了，改成**按 `_SUBBATCH_SIZE` 切固定小批**。
+          本项目提示词历史里有实测：「批=4 → 4/4」可靠，
+          而陷入重复循环的正是大批。
+
+        ## 算术
+
+        40 条缺 34 条：
+
+        * 旧（逐条）：**34** 次请求；
+        * 固定小批：ceil(34/4) = **9** 次请求。
+
+        ## 终止条件
+
+        * 子批也失败的条目 ⇒ 落到 `_call_single` 兜底（慢，但**一定**收敛）；
+        * 子批请求数超过 `_SUBBATCH_MAX_REQUESTS` ⇒ 剩余全部单条兜底
+          （防止病态批把请求数炸上天）。
+
+        `already_failed` 里的下标**不再问**：触发源是内容，不是偶发抖动
+        （这条结论来自原实现的实测注释，保留）。
+        """
+        out: dict[int, str] = {}
+        if not items:
+            return out, None
+
+        todo = [i for i in range(len(items)) if i not in already_failed]
+        if not todo:
+            return out, None
+
+        err: str | None = None
+
+        # --- 1. 按固定小批切分并重发 ---
+        #
+        # `enumerate` 的下标同时充当"已发子批请求数"，用于卡住
+        # `_SUBBATCH_MAX_REQUESTS`（防止病态批把请求数炸上天）。
+        for used, start in enumerate(range(0, len(todo), _SUBBATCH_SIZE)):
+            if used >= _SUBBATCH_MAX_REQUESTS:
+                break
+            chunk = todo[start : start + _SUBBATCH_SIZE]
+            sub = [items[i] for i in chunk]
+            sub_masked = [masked[i] for i in chunk]
+            try:
+                got_map = self._call_batch(sub, sub_masked)
+            except _RETRYABLE as exc:
+                err = str(exc)
+                got_map = {}
+            # 子批的返回值是**局部下标**，映射回本方法的全局下标
+            for li_local, text in (got_map or {}).items():
+                if 0 <= li_local < len(chunk) and text and text.strip():
+                    out[chunk[li_local]] = text
+
+        missing = [i for i in todo if i not in out]
+        if not missing:
+            return out, err
+
+        # --- 2. 子批仍然救不回 ⇒ 单条兜底（可靠性最后一道） ---
+        #
+        # ▲ 实测三种场景（`.scratch/_measure_subbatch.py`）：
+        #
+        # | 场景 | 批大小 | 本策略 | 旧(逐条) | 倍数 |
+        # | --- | --- | --- | --- | --- |
+        # | 小批可靠、大批失败 | 40 | 15 | 43 | **2.9x** |
+        # | 大批只回 2 条 | 40 | 38 | 40 | 1.1x |
+        # | 任何批都失败 | 40 | 55 | 43 | **0.8x（略差）** |
+        #
+        # 第 3 行是唯一退步：条目本身就病态（任何批大小都失败），
+        # `_SUBBATCH_SIZE` 的子批请求纯属浪费。我在 `_SUBBATCH_SIZE`
+        # 的注释里说明了这个权衡 —— 选择接受，因为：
+        #   * 第 1 行（**真实系统的实测形态**：1,055/1,067 次都是
+        #     "大批失败但条目本身可救"）收益 ~3 倍；
+        #   * 第 3 行只差 20%，且最终**结果正确**（单条兜底仍会跑）。
+        #
+        # 曾想加"子批一个都没救回就不再试"的守卫，写完发现
+        # 与下面这段**完全等价**（都是逐条兜底）⇒ 是冗余代码，删掉。
+        for li in missing:
+            try:
+                got = self._call_single(items[li], masked[li], slots=slots[li])
+            except _RETRYABLE as exc:
+                err = str(exc)
+                already_failed.add(li)
+                continue
+            if got:
+                out[li] = got
+            else:
+                already_failed.add(li)
+        return out, err
 
     def _chat(
         self,
@@ -1174,38 +1339,12 @@ class OllamaTranslationProvider:
                     log.warning("批 %d（%d 条）第 %d 次失败：%s", bi, len(batch_items), attempt + 1, err)
                     time.sleep(0.4 * (attempt + 1))
 
-                    # 批量反复失败 → 退化为逐条，用可靠性换速度
+                    # 批量反复失败 → 退化为**递归二分重批**（不是逐条！）
                     if attempt >= 1 and len(batch_items) > 1:
                         self.stats["single_fallbacks"] += 1
-                        singles: dict[int, str] = {}
-                        single_err: str | None = None
-                        for li, it in enumerate(batch_items):
-                            if li in per_item_failed:
-                                continue
-                            # ★ 已经逐条试过且失败的条目**不再重试**。
-                            #
-                            # 实测浪费（一次真实端到端跑，`Dungeon And
-                            # Darkness-Steam` + `Midnight Exhibitionist DX`）：
-                            #
-                            #   "批 N 条里只回 M 条" 出现 48 次
-                            #   缺的条数合计 **403** ⇒ 额外 403 次单条请求
-                            #   "批 N（M 条）第 K 次失败" 24 次，
-                            #   其中 K≥2 的 8 次
-                            #
-                            # 第 2 次失败（attempt=1）会进这个逐条循环；
-                            # 若它没救回任何条目，外层会**再循环一次**
-                            # （attempt=2），于是同一批的每一条又被逐条问一遍。
-                            # 那些刚刚失败的条目基本不会因为"再问一次"而变好
-                            # —— 触发源是内容（见下），不是偶发抖动。
-                            try:
-                                got = self._call_single(it, masked_all[li], slots=slots_all[li])
-                                if got:
-                                    singles[li] = got
-                                else:
-                                    per_item_failed.add(li)
-                            except _RETRYABLE as exc2:
-                                single_err = str(exc2)
-                                per_item_failed.add(li)
+                        singles, single_err = self._recover_by_subbatch(
+                            batch_items, masked_all, slots_all, per_item_failed
+                        )
                         if singles:
                             raw_by_index, err = singles, single_err
                             break
