@@ -1817,6 +1817,53 @@ class Pipeline:
             for w in res.warnings[:100]:
                 self.bus.log(w, stage="apply", severity=Severity.WARN)
             if not res.ok:
+                # ★★ 幂等：区分"真的写不出去"和"**早就写过了**"。
+                #
+                # ## 实测的真实回归（我自己引入的）
+                #
+                # 我给 `out/` 加了"写回成功后回收"（省下 11.5 GB，见 ROADMAP §22）。
+                # 但回收之后，下一轮 `auto` 会这样走：
+                #
+                #   1. `prepare_out` 从**现盘**重新复制 `out/`
+                #      —— 而现盘已经是译文了；
+                #   2. 于是 `changed_files()` 发现**零差异**；
+                #   3. `files_written == 0` 且 `by_file` 非空
+                #      ⇒ `res.ok = False` ⇒ 报"没有任何文件被写入"
+                #      ⇒ **整局被判 failed**。
+                #
+                # 实测受害者：`AliQ`（473 条全译完、8 个文件已写回），
+                # 下一轮变成 `✗ failed 条目 0 用时 10.7 s`。
+                # 日志证据：`PipelineError: [回写产物] 没有任何文件被写入`。
+                #
+                # ## 判据：源文件里是不是**已经**有这些译文了
+                #
+                # 抽查若干条"有译文"的条目，看它的 `target` 是否已经出现在
+                # **游戏现盘**对应文件里。全部命中 ⇒ 这是"已应用"而非"失败"，
+                # 按成功返回（`files_written=0` 是正确结果，不是错误）。
+                #
+                # 只抽查有限的条目（默认 40）—— 目的是**判别**，不是审计；
+                # 全量比对在大游戏上会很慢。
+                if res.files_written == 0 and translations:
+                    already, checked = self._already_applied(units, translations)
+                    if checked and already == checked:
+                        self.bus.log(
+                            f"这 {checked} 条译文**已经**在游戏文件里了"
+                            "（上一轮已写回）。按幂等处理：无需重复回写。",
+                            stage="apply",
+                            severity=Severity.INFO,
+                        )
+                        return StageResult(
+                            stage="apply",
+                            ok=True,
+                            message=f"译文已就位（抽查 {checked} 条全部命中），无需重复回写",
+                            stats={
+                                "written": 0,
+                                "already_applied": True,
+                                "checked": checked,
+                                "translations": len(translations),
+                                "out_dir": str(out_dir),
+                            },
+                        )
                 return StageResult(
                     stage="apply",
                     ok=False,
@@ -1846,6 +1893,83 @@ class Pipeline:
             )
 
         return self._run("apply", go)
+
+    def _already_applied(
+        self,
+        units: list[TextUnit],
+        translations: dict[str, str],
+        *,
+        sample: int = 40,
+    ) -> tuple[int, int]:
+        r"""抽查：这些译文是不是**已经**在游戏现盘里了。
+
+        返回 ``(命中的条数, 实际抽查的条数)``。用于区分
+        "回写失败" 与 "早就写过了"（幂等），见调用处的说明。
+
+        ## 判据为什么是"译文出现在现盘文件里"
+
+        `stage_apply` 是把译文写进 `out/`，再由 `auto` 的 `write_back`
+        覆盖回游戏。所以"已应用"的**可观测后果**就是：
+        **游戏现盘的那个文件里含有这条译文**。
+
+        这比"比较 mtime""看备份在不在"都可靠 —— 它是内容层面的证据。
+        （ROADMAP §13 那条判据的精神：只有内容比对算数。）
+
+        ## ★ 必须同时支持**二进制**文件（实测踩到的坑）
+
+        第一版只做 `read_text(encoding="utf-8", errors="ignore")` 再搜字符串。
+        实测 AliQ 只命中 **28/40**，看着像"没写全"，其实是我的判据错了：
+        未命中的全在 `resources.assets` / `level0` 这类**二进制**资源里，
+        用 `errors="ignore"` 解码会**丢掉无效字节**，而译文（UTF-8 编码）
+        在文件里是**原始字节**形式存的，解码后搜不到。
+
+        证据：那些"未命中"的条目源文是 `'Spin'` → 译 `'旋转'`（UI 标签），
+        它们**确实写进去了**，只是被判据漏掉。
+
+        ⇒ 判据是**两种都搜**：文本解码后搜 + 原始字节里搜 UTF-8 编码的
+        译文。Unity 的 `.assets` 走后者，RPG Maker 的 `.json` 走前者。
+        """
+        src = self.ws.effective_source
+        checked = 0
+        hit = 0
+        for u in units:
+            if checked >= sample:
+                break
+            tgt = translations.get(u.uid)
+            if not tgt or len(tgt.strip()) < 2:
+                continue
+            rel = u.location.file
+            p = src / rel
+            if not p.is_file():
+                # 找不到源文件 ⇒ 这条无法判定，跳过（不计入 checked）
+                continue
+            # 译文可能被引擎转义（`\n` 等），取第一行的前若干字符比对
+            needle = tgt.strip().splitlines()[0].strip()[:24]
+            if not needle:
+                continue
+            try:
+                if p.stat().st_size > 128 * 1024 * 1024:
+                    continue
+                raw = p.read_bytes()
+            except OSError:
+                continue
+            checked += 1
+            try:
+                nb = needle.encode("utf-8")
+            except UnicodeEncodeError:
+                continue
+            # ① 原始字节里搜（二进制资源 / 未解码的 UTF-8）
+            if nb in raw:
+                hit += 1
+                continue
+            # ② 文本解码后再搜（JSON 里可能是 `\uXXXX` 转义形态）
+            try:
+                blob = raw.decode("utf-8", errors="ignore")
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if needle in blob:
+                hit += 1
+        return hit, checked
 
     def _repack_archives(self) -> dict[str, Any]:
         """把解包树里改过的文件打回原归档（带备份）。
