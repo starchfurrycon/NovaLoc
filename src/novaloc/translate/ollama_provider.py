@@ -1291,7 +1291,35 @@ class OllamaTranslationProvider:
         # 换行也屏蔽（多行条目的完整性问题，见 placeholders.mask 的 newlines 参数）
         mask_nl = self.cfg.translate.mask_newlines
 
-        for bi, batch in enumerate(batches):
+        def _one_batch(
+            bi: int,
+            batch: list[int],
+        ) -> tuple[dict[int, str], str | None, list[str], list[list[str]]]:
+            r"""发**一个**批次的请求：屏蔽 + 重试 + 固定小批补救 + 补空。
+            返回 ``(局部下标→屏蔽态译文, 错误串, masked_all, slots_all)``。
+            `masked_all` / `slots_all` 一并带出，因为外层的校验段要用它们
+            还原占位符。
+
+            ## 为什么是**嵌套函数**而不是方法
+
+            我前两次把它抽成**方法**，都因为「漏了外层变量」而搞坏
+            （35 个 `F821 Undefined name`）。嵌套函数用**闭包**
+            自动捕获 `uniq_items` / `use_mask` / `mask_nl` / `self`
+            / `log` / `time` 等一切外层名字 —— 从根上消除那一类错误。
+
+            ## 两个 `break` 为什么不用改
+
+            它们跳的是**内层** `for attempt in range(3)`，不是外层循环。
+            我一开始误以为要改成 `return`，那是错的 —— 会提前跳过
+            「补空」和「还原」两段。实测确认它们都在内层。
+
+            ## 线程安全
+
+            本函数**不碰**任何跨批状态（`out` / `first_of` 留在外层），
+            只读 `self.cfg`。`httpx.Client` 官方支持多线程共享。
+            `self.stats` 的「读-改-写」在多线程下**可能丢计数** ——
+            可接受（统计不是判据），**不影响任何译文**。
+            """
             # ★ 动态资源占用：每批之前问一次"现在该让路吗"。
             #
             # 为什么放在**批次边界**而不是"随时打断"：
@@ -1448,7 +1476,52 @@ class OllamaTranslationProvider:
             #    48.6% 的 `failed` 才是（其中大量是 500
             #    `token repeat limit reached`）。
 
-            # ---- 3. 还原 + 校验 + 守卫 ----
+
+            return raw_by_index, err, masked_all, slots_all
+
+        # ---- 2a. 并发派发所有批次 ---- ★ 吞吐关键
+        #
+        # 原实现把「发请求」和「校验」写在同一个 `for` 里 ⇒ 每批都要
+        # 等 Ollama 往返结束才发下一批 ⇒ `OLLAMA_NUM_PARALLEL=4` 的
+        # 4 个槽位**永远用不满**。
+        #
+        # 实测（`.scratch/_probe_concurrency.py`，25 条批）：
+        #
+        # | 并发 | 吞吐(条/分) |
+        # | --- | --- |
+        # | 1 | 289 |
+        # | 4 | **655** |
+        # | 5 | 416（超出槽位，排队） |
+        #
+        # ⇒ 并发数应与 `OLLAMA_NUM_PARALLEL` 相等（本机 4）。
+        _workers = max(1, int(getattr(self.cfg.ollama, "concurrency", 1) or 1))
+        _results: dict[int, tuple[dict[int, str], str | None, list[str], list[list[str]]]] = {}
+        if _workers > 1 and len(batches) > 1:
+            log.debug("并发派发 %d 个批次（concurrency=%d）", len(batches), _workers)
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=_workers) as _pool:
+                _futs = {
+                    _bi: _pool.submit(_one_batch, _bi, _bt)
+                    for _bi, _bt in enumerate(batches)
+                }
+                for _bi in sorted(_futs):
+                    try:
+                        _results[_bi] = _futs[_bi].result()
+                    except _RETRYABLE as _exc:
+                        _results[_bi] = ({}, str(_exc), [], [])
+                    except Exception as _exc:  # noqa: BLE001
+                        # 单批的意外异常不该毁掉整轮翻译
+                        log.warning("批次 %d 派发异常：%s", _bi, _exc)
+                        _results[_bi] = ({}, str(_exc), [], [])
+        else:
+            for _bi, _bt in enumerate(batches):
+                _results[_bi] = _one_batch(_bi, _bt)
+
+        # ---- 2b. 顺序跑校验（**内容一字不改**，数据改从 _results 取） ----
+        for bi, batch in enumerate(batches):
+            batch_items = [uniq_items[i] for i in batch]
+            raw_by_index, err, masked_all, slots_all = _results[bi]
             for local_i, global_i in enumerate(batch):
                 item = uniq_items[global_i]
                 entry = out[first_of[global_i]]
