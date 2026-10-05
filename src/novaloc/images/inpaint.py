@@ -201,11 +201,125 @@ def inpaint_boxes(
 # --------------------------------------------------------------------------
 
 
+class LamaOnnxInpainter:
+    r"""LaMa 的 **ONNX** 封装（本机首选路径）。
+
+    ## ★ 为什么走 ONNX 而不是 TorchScript
+
+    代码原本只支持 `.pt`（`torch.jit.load`），但那要求 **torch**
+    —— 本机**没装**，而装它约 2 GB。同时本机**已经有**
+    `onnxruntime 1.24.4 + DirectML`（GPU 加速）在跑 OCR。
+
+    ⇒ 用 ONNX 版 LaMa 是**零新依赖 + 能复用 GPU**的路子。
+
+    实测（`D:\NovaLoc\models\lama\inpainting_lama_2025jan.onnx`，92.6 MB）：
+
+    * 来源：**OpenCV 官方** `opencv/inpainting_lama`（配 `cv2 5.0`，
+      兼容性有保障，且比社区版小一半）；
+    * 输入 `image [b,3,512,512] float` + `mask [b,1,512,512] float`；
+    * 输出 `output [b,3,512,512] float`；
+    * `providers = ['DmlExecutionProvider', 'CPUExecutionProvider']`
+      ⇒ **DML 可用，走 GPU**。
+
+    ## 尺寸处理
+
+    模型固定吃 512×512，所以：
+    把原图缩放到 512、推理、再把**结果**放大回原尺寸。
+
+    ⚠️ 放大回原尺寸会**损失原图细节** —— 所以**不能整张图替换**，
+    只把修补结果**贴回 mask 覆盖的区域**（见 `__call__`），
+    其余像素保持原样。这是"只抹文字、不动背景"的关键。
+    """
+
+    def __init__(self, model_path: Path, *, providers: list[str] | None = None) -> None:
+        r"""加载 ONNX 会话。
+
+        ## ★ 默认 **不用 DirectML**（实测该模型跑不了）
+
+        `DirectML` 在 LaMa 的 FFC 模块上执行 `MatMul` 节点会失败：
+
+            Non-zero status code returned while running MatMul node.
+            Name:'/generator/model.5/conv1/ffc/conv2g2/fu/rtn/MatMul_5'
+
+        ⇒ 实测 `providers=['DmlExecutionProvider']` **每次都抛异常**，
+        而 CPU 跑得通（512×512 约 9.4 秒）。
+
+        更糟的是那个异常的信息是**本地化的 GBK 字节**，
+        在 UTF-8 环境里解码又抛 `UnicodeDecodeError`，
+        把真正的错误盖掉了。
+
+        ⇒ 所以默认只用 CPU：**慢，但确定能用**。
+        调用方若确认自己环境支持，可以显式传 `providers=['DmlExecutionProvider', ...]`。
+        """
+        import onnxruntime as ort
+
+        so = ort.SessionOptions()
+        # 关掉啰嗦日志（否则每次推理刷一堆 native warning）
+        so.log_severity_level = 3
+        want = providers or ["CPUExecutionProvider"]
+        self.session = ort.InferenceSession(str(model_path), so, providers=want)
+        self.size = 512
+
+    def __call__(self, image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        r"""抹掉 mask 区域的文字，返回新图（BGR uint8）。
+
+        ## ★ 预处理/后处理**必须照 OpenCV 参考实现**（我第一版两处都错了）
+
+        官方 `lama.py` 的关键三行：
+
+        ```python
+        image_blob = cv.dnn.blobFromImage(image, 0.00392, (512,512), (0,0,0), False, False)
+        mask_blob  = (cv.dnn.blobFromImage(mask, 1.0, (512,512), (0,), False, False) > 0).astype(np.float32)
+        result     = np.transpose(output[0], (1,2,0)).astype(np.uint8)
+        ```
+
+        我第一版的两个错误：
+
+        1. **画蛇添足转了 RGB**（`cvtColor(BGR2RGB)`）。参考实现第 5 个参数
+           `swapRB=False` ⇒ **直接用 BGR**。颜色通道搞反会让输出色彩错乱。
+        2. **输出又乘了 255**。实测模型输出范围**已经是 `[0, 255]`**
+           （不是 `[0,1]`），参考实现也是直接 `astype(np.uint8)`。
+           再乘 255 会**全部溢出成白色**。
+
+        ## 只贴回 mask 区域（这一条是我加的，参考实现没做）
+
+        参考实现整张图替换。但模型固定吃 512，放大回原尺寸会**糊掉整图**。
+        我们只需要"抹掉文字"，所以**只把 mask 覆盖的像素贴回去**，
+        其余保持原图 —— 背景细节一点不损失。
+        """
+        h, w = image_bgr.shape[:2]
+        side = self.size
+        # 1) 原图 → BGR float [0,1]（**不转 RGB**，照参考实现），缩放到 512
+        img = image_bgr.astype(np.float32) * 0.00392
+        img_s = cv2.resize(img, (side, side), interpolation=cv2.INTER_AREA)
+        # 2) mask → 0/1，同样缩放（最近邻，避免半透明边缘）
+        m = (mask > 127).astype(np.float32)
+        m_s = cv2.resize(m, (side, side), interpolation=cv2.INTER_NEAREST)
+
+        inp = {
+            "image": img_s.transpose(2, 0, 1)[None],      # [1,3,H,W]
+            "mask": m_s[None, None],                       # [1,1,H,W]
+        }
+        out = self.session.run(None, inp)[0][0]            # [3,H,W]，范围 [0,255]
+        # 3) 结果 → BGR uint8（**不乘 255**），放回原尺寸
+        res = np.clip(out.transpose(1, 2, 0), 0, 255).astype(np.uint8)
+        res = cv2.resize(res, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # 4) 只把 mask 覆盖的区域贴回去，其余保持原图
+        sel = (mask > 127)[:, :, None]
+        out_img = image_bgr.copy()
+        np.copyto(out_img, res, where=np.broadcast_to(sel, out_img.shape))
+        return out_img
+
+
 class LamaInpainter:
     """LaMa（TorchScript）封装。装不上就静默降级，不阻塞主流程。
 
     LaMa 是 Apache-2.0，适合背景复杂的情况。本机没装 torch，
     所以这个类默认处于"不可用"状态，由 :func:`load_lama` 探测。
+
+    ⚠️ 本机**优先走** :class:`LamaOnnxInpainter`（ONNX + DirectML，
+    零新依赖）；这个 TorchScript 版本留着兼容已有 `.pt` 权重。
     """
 
     def __init__(self, model_path: Path, device: str = "cpu") -> None:
@@ -238,29 +352,76 @@ class LamaInpainter:
 
 
 def load_lama(model_path: Path | None = None) -> Any:
-    """尝试加载 LaMa，失败返回 ``None``（调用方据此降级）。"""
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        log.info("未安装 torch，跳过 LaMa（将使用纯色/OpenCV 修补）")
-        return None
+    r"""加载 LaMa 修补器；失败返回 ``None``（调用方据此降级）。
 
-    if model_path is None or not Path(model_path).exists():
+    ## 支持两种权重，**优先 ONNX**
+
+    1. **`.onnx`** ⇒ :class:`LamaOnnxInpainter`（需要 `onnxruntime`，
+       本机已装且带 DirectML ⇒ 走 GPU）。**零 torch 依赖**。
+    2. **`.pt`** ⇒ :class:`LamaInpainter`（需要 `torch`，本机未装）。
+
+    ``model_path`` 给的是**首选**路径；若它不存在，会去同一目录找
+    其它已知文件名（实测本机放的是 OpenCV 官方的
+    `inpainting_lama_2025jan.onnx`，而不是代码原来期望的 `lama.pt`）。
+
+    ## 为什么要"自动找同目录的其它候选"
+
+    原代码写死 `models/lama/lama.pt`。实测该文件**不存在**，
+    于是永远静默降级到纯色/OpenCV 修补 —— 而用户以为贴图汉化在工作。
+    多认几个候选名可以让"权重放对了但名字不同"不再变成静默失效。
+    """
+    # 解析实际要用的文件：先试给定路径，再在它的目录里找候选
+    chosen: Path | None = None
+    if model_path is not None:
+        p = Path(model_path)
+        if p.is_file():
+            chosen = p
+        elif p.parent.is_dir():
+            for pat in ("*.onnx", "*.pt"):
+                cands = sorted(p.parent.glob(pat))
+                if cands:
+                    chosen = cands[0]
+                    log.info("LaMa：%s 不存在，改用同目录的 %s", p.name, chosen.name)
+                    break
+    if chosen is None:
         log.info("未找到 LaMa 模型文件，跳过（将使用纯色/OpenCV 修补）")
         return None
 
+    suffix = chosen.suffix.lower()
+    if suffix == ".onnx":
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError:
+            log.info("未安装 onnxruntime，跳过 ONNX LaMa（将降级）")
+            return None
+        try:
+            inst = LamaOnnxInpainter(chosen)
+            prov = inst.session.get_providers()
+            log.info("LaMa(ONNX) 已加载：%s  providers=%s", chosen.name, prov)
+            return inst
+        except Exception as exc:  # noqa: BLE001
+            log.warning("LaMa(ONNX) 加载失败：%s", exc)
+            return None
+
+    # --- TorchScript 路径（需要 torch） ---
     try:
-        inst = LamaInpainter(Path(model_path))
-        log.info("LaMa 已加载：%s", model_path)
+        import torch  # noqa: F401
+    except ImportError:
+        log.info("未安装 torch，跳过 TorchScript LaMa（将降级）")
+        return None
+    try:
+        inst = LamaInpainter(chosen)
+        log.info("LaMa(TorchScript) 已加载：%s", chosen.name)
         return inst
     except Exception as exc:  # noqa: BLE001
-        log.warning("LaMa 加载失败：%s", exc)
+        log.warning("LaMa(TorchScript) 加载失败：%s", exc)
         return None
 
 
 __all__ = [
     "InpaintResult",
     "LamaInpainter",
+    "LamaOnnxInpainter",
     "build_mask",
     "inpaint_boxes",
     "load_lama",
