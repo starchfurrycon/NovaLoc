@@ -1385,6 +1385,26 @@ class Pipeline:
 
             from ..images.io import imwrite_bgr
 
+            #: ★ OCR 层报错的文件（`res.error` 非空）。见下面 2b 的聚合判断。
+            #
+            # ## 为什么必须单独收集
+            #
+            # 实测（隔离数据根里**没有 OCR 模型**时）：
+            #
+            # ```
+            # images_localize: ok=True 0/243 张贴图已汉化（0 处文字）
+            # localize.json:   243 条，全部 ok=False changed=False warnings=[]
+            # ```
+            #
+            # 也就是**OCR 引擎系统性失败**（"缺少 2 个离线模型：PP-OCRv6_det…"）
+            # 被表现成"这些图没有文字" —— 而 `stages.py` 只把 `res.error`
+            # 写进 `localize.json`，**从不记日志、从不统计**
+            # ⇒ 用户看到的是"贴图都没字"，而不是"OCR 起不来"。
+            #
+            # 这类"配置/依赖缺失"必须**响亮地**报出来，否则会静默地
+            # 让整个贴图汉化看起来"正常但无事可做"。
+            ocr_errors: list[str] = []
+
             for i, asset in enumerate(assets, 1):
                 src = src_root / asset.path
                 if not src.is_file():
@@ -1462,6 +1482,9 @@ class Pipeline:
                 else:
                     skipped += 1
 
+                if res.error:
+                    ocr_errors.append(f"{asset.path}: {res.error}"[:160])
+
                 total_blocks += res.translated
                 results.append({
                     "uid": asset.uid,
@@ -1518,6 +1541,37 @@ class Pipeline:
 
             self.ws.save_images(assets)
             self.ws.write_json("images/localize.json", results)
+
+            # ---- 2b. ★ OCR 层系统性失败必须**响亮地**报出来 ----
+            #
+            # 实测（隔离数据根里没有 OCR 模型时）：
+            #
+            # ```
+            # images_localize: ok=True 0/243 张贴图已汉化（0 处文字）
+            # ```
+            #
+            # 也就是"OCR 引擎起不来"被表现成"这些图没有文字"。
+            # 这属于**配置/依赖缺失**，报成"无事可做"是误导。
+            #
+            # 判据用**比例**而不是绝对数：个别图读不了很正常
+            # （加密/损坏/超尺寸），但**过半**报错就一定是系统性问题。
+            err_ratio = len(ocr_errors) / max(1, len(assets))
+            if ocr_errors and err_ratio >= 0.5:
+                sample = "；".join(ocr_errors[:3])
+                self.bus.log(
+                    f"⚠️ {len(ocr_errors)}/{len(assets)} 张贴图的 OCR 报错"
+                    f"（{err_ratio:.0%}）—— 这通常意味着 **OCR 模型缺失或引擎起不来**，"
+                    f"而不是「这些图没有文字」。样本：{sample}",
+                    stage="images_localize",
+                    severity=Severity.ERROR,
+                )
+            elif ocr_errors:
+                self.bus.log(
+                    f"{len(ocr_errors)}/{len(assets)} 张贴图 OCR 报错（已跳过）",
+                    stage="images_localize",
+                    severity=Severity.WARN,
+                )
+
             self.bus.log(
                 f"贴图处理完成：{ok_count} 张已汉化，共替换 {total_blocks} 处文字，"
                 f"{skipped} 张无需处理或跳过",
@@ -1526,7 +1580,14 @@ class Pipeline:
             return StageResult(
                 stage="images_localize",
                 ok=True,
-                message=f"{ok_count}/{len(assets)} 张贴图已汉化（{total_blocks} 处文字）",
+                message=(
+                    f"{ok_count}/{len(assets)} 张贴图已汉化（{total_blocks} 处文字）"
+                    + (
+                        f"；⚠️ {len(ocr_errors)} 张 OCR 报错"
+                        if ocr_errors
+                        else ""
+                    )
+                ),
                 stats={
                     "total": len(assets),
                     "localized": ok_count,
@@ -1534,6 +1595,7 @@ class Pipeline:
                     "blocks": total_blocks,
                     "ocr_calls": tt.calls,
                     "cache_hits": tt.cache_hits,
+                    "ocr_errors": len(ocr_errors),
                 },
             )
 
