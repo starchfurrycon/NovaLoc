@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,13 @@ class EngineAdapter:
     display_name: str = "基类"
     #: 优先级，越小越先被检查
     priority: int = 100
+
+    #: 上一次 `prepare_out` **复制不了而跳过**的文件（相对路径 + 异常类型）。
+    #:
+    #: 用于把"有些资源没复制过去"这件事暴露给调用方 ——
+    #: 那些文件在 `out/` 里不存在，所以 `write_back` 不会碰它们，
+    #: **游戏里那份保持原样**（这是我们要的行为）。
+    out_copy_skipped: list[str] = []
 
     def __init__(self, ctx: Context) -> None:
         self.ctx = ctx
@@ -174,17 +182,67 @@ class EngineAdapter:
 
     @staticmethod
     def prepare_out(game_dir: Path, out_dir: Path, *, overwrite: bool = True) -> None:
-        """把游戏目录复制到输出目录。
+        r"""把游戏目录复制到输出目录。
 
         默认整目录复制而不是"只复制要改的文件"：游戏运行时可能依赖
         大量未被修改的资源，少复制一个就可能启动失败。
+
+        ## ★ 为什么不能直接用 `shutil.copytree`
+
+        实测 `Arena Story` 因为这个失败：
+
+            PipelineError: [回写产物] 复制游戏目录失败：[WinError 5] 拒绝访问。:
+              ...\out\MonoBleedingEdge\1.txt
+
+        `copytree` 遇到**任何一个**文件读不了（只读属性、被杀软/索引服务
+        占用、权限异常）就**整体抛异常** ⇒ 整个游戏被判 `failed`，
+        连"这个游戏其实有 547 条文本要翻"都做不到。
+
+        一个文件的问题不该让整局失败。所以改成：
+        **逐个文件复制；读不了的跳过并计数**，最后把跳过数量报出来
+        （调用方据此决定要不要警告用户）。
+
+        跳过的文件在 `out/` 里不存在 ⇒ `write_back` 也不会碰它们
+        ⇒ 游戏里那份**保持原样**。这正是我们要的行为：
+        "复制不了的资源不动它"比"整局失败"好得多。
         """
+
         out_dir = Path(out_dir)
         if out_dir.exists() and overwrite:
-            shutil.rmtree(out_dir)
-        if not out_dir.exists():
-            out_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(game_dir, out_dir, symlinks=True)
+            shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        skipped: list[str] = []
+        for src in game_dir.rglob("*"):
+            try:
+                rel = src.relative_to(game_dir)
+            except ValueError:
+                continue
+            dst = out_dir / rel
+            try:
+                if src.is_dir():
+                    dst.mkdir(parents=True, exist_ok=True)
+                elif src.is_symlink():
+                    # 符号链接：原样重建，不跟随（避免复制到目标目录里）
+                    if not dst.exists():
+                        dst.symlink_to(os.readlink(src))
+                elif src.is_file():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+            except (OSError, shutil.Error) as exc:
+                # 单个文件失败 ⇒ 跳过，记下来，**继续**复制其余文件
+                skipped.append(f"{rel}: {type(exc).__name__}")
+                log.debug("复制跳过 %s：%s", rel, exc)
+                continue
+
+        if skipped:
+            log.warning(
+                "有 %d 个文件复制不了（已跳过，它们在游戏里保持原样）：%s",
+                len(skipped),
+                "、".join(skipped[:5]),
+            )
+        # 供调用方读取（不改 `prepare_out() -> None` 的既有契约）
+        EngineAdapter.out_copy_skipped = skipped
 
     def _rel(self, game_dir: Path, path: Path) -> str:
         try:
