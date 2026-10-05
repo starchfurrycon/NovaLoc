@@ -139,14 +139,60 @@ def test_high_gpu_from_our_own_foreground_does_not_pause(monkeypatch: pytest.Mon
 
 
 def test_high_gpu_with_external_foreground_pauses(monkeypatch: pytest.MonkeyPatch) -> None:
-    """GPU 高**且**前台是外部程序 ⇒ 让路（用户在打游戏/跑渲染）。"""
+    """GPU 高**且**前台是外部程序 ⇒ 让路（用户在打游戏/跑渲染）。
+
+    ▲ 数值必须**高于** `gpu_busy` 阈值（默认 90）。
+      原来这里写 88 —— 阈值从 55 放宽到 90 之后就不再触发了。
+      测试里的数值要和阈值的语义对齐，否则改阈值时会静默失效。
+    """
     monkeypatch.setattr(busy, "cpu_percent", lambda: 20.0)
-    monkeypatch.setattr(busy, "gpu_percent", lambda **_kw: 88.0)
+    monkeypatch.setattr(busy, "gpu_percent", lambda **_kw: 96.0)
     monkeypatch.setattr(busy, "foreground_process", lambda: ("SomeGame", 5))
     monkeypatch.setattr(busy, "running_games", lambda *_a, **_k: [])
     st = busy.evaluate(busy.BusyConfig())
     assert st.busy is True
     assert any("GPU" in r for r in st.reasons)
+
+
+def test_own_translation_gpu_usage_does_not_pause_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r"""★★ **翻译自己的 GPU 占用不能把自己判成忙**（自锁悖论守卫）。
+
+    ## 为什么必须有这条
+
+    并发派发 + 批大小 8 之后，翻译自己会把 GPU 推到约 **74%**
+    （实测 `5053 MiB / 8188 MiB` 显存）。
+
+    如果 `gpu_busy` 阈值低于这个数（**原来就是 55**），就会形成
+    一个自锁：一旦开始翻译 ⇒ 下次轮询发现 GPU > 55% ⇒ 暂停自己
+    ⇒ 空闲下来 ⇒ 恢复 ⇒ 又开始翻译 …… 实测的 CPU/GPU 交替暂停里
+    有这个成分。
+
+    ⇒ 这条用例把"阈值必须高于自身占用"变成可执行的约束：
+      用**实测到的自身 GPU 占用**（74%）去跑判定，必须**不忙**。
+    """
+    monkeypatch.setattr(busy, "cpu_percent", lambda: 20.0)
+    # 74 = 实测的"翻译自己"的 GPU 利用率
+    monkeypatch.setattr(busy, "gpu_percent", lambda **_kw: 74.0)
+    # 前台就是自己的控制台（不是外部游戏）
+    monkeypatch.setattr(busy, "foreground_process", lambda: ("", 0))
+    monkeypatch.setattr(busy, "running_games", lambda *_a, **_k: [])
+    st = busy.evaluate(busy.BusyConfig())
+    assert st.busy is False, (
+        f"翻译自己的 GPU 占用（74%）被判成忙 ⇒ 会自锁。"
+        f"当前 gpu_busy={busy.BusyConfig().gpu_busy}，理由 {st.reasons}"
+    )
+
+
+def test_default_gpu_threshold_exceeds_own_usage() -> None:
+    """结构性守卫：默认 `gpu_busy` 必须**严格高于**自身占用（74%）。"""
+    assert busy.BusyConfig().gpu_busy > 74.0, (
+        "gpu_busy 默认值不得低于翻译自身的 GPU 占用（约 74%），否则会自锁"
+    )
+    assert busy.BusyConfig().cpu_busy > 50.0, (
+        "cpu_busy 默认值是 50 时会把大量正常使用误判成忙（翻译自己只用 1.7/32 核）"
+    )
 
 
 def test_unknown_signals_do_not_pause(monkeypatch: pytest.MonkeyPatch) -> None:
