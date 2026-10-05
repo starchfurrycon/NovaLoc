@@ -2867,4 +2867,107 @@ D: 312.84 GB → 324.10 GB   （+11.24 GB）
 ---
 ---
 
+## 23. #57 ★★「失败 24,049 条」的真身：**引擎 API 文档被当成游戏文本抽了出来**
+
+### 23.1 起因
+
+我报告"失败 24,049 条（11.7%）"时，按 `warnings` 归类得到
+**23,700 条（98.5%）是 `placeholder_broken`**，即"丢了占位符"。
+看着像一类机械问题，值得修。于是去查。
+
+### 23.2 第一版分类给出的信号（样本一看就不对）
+
+我按"丢的是什么记号"分类，得到"混合：换行+未分类 63.9%"。
+但抽出来的样本**根本不是游戏对话**：
+
+```
+<name>UnityEngine.AccessibilityModule</name>
+<para>A class containing methods to assist with accessibility for user
+<param name="palette">An array of colors to populate with a palette.
+<SG説明:Cabbage is way too expensive,\nso I want you to go and procure me
+PRJ_RogueDeck/Content/PRJ_RogueDeck/Texture/UI/Status/DeBuff/T_Executi
+```
+
+⇒ 所以"丢占位符"只是**表象**。真身是**抽取阶段把不该翻的东西收进来了**。
+
+### 23.3 重新归类：61.2% 是"抽错东西"
+
+| 类别 | 条数 | 占比 |
+|---|---|---|
+| **Unity API 文档 XML**（`<para>`/`<param>`/`<name>`） | **13,889** | **58.4%** |
+| Unity 内置命名空间 | 494 | 2.1% |
+| 泛 XML 标签 | 91 | 0.4% |
+| 插件标签 `<SG…>` | 44 | 0.2% |
+| 纯 ASCII 标识符 | 18 | 0.1% |
+| **小计（不是翻译问题）** | **14,536** | **61.2%** |
+
+剩下 9,234 条里，大头是插件 DSL（`<Set Sts Data>`、`<PsensorL:4 Ld>`、
+`<random:40>`）和真正的 `\n` 掩码丢失。
+
+### 23.4 为什么 `Managed` 目录的排除规则没生效
+
+`_UNITY_SKIP_DIRS` **本来就有 `Managed`** —— 但它只在
+"**找 `*_Data` 目录**"那一步用；进入抽取阶段后是
+`rglob("*")` 从 `*_Data` 根扫起，**不再过滤目录**。
+所以 `*_Data/Managed/*.xml` 照样被抽。
+
+> 又一处"规则写了但没在正确的层次生效"。与 §21 的
+> "只写独立函数、忘了在主管线调用"是同一类。
+
+### 23.5 修法：两道判据（都不能省）
+
+1. **路径形态** `*_Data/Managed/UnityEngine*.xml`；
+2. **内容标签** `<member>`/`<summary>`/`<param>`/`<typeparam>`/`<returns>`…。
+
+判据 1 不能省 —— 实测 `Arena Story` 里有几个文档**已被旧版本翻译写坏**：
+
+```
+UnityEngine.VideoModule.xml:  '中文译文 已完成<doc> ...
+                                {"t":<members> "中文译文"}'
+UnityEngine.InputModule.xml:  '中文译文 已完成<doc> ...'
+```
+
+原本的 `<summary>`/`<param>` 标签被译文**替换掉了**，判据 2 对它们漏判。
+这类文件更该被排除（继续翻只会越改越乱）。
+
+### 23.6 ★ 我第一版判据过宽，被自己的反面用例抓到
+
+第一版把 `para`/`list`/`item`/`term` 也算成文档标签。测试立刻红了：
+
+```
+tests/test_api_doc_filter.py::test_plain_game_xml_without_doc_tags
+  <items><item id='1'>Potion</item></items>   ← 游戏数据，必须保留
+```
+
+⇒ 收紧到**只收文档专属标签**。这正是"先写反面用例"的价值：
+
+> **误排游戏数据的代价（玩家看到没翻的文本）比多抽几条文档严重得多。**
+> 所以判据宁可窄，不可宽 —— 与 §21「自带中文」判据宁可宽的方向**相反**，
+> 因为那一次漏判的代价是白烧 GPU，而这次漏抽的代价是玩家体验。
+
+### 23.7 实测效果
+
+| 游戏 | 修改前抽取 | 修改后抽取 | 说明 |
+|---|---|---|---|
+| `Arena Story` | **83,585 条** | **545 条** | 排除 60 个文档 XML，**残留 0** |
+| `ButtKnight` | 34,650 条 | 34,650 条 | **完全不变** ⇒ 无误伤 |
+
+`Arena Story` 剩下的是真游戏文本（`Telegram@quzimingyue`、
+`本游戏为Tg频道quzimingyue自购分享`）。
+
+意义：这个游戏以后**不会再重译 8 万多条文档**（它单轮跑了
+7 小时 43 分，其中大部分是这个）。
+
+### 23.8 还没做的两件事（留待收尾）
+
+1. **已有工作区里的旧 units 不会自动重抽** ——
+   `Arena Story` 的 83,585 条还躺在 `units.jsonl` 里，
+   而 `--backlog` 会跳过抽取。需要一次显式的重抽。
+2. **插件 DSL**（`<Set Sts Data>`、`<PsensorL:…>`）**仍是该讨论的** ——
+   它们是真游戏逻辑，但**不该整条翻译**（模型只能回"确认"）。
+   正确处理是"只翻标签外的文字"，那是另一个中等规模的改动。
+
+---
+---
+
 本文档应随代码变更同步更新。**如果你发现某处描述与代码不符，以代码为准并修本文档。**

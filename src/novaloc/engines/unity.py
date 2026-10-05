@@ -182,6 +182,78 @@ def _in_runtime_infra(path: Path) -> bool:
     return any(f"/{d}/" in f"/{low}/" for d in _RUNTIME_INFRA_DIRS)
 
 
+#: Unity / .NET **API 文档注释**的特征标签。
+#:
+#: ⚠️ **只收"文档专属"的标签，不收通用 XML 标签。**
+#:
+#: 第一版我把 `para`/`list`/`item`/`term` 也收进来了，结果测试立刻抓到
+#: 误判 —— 游戏自己的数据也用 `<item id='1'>Potion</item>`：
+#:
+#:     tests/test_api_doc_filter.py::test_plain_game_xml_without_doc_tags
+#:     tests/test_api_doc_filter.py::test_non_unityengine_name_in_managed_is_not_doc_by_path
+#:
+#: 这两个用例**本该是绿的**（游戏数据必须保留），它们红了说明判据过宽。
+#: 这正是"先写反面用例"的价值：**误排游戏数据的代价（玩家看到没翻的
+#: 文本）比多抽几条文档严重得多**。
+#:
+#: 下面这些标签只出现在"随程序集发布的 XML 文档注释"里，
+#: 游戏策划数据不会用。
+_API_DOC_TAGS = re.compile(
+    r"</?(?:member|summary|param|typeparam|returns|remarks|exception|"
+    r"seealso|inheritdoc|listheader|typeparamref|paramref)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_api_doc(path: Path, *, head_bytes: int = 65536) -> bool:
+    r"""这个 `.xml` 是不是**引擎自带的 API 文档**（而不是游戏的策划数据）。
+
+    ## 判据一：路径形态（`*_Data/Managed/UnityEngine*.xml`）
+
+    Unity 引擎的文档注释**恒定**发布在 `<游戏>_Data/Managed/` 下，
+    文件名是 `UnityEngine.*.xml` / `UnityEngine.xml`。这个组合在
+    真实游戏里不会用于策划数据（策划数据放 `StreamingAssets` 或
+    `Resources`）。所以先按路径快速判定。
+
+    ## 判据二：内容里的 API 文档标签
+
+    覆盖"文档被挪了位置"或"不在 Managed 下"的情况。读开头 64 KB，
+    找 `<member>`/`<summary>`/`<param>`/`<typeparam>`/`<returns>`…
+    只认这一组 —— 游戏自己的数据用 `<Set Sts Data>` 这类自研标签，
+    那是**该处理**的。
+
+    ## ★ 为什么还必须容忍"已被改坏"的文件
+
+    实测 `Arena Story` 里有几个文档文件**已经被旧版本的翻译写坏了**：
+
+        UnityEngine.VideoModule.xml:  '中文译文 已完成<doc> ...
+                                        {"t":<members> "中文译文"}'
+        UnityEngine.InputModule.xml:  '中文译文 已完成<doc> ...'
+
+    它们原本的 `<summary>`/`<param>` 标签被译文**替换掉了**，
+    所以**判据二会漏判**。这类文件更该被排除（继续翻只会越改越乱），
+    判据一正好兜住它们。
+
+    ## 失败一律返回 False
+
+    **宁可多抽，不可漏抽**：多抽的代价是几条假失败，
+    漏抽的代价是玩家看到没翻的文本。
+    """
+    # 判据一：路径 + 文件名形态
+    parts = [p.lower() for p in path.parts]
+    if "managed" in parts and path.stem.lower().startswith("unityengine"):
+        return True
+
+    # 判据二：内容里的 API 文档标签
+    try:
+        if path.stat().st_size > 64 * 1024 * 1024:
+            return False
+        head = path.read_bytes()[:head_bytes].decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(_API_DOC_TAGS.search(head))
+
+
 #: 明显不该翻的键名（Unity 工程里常见的配置键）
 _SKIP_KEYS = {
     "id", "uuid", "guid", "path", "file", "url", "key", "type", "class",
@@ -388,6 +460,7 @@ class UnityAdapter(EngineAdapter):
         files: list[Path] = []
         skipped_logs: list[str] = []
         skipped_infra: list[str] = []
+        skipped_docs: list[str] = []
         for r in roots:
             for p in r.rglob("*"):
                 if not p.is_file() or p.suffix.lower() not in TEXT_SUFFIXES:
@@ -400,8 +473,41 @@ class UnityAdapter(EngineAdapter):
                 if p.name.lower() in _NOT_GAME_TEXT or _NOT_GAME_TEXT_RE.match(p.name):
                     skipped_logs.append(p.name)
                     continue
+                # 3) ★ Unity/引擎自带的 **API 文档 XML**
+                #
+                # ## 实测（这是本轮最大的一处抽取噪声）
+                #
+                # `*_Data/Managed/*.xml` 是 Unity 引擎随包发布的 API 文档注释，
+                # 每个 Unity 游戏都有。实测 `Arena Story` 一个游戏就因为
+                # 它们产生了 **13,889 条**"文本"，占该游戏全部占位符失败的
+                # **98.7%**：
+                #
+                #     <name>UnityEngine.AccessibilityModule</name>
+                #     <para>A class containing methods to assist with
+                #           accessibility for users with different visual abilities.
+                #     <param name="palette">An array of colors to populate...
+                #
+                # 翻它毫无意义（玩家永远看不到），而且它们**天生带 XML 标签**
+                # ⇒ 占位符守卫必然判"丢记号" ⇒ 变成成片的假失败，
+                # 每轮 backlog 都要重试一遍。
+                #
+                # ⇒ 在抽取阶段就排掉。判据用**内容**（前 64 KB 里有没有
+                # Unity 文档特征标签），不只看扩展名 —— 有些游戏会把自己
+                # 的策划数据也存成 .xml，那类是**该翻**的。
+                if p.suffix.lower() == ".xml" and _looks_like_api_doc(p):
+                    skipped_docs.append(p.name)
+                    continue
                 files.append(p)
         report.files_scanned = len(files)
+        if skipped_docs:
+            # ⚠️ `ExtractReport` 没有 `notes` 字段（只有 `skipped`/`errors`），
+            # 所以说明文字走 `errors` —— 它在下游是**警告级**输出，
+            # 不是"失败"。这里记的是"排除了什么"，便于用户核对。
+            report.skipped["api_doc_xml"] = len(skipped_docs)
+            report.errors.append(
+                f"已排除 {len(skipped_docs)} 个引擎 API 文档 XML"
+                f"（随引擎打包的注释，玩家看不到）：{', '.join(skipped_docs[:5])}"
+            )
 
         for f in files:
             before = len(units)
