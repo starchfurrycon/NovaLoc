@@ -222,6 +222,54 @@ def _block_degenerate_entries(
     return blocked
 
 
+#: 日文假名（平假名 + 片假名）。用于识别"该翻却被回显"的条目。
+_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+
+
+def _content_only(s: str) -> str:
+    """只留字母/数字/汉字（丢标点与空白）。
+
+    与 `images.service._content` 语义一致；这里是**文本路径**的复刻，
+    避免跨包导入私有函数。
+    """
+    return "".join(ch for ch in (s or "") if ch.isalnum())
+
+
+def is_kana_echo(source: str, target: str) -> bool:
+    r"""译文是不是**日文假名条目的原样回显**（= 批内该翻没翻）。
+
+    ## 实测依据（`.scratch/_probe_echo_kana.py`）
+
+    对 30 条"含假名 + 批内回显"的条目**单独**问模型：
+
+    ```
+    'ポイズンガード'  批内→'ポイズンガード'   单独→'毒药卫'
+    'ゴブリン'        批内→'ゴブリン'         单独→'绿皮'
+    'ポーション'      批内→'ポーション'       单独→'药水'
+    ... 30/30 全部得到真译文（100%）
+    ```
+
+    ⇒ 这是"批内该翻没翻"，**不是**"本来就该保留"。
+
+    ## 为什么只判"含假名"，不判"所有回显"
+
+    全库 19,353 条回显里：
+
+    * **纯拉丁**（`Rockman`/`IN-cubus001`）15,892 条 ⇒ **不该重译**（专名）；
+    * **含假名** 2,218 条 ⇒ **该重译**；
+    * 含汉字 1,243 条 ⇒ 不确定（日文汉字可能本就该保留），**先不动**。
+
+    只在**能用行为验证**的最小集合上动手 —— 这是我上一轮在
+    "跳过不翻译"上翻车（静态启发式收益 5% / 风险 25%）学到的。
+    """
+    if not source or not target:
+        return False
+    if not _KANA_RE.search(source):
+        return False
+    a, b = _content_only(source), _content_only(target)
+    return bool(a) and a == b
+
+
 def _is_label_only_output(target: str, source: str = "") -> bool:  # noqa: ARG001
     r"""**#42 撤回：这个判据已停用。** 保留函数只为让撤回记录可执行、可测试。
 
@@ -1856,6 +1904,51 @@ class OllamaTranslationProvider:
                 entry.glossary_hits = [g.source for g in item.glossary]
                 entry.retries = 0
                 entry.status = EntryStatus.FAILED if res.fatal else EntryStatus.TRANSLATED
+
+                # ---- 3.4 ★ 假名回显 ⇒ 判失败（交给逐条重译） ----
+                #
+                # ## 缺陷（实测，`.scratch/_probe_echo_kana.py`）
+                #
+                # 批处理时模型会把**纯假名条目原样回显**，而流水线把它
+                # 记成"已译"：
+                #
+                #     批内：'ポイズンガード' → 'ポイズンガード'
+                #     单条：'ポイズンガード' → '毒药卫'      ← 单独问就对
+                #
+                # 对 30 条"含假名 + 回显"条目**单独复测：30/30 全部得到
+                # 真译文（100%）** ⇒ 是"批内该翻没翻"，不是"该保留"。
+                #
+                # 规模：已译条目里 **2,218 条**（全库 19,353 条回显的 11.5%）。
+                #
+                # ## 为什么只处理"含假名"的回显
+                #
+                # 19,353 条回显里：纯拉丁 15,892 条（专名，**不该**重译）、
+                # 含假名 2,218 条（**该**重译）、含汉字 1,243 条（不确定，先不动）。
+                # ⇒ 只在**能用行为验证**的最小集合上动手。
+                #
+                # ## 判失败而不是就地重译
+                #
+                # * 判失败 ⇒ 条目进 `only_pending` 队列，下一轮被**逐条**
+                #   处理（单条路径实测 30/30 成功）；
+                # * 就地重译要给本函数加递归，侵入性大；
+                # * 而且"失败"是**诚实**的状态 —— 它确实还没翻好。
+                #
+                # ⚠️ 必须**同时清空 target**：`FAILED` 的定义就是"没有可用
+                #   译文"（见上面那段事故注释 —— 留着垃圾译文会让字体阶段
+                #   把非中文字符收进字符集，最终满屏口口口）。
+                if (
+                    entry.status is EntryStatus.TRANSLATED
+                    and is_kana_echo(item.unit.source, entry.target)
+                ):
+                    self.stats["kana_echo_rejected"] = (
+                        self.stats.get("kana_echo_rejected", 0) + 1
+                    )
+                    entry.status = EntryStatus.FAILED
+                    entry.target = ""
+                    entry.warnings = [
+                        *entry.warnings,
+                        "批内原样回显了日文假名（单独重译通常可得译文）",
+                    ]
 
             # ---- 3.5 定向重试：把"整条掩码记号弄丢"的条目重问一次 ----
             #

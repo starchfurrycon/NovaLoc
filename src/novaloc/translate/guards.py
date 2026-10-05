@@ -1003,12 +1003,33 @@ def is_unsafe_writeback(source: str, target: str) -> bool:
     """这条译文**绝对不能写回游戏**吗？
 
     与 :func:`guard` 的 `fatal` 不同：`guard` 是在翻译**过程中**做全量校验
-    （还管占位符、复读、长度），这里只抽查那两条**"产物已经写下去了才发现"**
+    （还管占位符、复读、长度），这里只抽查那几条**"产物已经写下去了才发现"**
     的判据 —— 它们要么让玩家看到乱码，要么让玩家看不到是谁做了什么。
+
+    ## 三处必须用**同一套**判据
+
+    `stage_translate` 的"推翻已完成"分支、重查入口、以及 `apply` 闸门
+    都读这里。实测踩过：只在一处加判据时，另一处会把同样的坏答案
+    写回来还标成"已翻译"，于是每轮空跑一次 revalidate。
+
+    ## 第三条：假名回显（`kana_echo`）
+
+    批处理时模型会把**纯假名条目原样回显**：`'ポイズンガード'`
+    批内回显成 `'ポイズンガード'`，而**单独**问就得到 `'毒药卫'`
+    （30/30 实测，见 `.scratch/_probe_echo_kana.py`）。
+
+    这属于"产物已经写下去了才发现"——写回游戏后玩家看到的是**日文**，
+    而报告说"已译"。所以放进这套判据，让它被强制重译。
+
+    ⚠️ 只在**含假名**时成立。纯拉丁专名（`Rockman`）的回显**不该**重译
+    （15,892 条，重译浪费 token 且结果一样）。
     """
-    return bool(
-        check_foreign_script(target, source=source) or check_percent_vars(source, target)
-    )
+    if check_foreign_script(target, source=source) or check_percent_vars(source, target):
+        return True
+    # 局部导入避免循环依赖（ollama_provider 已经 import 了本模块）
+    from .ollama_provider import is_kana_echo
+
+    return is_kana_echo(source, target)
 
 
 def summarize_warnings(entries_warnings: list[list[str]]) -> dict[str, int]:
