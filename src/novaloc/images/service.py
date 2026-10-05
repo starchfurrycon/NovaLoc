@@ -121,7 +121,46 @@ class TextureResult:
 
     @property
     def changed(self) -> bool:
-        return self.translated > 0
+        r"""这张图**真的**会被改动吗（而不是"有过译文"）。
+
+        ## ★ 实测缺陷：原来是 ``return self.translated > 0``
+
+        那只看"有几块有译文"，**不看译文是否与原文不同**。实测后果：
+
+        ```
+        localize.json:  "changed": true, "translated": 1, "ok": true
+        blocks:         src='LOV'  tgt='LOV'      ← 模型把原文原样"译"了回来
+        rebuilt/ 与原图 sha1 **完全相同**
+        ```
+
+        于是：
+        * `stages.py` 因为 `res.changed` 为真而**照常落盘**（写了一份
+          与原图逐字节相同的文件）；
+        * `localize.json` 报 `changed: true`；
+        * 报告说"138 张已汉化"，实际**一张都没改动**。
+
+        这是典型的"报告与实际不一致"：数字看着对，磁盘上什么都没发生。
+        （ROADMAP §13 那条判据的又一次应用：只有内容比对算数。）
+
+        ## 修法
+
+        要求**至少有一块的译文与原文实质不同**。"实质不同"用
+        `_content`（丢标点/空白后）比较，这样：
+
+        * `'LOV'` → `'LOV'` ⇒ **不算改动**（正确）
+        * `'Loading'` → `'载入中'` ⇒ 算改动
+        * `'（…）'` → `'……'` ⇒ 标点差异不算改动（避免把"只换标点"
+          当成汉化成果）
+        """
+        for o in self.outcomes:
+            if not o.ok:
+                continue
+            if not (o.target or "").strip():
+                continue
+            # `_content` 是**模块级**函数（本文件 line 282），直接用。
+            if _content(o.source or "") != _content(o.target or ""):
+                return True
+        return False
 
 
 def _crop_quad(image: Any, quad: list[tuple[float, float]], *, pad: int = 3) -> Any:
