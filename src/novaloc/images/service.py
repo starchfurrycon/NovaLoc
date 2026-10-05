@@ -881,6 +881,79 @@ class TextureTranslator:
         translations = self._translate_texts(
             texts, lang, existing or {}, glossary or [], context_lines or [], p, dry_run
         )
+
+        # ---- 3b. ★ 剔除"原文原样回显"的组（必须在**抹字之前**做） ----
+        #
+        # ## 为什么必须在这一步、这个位置
+        #
+        # 流程是「先 inpaint 抹掉全部文字 → 再逐块把译文画回去」。
+        # 所以如果某组的译文就是原文（模型原样回显），而我们在**画**的时候
+        # 跳过它，那块文字**已经被抹掉了却不会被重画** ⇒ **原文被销毁**，
+        # 图上留一块空白。这比"没翻译"更糟。
+        #
+        # ⇒ 必须在 `inpaint_boxes` **之前**把它从待处理集合里去掉，
+        #   这样它既不参与抹字、也不参与重绘，原图那块**原样保留**。
+        #
+        # ## 实测的真实案例
+        #
+        # `[Summoner Veil]` 的图集里有一块 `src='LOV'`，模型回了 `tgt='LOV'`。
+        # 结果是：落盘了一份与原图 **sha1 完全相同**的文件，
+        # 而 `localize.json` 报 `changed:true / ok:true`。
+        # （`changed` 已在别处修好；这里补的是"根本不把它当成功"。）
+        #
+        # ## ▲ 索引陷阱
+        #
+        # `groups` / `texts` 是**列表**，而 `translations` 是
+        # **`{组下标: 译文}` 的 dict**（下游用 `translations.get(gi)` 取）。
+        # 三者按组下标对齐。剔除时必须**同时重建**，而且
+        # `translations` 的键要**按下标重新编号** ——
+        # 否则索引错位，会把 A 组的译文画到 B 组的框里。
+        #
+        # ▲ 这个错我第一版就犯了：把 `translations` 也当成 list 重建，
+        #   下游 `translations.get(gi)` 立刻抛
+        #   `AttributeError: 'list' object has no attribute 'get'`。
+        #   是测试抓到的 —— 单靠读代码很容易漏掉"它其实是 dict"。
+        kept_groups: list[Any] = []
+        kept_texts: list[str] = []
+        kept_translations: dict[int, str] = {}
+        for gi, g in enumerate(groups):
+            src = texts[gi] if gi < len(texts) else ""
+            tgt = translations.get(gi, "")
+            if tgt.strip() and (
+                self._is_untranslated(src, tgt) or self._is_source_echo(src, tgt)
+            ):
+                # 回显 ⇒ 不处理这一组，原图那块保持原样
+                for b in g.blocks:
+                    result.outcomes.append(
+                        BlockOutcome(
+                            block_id=b.id,
+                            source=b.source,
+                            target="",
+                            status=EntryStatus.SKIPPED,
+                            warnings=["译文与原文相同（模型未翻译），保留原图"],
+                            box=tuple(b.box),  # type: ignore[arg-type]
+                            quad=[(float(x), float(y)) for x, y in (b.quad or [])],
+                            confidence=float(b.confidence or 0.0),
+                            ocr_engine=b.ocr_engine or "",
+                        )
+                    )
+                continue
+            # 新下标 = 已保留的组数
+            kept_translations[len(kept_groups)] = tgt
+            kept_groups.append(g)
+            kept_texts.append(src)
+
+        if not kept_groups:
+            # 全部都是回显 ⇒ 没必要走一趟昂贵的 inpaint + 重绘
+            result.warnings.append(
+                f"{len(groups)} 组文字全部被判为「译文与原文相同」，"
+                "未做任何重绘（原图保持原样）"
+            )
+            result.image = _restore_alpha(raw)
+            result.total_ms = (time.time() - t_start) * 1000
+            return result
+        groups, texts, translations = kept_groups, kept_texts, kept_translations
+
         if dry_run:
             result.image = _restore_alpha(raw)
             result.outcomes = [
@@ -1353,6 +1426,40 @@ class TextureTranslator:
             if a and b.startswith(a) and len(b) > len(a):
                 if any(ch.isalnum() for ch in b[len(a):]):
                     return True
+        return False
+
+    @classmethod
+    def _is_untranslated(cls, src: str, tgt: str) -> bool:
+        r"""译文是不是**等于原文**（模型原样回显，等于没翻）。
+
+        ## 与 `_is_source_echo` 的分工（两者都要，判据不同）
+
+        | 方法 | 判什么 | 例 |
+        |---|---|---|
+        | `_is_source_echo` | 译文是"**原文 + 冗余正文**" | `'o'` → `'o中文译文'` |
+        | `_is_untranslated`（本方法） | 译文**逐字就是原文** | `'LOV'` → `'LOV'` |
+
+        `_is_source_echo` 的判据是 `b.startswith(a) and len(b) > len(a)`
+        —— 要求**更长**，所以对"完全一样"返回 False。实测
+        `[Summoner Veil]` 图集里的 `src='LOV' / tgt='LOV'` 正好落在
+        它的盲区里：**看起来像成功**（`ok=True`、`translated=1`），
+        实际什么都没翻。
+
+        ## 边界：两边实义字符都空时不算"没翻"
+
+        `'....'` → `'……'` 这种：实义字符都是空。它**确实是翻译**
+        （省略号换了中文写法），不该被当成回显。所以要求
+        `_content()` 非空。
+
+        （`_is_source_echo` 的 docstring 里也提到同一件事：
+        那两者实义字符都是空，第 3 条自然不会触发。这里保持一致。）
+        """
+        a, b = (src or "").strip(), (tgt or "").strip()
+        if not a or not b:
+            return False
+        if a == b:
+            # 逐字相同 ⇒ 没翻。但纯标点不算（见 docstring）
+            return bool(_content(a))
         return False
 
     @staticmethod

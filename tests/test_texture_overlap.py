@@ -293,7 +293,20 @@ def test_non_overlapping_blocks_do_not_trigger_reread(tmp_path: Path) -> None:
     cfg = Config()
     ctx = Context(config=cfg, events=EventBus())
     tr = TextureTranslator(ctx, translate_fn=lambda items, lang: [
-        TranslationEntry(uid=it.unit.uid, source=it.unit.source, target=it.unit.source)
+        # ▲ target 必须**真的不同**于 source。
+        #
+        # 原来这里写的是 `target=it.unit.source`（回显）。加了
+        # 「原文原样回显 ⇒ 视为未翻译、保留原图」的守卫之后，
+        # 回显会被正确剔除 ⇒ outcomes 的 target 全空，
+        # 而本用例断言的是"两块各自拿到译文"。
+        #
+        # 那说明**夹具在测别的东西**：本用例要测的是"不重叠时不该重读
+        # OCR"，与译文内容无关。所以给它真译文，让断言回到被测行为上。
+        TranslationEntry(
+            uid=it.unit.uid,
+            source=it.unit.source,
+            target=f"【译】{it.unit.source}",
+        )
         for it in items
     ])
     # 两个**不重叠**的块（间距 100 px，远大于字高）
@@ -307,7 +320,7 @@ def test_non_overlapping_blocks_do_not_trigger_reread(tmp_path: Path) -> None:
         f"不重叠时不该重读，实际调用 OCR {len(long_fake.calls)} 次"
     )
     # 两块各自拿到译文（没有被并成一组）
-    assert [o.target for o in res.outcomes] == ["HELLO THERE", "WORLD AGAIN"]
+    assert [o.target for o in res.outcomes] == ["【译】HELLO THERE", "【译】WORLD AGAIN"]
 
 
 def test_reread_is_bounded_to_the_group_box(tmp_path: Path) -> None:
