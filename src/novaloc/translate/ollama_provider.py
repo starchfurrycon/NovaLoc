@@ -1609,6 +1609,41 @@ class OllamaTranslationProvider:
         #    必须自己控制提交节奏。
         _workers = max(1, int(getattr(self.cfg.ollama, "concurrency", 1) or 1))
         _results: dict[int, tuple[dict[int, str], str | None, list[str], list[list[str]]]] = {}
+
+        # ---- ★ 派发层的连续失败熔断 ----
+        #
+        # 条目层的熔断（下面 2b）要等**全部批次跑完**才能生效，所以它挡不住
+        # `_one_batch` 内部的重试放大（批 3 次 × 逐条 2 次 × 补空 2 次）。
+        # 实测：60 条全失败时条目层虽然熔断了，但**已经发出 159 次请求**。
+        #
+        # ⇒ 这里在**每次派发前**再查一次：一旦某批的 `err` 显示"整批失败"，
+        #   就把连续失败计数按该批条数推进，超阈值立刻停止派发后续批次。
+        #
+        # ⚠️ 这是**近似**计数（以批为单位而不是以条目为单位），
+        #    保守方向是**更容易触发**（每批按满条数计），这对"止血"是安全的。
+        _cb_limit = int(getattr(self.cfg.ollama, "fail_circuit_breaker", 40))
+        _dispatch_fail = 0
+        _dispatch_tripped = False
+
+        def _note_batch_result(_bi: int, _res: tuple) -> None:
+            """按批结果推进派发层计数；整批失败则累加，有产出则清零。"""
+            nonlocal _dispatch_fail, _dispatch_tripped
+            _raw = _res[0] if _res else {}
+            if _raw:
+                _dispatch_fail = 0
+                return
+            _batch_len = len(batches[_bi]) if _bi < len(batches) else 1
+            _dispatch_fail += max(1, _batch_len)
+            if not _dispatch_tripped and _dispatch_fail >= _cb_limit:
+                _dispatch_tripped = True
+                log.error(
+                    "★ 熔断（派发层）：连续约 %d 条无任何译文，停止派发后续批次"
+                    "（剩余条目留作未翻译，下次运行会重试）。"
+                    "常见原因：模型对某类短专名/技能名不给译文。",
+                    _dispatch_fail,
+                )
+                self.stats["dispatch_circuit_tripped"] = 1
+
         if _workers > 1 and len(batches) > 1:
             log.debug(
                 "窗口式并发派发 %d 个批次（concurrency=%d）", len(batches), _workers
@@ -1625,12 +1660,13 @@ class OllamaTranslationProvider:
                     # 单批的意外异常不该毁掉整轮翻译
                     log.warning("批次 %d 派发异常：%s", _bi, _exc)
                     _results[_bi] = ({}, str(_exc), [], [])
+                _note_batch_result(_bi, _results[_bi])
 
             _queue = deque(enumerate(batches))
             with ThreadPoolExecutor(max_workers=_workers) as _pool:
                 # 先填满窗口
                 _inflight: dict[object, int] = {}
-                while _queue and len(_inflight) < _workers:
+                while _queue and len(_inflight) < _workers and not _dispatch_tripped:
                     _bi, _bt = _queue.popleft()
                     _inflight[_pool.submit(_one_batch, _bi, _bt)] = _bi
                 # 回来一个补一个
@@ -1639,15 +1675,65 @@ class OllamaTranslationProvider:
                     for _fut in _done:
                         _bi = _inflight.pop(_fut)
                         _take(_bi, _fut)
-                        if _queue:
+                        if _queue and not _dispatch_tripped:
                             _nbi, _nbt = _queue.popleft()
                             _inflight[_pool.submit(_one_batch, _nbi, _nbt)] = _nbi
         else:
             for _bi, _bt in enumerate(batches):
+                if _dispatch_tripped:
+                    break
                 _results[_bi] = _one_batch(_bi, _bt)
+                _note_batch_result(_bi, _results[_bi])
 
         # ---- 2b. 顺序跑校验（**内容一字不改**，数据改从 _results 取） ----
+        #
+        # ★★ 连续失败熔断器（治 `Battle Demon Kirsten` 卡死 44 分钟的根）。
+        #
+        # 实测：该游戏 1,016 条失败条目在**无限重试**，全库吞吐掉到
+        # **2 条/分钟**（预期 150）。失败内容是短日文技能名
+        # （`'一の型・焔斬'`/`'終の型・煌々一閃'`/`'チンゲリオン'`），
+        # 模型确实不给译文（回显原文）。
+        #
+        # 重试放大链（已测绘）：
+        #
+        #     translate_batch   for attempt in range(3)     ← 批重试 3 次
+        #       ├─ _recover_by_subbatch → _call_single      ← 每缺条 2 次
+        #       └─ 补空 → _call_single                      ← 又 2 次
+        #     _call_single      for attempt in range(2)     ← 单条再 2 次
+        #
+        # ⇒ 一条病态条目最多 **6 次请求**。
+        #
+        # 为什么 `fail_streak` 救不了：它**只在整轮结束时累加**，
+        # 而这一轮永远结束不了（一直在重试）⇒ streak 停在 0/1。
+        #
+        # 为什么用"行为"而不是"内容"判据：试过给假名回显守卫加长度
+        # 阈值，**被测试否决** —— `ポイズンガード`(7 字，已验证能译)
+        # 与 `'一の型・焔斬'`(6 字，不译) **长度分不开**。
+        #
+        # 熔断**不丢任何已成功的译文**，只是不再为病态条目烧算力；
+        # 剩余条目留作未翻译，下次运行会重试（那时它们已有 fail_streak）。
+        _cb_limit = int(getattr(self.cfg.ollama, "fail_circuit_breaker", 120))
+        _consec_fail = 0
+        _cb_tripped = False
         for bi, batch in enumerate(batches):
+            if _cb_tripped:
+                # 已熔断：把这一批及**后面所有**条目留作未翻译。
+                #
+                # 为什么不继续跑：熔断的意义就是"别再为病态内容烧算力"。
+                # 继续跑只会让症状（吞吐掉到 2 条/分钟）延续下去。
+                #
+                # 这些条目会被写成 FAILED，`stages.py` 的跨轮次
+                # `fail_streak` 会在本轮结束时 +1 —— 所以下次运行
+                # 它们就有机会被跳过，或（若内容其实可翻）被重试成功。
+                for _local_i, global_i in enumerate(batch):
+                    entry = out[first_of[global_i]]
+                    if entry.status != EntryStatus.TRANSLATED:
+                        entry.status = EntryStatus.FAILED
+                        entry.target = ""
+                        entry.warnings = [
+                            "circuit_breaker: 连续失败过多，本次运行已停止尝试"
+                        ]
+                continue
             batch_items = [uniq_items[i] for i in batch]
             raw_by_index, err, masked_all, slots_all = _results[bi]
             for local_i, global_i in enumerate(batch):
@@ -1668,7 +1754,18 @@ class OllamaTranslationProvider:
                     entry.status = EntryStatus.FAILED
                     entry.target = ""
                     entry.warnings = [f"provider_error: {err or '空响应'}"]
+                    _consec_fail += 1
+                    if not _cb_tripped and _consec_fail >= _cb_limit:
+                        _cb_tripped = True
+                        log.error(
+                            "★ 熔断：已连续 %d 条翻译失败，停止为本次运行继续"
+                            "发请求（剩余条目留作未翻译，下次运行会重试）。"
+                            "常见原因：模型对某类短专名/技能名不给译文。",
+                            _consec_fail,
+                        )
+                        self.stats["circuit_breaker_tripped"] = 1
                     continue
+                _consec_fail = 0
 
                 if use_mask:
                     restored, ph_check = ph.verify_restored(
