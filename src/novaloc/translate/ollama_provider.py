@@ -1634,6 +1634,10 @@ class OllamaTranslationProvider:
                 return
             _batch_len = len(batches[_bi]) if _bi < len(batches) else 1
             _dispatch_fail += max(1, _batch_len)
+            log.debug(
+                "派发层熔断计数：批次 %d 无产出（%d 条），连续累计 %d / %d",
+                _bi, _batch_len, _dispatch_fail, _cb_limit,
+            )
             if not _dispatch_tripped and _dispatch_fail >= _cb_limit:
                 _dispatch_tripped = True
                 log.error(
@@ -1712,7 +1716,7 @@ class OllamaTranslationProvider:
         #
         # 熔断**不丢任何已成功的译文**，只是不再为病态条目烧算力；
         # 剩余条目留作未翻译，下次运行会重试（那时它们已有 fail_streak）。
-        _cb_limit = int(getattr(self.cfg.ollama, "fail_circuit_breaker", 120))
+        _cb_limit = int(getattr(self.cfg.ollama, "fail_circuit_breaker", 40))
         _consec_fail = 0
         _cb_tripped = False
         for bi, batch in enumerate(batches):
