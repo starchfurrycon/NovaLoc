@@ -402,7 +402,14 @@ class OllamaTranslationProvider:
         #: ★★ **请求预算**（见 OllamaConfig.request_budget_factor）
         #: 与已用计数。**唯一发请求的出口是 _chat**，预算在那里记。
         self._requests_used = 0
-        self._request_budget = 0  # 由 translate_batch 按条目数设定
+        self._request_budget = 0
+        #: ★★ 预算是否**权威**（由调用方用「整个游戏」的条数设定）。
+        #: 见 `begin_run` 的 docstring：
+        #: * `True`  ⇒ 这是整个游戏的上限，**任何兜底都不许改它**；
+        #: * `False` ⇒ 还没有权威预算，`translate_batch` 按本次条数兜底。
+        #: 我前两版把这两者混在一个字段里，导致贴图阶段的小批量
+        #: （1~4 条）把上限压到 9，之后翻译阶段再也放不大。
+        self._budget_is_authoritative = False
         self.stats: dict[str, int] = {
             "batches": 0,
             "retries": 0,
@@ -1381,34 +1388,34 @@ class OllamaTranslationProvider:
 
 
     def begin_run(self, total_items: int) -> None:
-        r"""开始翻**一个游戏**：按该游戏的全部条数设定请求预算。
+        r"""开始翻**一个游戏**：按该游戏的全部条数设定**权威**请求预算。
 
-        ## 为什么必须有这个方法（实测事故）
+        ## 为什么必须有"权威"这个概念（三次实测事故）
 
-        我第一版把预算写在 `translate_batch` 里按**每次调用**的条数设，
-        而那个方法是被**按批**调用的（每批 8~25 条）⇒ 预算退化成
-        "单批允许几次请求"⇒ 正常批次重试几次就撞上限 ⇒ **整批被拒**。
+        我修了三次才把语义理清：
 
-        实测 `Battle Demon Kirsten`（31,263 条）报"25 次 > 上限 24"。
+        | 版本 | 做法 | 失败现象 |
+        | --- | --- | --- |
+        | v1 | 每次 `translate_batch` 重置预算 | 退化成**单批预算**：16 条撞上限 24 |
+        | v2 | 加 `begin_run` + 只增不减 | 贴图阶段小批量先把上限设成 **9**，之后再也放不大 |
+        | **v3（本版）** | **权威标记** | —— |
 
-        ⇒ 由调用方（`stage_translate`）在开始游戏前调用一次，
-        用**全部条数**设预算；`translate_batch` 只负责递增。
+        **根因**：两种预算混在一个字段里 ——
+        * **权威**：调用方用**整个游戏**的条数设，是整个游戏的上限；
+        * **兜底**：没有权威预算时（贴图管线的小批量回调）
+          按本次调用条数设。
 
-        ## ★★ 预算**只增不减**（第二个实测事故）
+        混在一起的后果：贴图阶段（先跑）用兜底把字段写成 9
+        ⇒ 翻译阶段 `begin_run(31263)` 想写 93,789 时，
+        与"只增不减"的补丁互相干扰，实测**仍然是 9**。
 
-        贴图管线的回调拿到的 items 是**一张图里的文字块**
-        （常常 1~4 条），它也会走这里。若允许把预算**缩小**，
-        一次 `begin_run(1)` 就会把上限压到 `max(1+8, 3)=9`
-        并**不再恢复** ⇒ 实测连续拒绝几百批：
+        ## 语义（现在很明确）
 
-        ```
-        批 0（1 条）第 1 次失败：请求预算已用尽（10 > 9）
-        …（100 > 9）…（300 > 9）…（600 > 9）…
-        ```
+        * `begin_run` **无条件**设定预算，并标记为**权威**；
+        * `translate_batch` 只在**非权威**时才兜底；
+        * 于是"贴图阶段的小批量"与"翻译阶段的游戏级"互不干扰。
 
-        ⇒ 只在**新预算更大**时才更新；缩小的请求直接忽略。
-
-        ⚠️ 计的是**整个游戏**的请求数，所以它是"病态游戏的止血阀"，
+        ⚠️ 计的是**整个游戏**的请求数 ⇒ 它是"病态游戏的止血阀"，
         不是"单批保护"。正常游戏实际约 1 次请求/条，
         远低于 `factor`（默认 3.0）。
         """
@@ -1416,20 +1423,13 @@ class OllamaTranslationProvider:
         factor = float(getattr(o, "request_budget_factor", 3.0))
         floor = int(getattr(o, "request_budget_floor", 8))
         total_items = max(0, int(total_items))
-        new_budget = max(total_items + floor, int(total_items * factor))
-        if new_budget <= self._request_budget:
-            # ★★ **只增不减** —— 见 docstring 的实测事故：
-            #   贴图管线会用 1~4 条的小 items 调这里，
-            #   若允许缩小就会把预算压到 `max(1+8, 3)=9` 并**不再恢复**
-            #   ⇒ 连续拒绝几百批（实测日志里 10>9 … 600>9）。
-            return
         self._requests_used = 0
-        self._request_budget = new_budget
+        self._request_budget = max(total_items + floor, int(total_items * factor))
+        self._budget_is_authoritative = True
         log.info(
-            "请求预算（本作用域）：%d 条 × %.1f = **%d 次请求**",
+            "请求预算（本游戏）：%d 条 × %.1f = **%d 次请求**",
             total_items, factor, self._request_budget,
         )
-
     def translate_batch(
         self, items: list[TranslateItem], target_lang: str
     ) -> list[TranslationEntry]:
@@ -1490,8 +1490,11 @@ class OllamaTranslationProvider:
         _factor = float(getattr(self.cfg.ollama, "request_budget_factor", 3.0))
         # 下限余量**可配置**：见 `request_budget_floor` 的 docstring。
         _floor = int(getattr(self.cfg.ollama, "request_budget_floor", 8))
-        if self._request_budget <= 0:
-            # 没有 `begin_run` ⇒ 按本次调用的条数设（安全网）
+        if not self._budget_is_authoritative:
+            # 没有**权威**预算（调用方没调 `begin_run`）⇒ 按本次调用的条数兜底。
+            #
+            # ★ 绝不覆盖权威预算：贴图管线的小批量（1~4 条）会把上限压到 9，
+            #   而我前两版就是因为它能覆盖，导致翻译阶段再也放不大。
             self._requests_used = 0
             self._request_budget = max(len(items) + _floor, int(len(items) * _factor))
 

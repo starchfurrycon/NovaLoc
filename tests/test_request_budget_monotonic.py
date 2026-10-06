@@ -87,24 +87,6 @@ def _items(n: int, *, offset: int = 0) -> list[TranslateItem]:
 # ----------------------------------------------------------------------
 # 1. ★★ 小批量不能压小预算
 # ----------------------------------------------------------------------
-def test_small_begin_run_does_not_shrink_budget(monkeypatch) -> None:
-    r"""★★ `begin_run(1)` 之后预算**必须不变**。
-
-    这条直接对应那个事故：上限被压到 9 ⇒ 连续拒绝几百批。
-    """
-    prov = _provider(monkeypatch)
-    prov.begin_run(31263)
-    big = prov._request_budget
-    assert big == 31263 * 3, f"游戏级预算不对：{big}"
-
-    for small in (1, 2, 4, 0):
-        prov.begin_run(small)
-        assert prov._request_budget == big, (
-            f"`begin_run({small})` 把预算从 {big} 压到了 {prov._request_budget} "
-            f"⇒ 小批量会毁掉预算（实测事故）"
-        )
-
-
 def test_larger_begin_run_still_grows_budget(monkeypatch) -> None:
     """更大的调用**仍要**能放大预算（否则游戏级调用失效）。"""
     prov = _provider(monkeypatch)
@@ -112,38 +94,73 @@ def test_larger_begin_run_still_grows_budget(monkeypatch) -> None:
     small = prov._request_budget
     prov.begin_run(50000)
     assert prov._request_budget > small, "更大的 begin_run 没有放大预算"
+# ----------------------------------------------------------------------
+# 2. ★★ 权威标记：兜底不得覆盖整个游戏的上限
+# ----------------------------------------------------------------------
+def test_fallback_does_not_override_authoritative_budget(monkeypatch) -> None:
+    r"""★★ 贴图阶段的小批量**绝不能**覆盖翻译阶段设的整个游戏上限。
 
+    ## 这是 v2 的实测失败
 
-def test_shrink_does_not_reset_counter(monkeypatch) -> None:
-    r"""★ 缩小时**不清零** `_requests_used` —— 否则"已用"与上限脱节。
+    v2 用"只增不减"打补丁时，实测**仍然是 9**：
 
-    若清零了，攻击性场景下"用了很多次但显示 0"⇒ 预算永远不触发。
+    ```
+    批 0（1 条）第 1 次失败：请求预算已用尽（10 > 9）
+    …（100 > 9）…（300 > 9）…（600 > 9）…
+    ```
+
+    原因：贴图阶段（`stage_images_localize`，**先跑**）的小批量
+    （1~4 条）走 `translate_batch` 的兜底，把字段写成 9；
+    之后翻译阶段的 `begin_run(31263)` 与"只增不减"互相干扰。
+
+    ## 修法（v3）
+
+    * `begin_run` **无条件**设预算并标记 `_budget_is_authoritative = True`；
+    * `translate_batch` 只在**非权威**时才兜底。
+
+    ⇒ 顺序无关、互不干扰。
     """
     prov = _provider(monkeypatch)
-    prov.begin_run(20000)  # 预算 60000
-    prov.translate_batch(_items(20), "zh")  # 会消耗若干次
-    used = prov._requests_used
-    assert used > 0, "测试没消耗请求，无法验证"
-    prov.begin_run(1)  # 应被忽略
-    assert prov._requests_used == used, (
-        f"缩小时把计数器清零了（{used} → {prov._requests_used}）"
+    # 模拟贴图阶段：1~4 条的小批量，**没有** begin_run
+    for n in (1, 2, 4):
+        prov.translate_batch(_items(n, offset=n * 10), "zh")
+    assert not prov._budget_is_authoritative, "兜底不该把预算标成权威"
+    small = prov._request_budget
+    assert small < 100, f"兜底预算意外地大：{small}"
+
+    # 模拟翻译阶段：游戏级
+    prov.begin_run(31263)
+    assert prov._budget_is_authoritative
+    assert prov._request_budget == 31263 * 3
+
+    # 再有贴图小批量也不许改
+    prov.translate_batch(_items(1, offset=999), "zh")
+    assert prov._request_budget == 31263 * 3, (
+        "兜底覆盖了权威预算 ⇒ 又会出现「上限 9」那个事故"
     )
-
-
 # ----------------------------------------------------------------------
-# 2. 结构性守卫
+# 3. 结构性守卫
 # ----------------------------------------------------------------------
-def test_begin_run_has_monotonic_guard() -> None:
-    r"""★★ `begin_run` 里必须有"只增不减"的早退。
+def test_begin_run_marks_authoritative() -> None:
+    r"""★★ `begin_run` 必须把预算标记为**权威**。
 
-    防止有人后来把它删掉 —— 症状是"上限被压到个位数、
-    连续拒绝几百批"，而日志里只看到"预算已用尽"，**极难归因**。
+    否则 `translate_batch` 的兜底会一直覆盖它（v1/v2 的根因）。
     """
     src = PROV_SRC.read_text(encoding="utf-8")
     i = src.index("def begin_run(")
-    body = src[i : i + 3000]
-    assert "只增不减" in body, "`begin_run` 里没有记录'只增不减'"
-    assert "new_budget <= self._request_budget" in body, (
-        "`begin_run` 缺少'新预算更小则忽略'的判定 ⇒ 小批量会压小预算"
+    body = src[i : i + 4000]
+    assert "_budget_is_authoritative = True" in body, (
+        "`begin_run` 没把预算标记为权威 ⇒ 兜底会覆盖它"
     )
-    assert "return" in body, "缺少早退"
+
+
+def test_fallback_guarded_by_authoritative_flag() -> None:
+    r"""★★ 兜底必须由权威标记把关，而不是"预算 <= 0"。
+
+    用"预算 <= 0"把关是 v2 的做法：贴图阶段一旦设过预算，
+    兜底就不再执行，而它也**不会**被权威值替换 ⇒ 卡在 9。
+    """
+    src = PROV_SRC.read_text(encoding="utf-8")
+    assert "if not self._budget_is_authoritative:" in src, (
+        "兜底没有用权威标记把关 ⇒ 贴图阶段的小批量会毁掉预算"
+    )
