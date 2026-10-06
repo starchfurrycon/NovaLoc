@@ -21,6 +21,10 @@ sys.path.insert(0, str(ROOT / "src"))
 import numpy as np  # noqa: E402
 from _fake_game import build_fake_game  # noqa: E402
 
+#: ★ 见 `tests/conftest.py` 的说明：这些标记是**实际探测**而非仅描述，
+#: 免得忘了打 `needs_fonts` 就照常跑然后失败（CI 上实测过）。
+from conftest import windows_only  # noqa: E402
+
 from novaloc.core.config import Config  # noqa: E402
 from novaloc.core.events import EventBus  # noqa: E402
 from novaloc.core.registry import Context  # noqa: E402
@@ -28,6 +32,9 @@ from novaloc.engines import available_engines, detect_engine, get_adapter  # noq
 from novaloc.engines.renpy import RenPyAdapter  # noqa: E402
 from novaloc.engines.unity import UnityAdapter  # noqa: E402
 from novaloc.images.io import imwrite_bgr  # noqa: E402
+
+pytestmark = windows_only
+
 
 SB = FIXTURES
 

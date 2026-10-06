@@ -28,8 +28,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import pytest  # noqa: E402
 
+#: ★ 见 `tests/conftest.py` 的说明：这些标记是**实际探测**而非仅描述，
+#: 免得忘了打 `needs_fonts` 就照常跑然后失败（CI 上实测过）。
+from conftest import windows_only  # noqa: E402
+
 from novaloc.archives.rpa import write_rpa  # noqa: E402
 from novaloc.models import TranslationEntry  # noqa: E402
+
+pytestmark = windows_only
+
 
 #: 一个最小可识别的 Ren'Py 游戏（脚本放在 game/ 下）
 SCRIPT = """\

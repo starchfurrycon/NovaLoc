@@ -40,8 +40,16 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from conftest import requires_ollama  # noqa: E402
+
 from novaloc.core.registry import TranslateItem  # noqa: E402
 from novaloc.models import EntryStatus, TextKind, TextLocation, TextUnit  # noqa: E402
+
+#: ★ 这些测试会构造真 `OllamaTranslationProvider` 并调 `available()`，
+#: 所以在**没有 Ollama 的 CI** 上必须 skip 而不是失败。
+#: 见 `tests/conftest.py` 的 `requires_ollama`。
+pytestmark = requires_ollama
+
 
 PROV = ROOT / "src" / "novaloc" / "translate" / "ollama_provider.py"
 CONFIG_SRC = ROOT / "src" / "novaloc" / "core" / "config.py"

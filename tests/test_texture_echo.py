@@ -51,12 +51,19 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+#: ★ 见 `tests/conftest.py` 的说明：这些标记是**实际探测**而非仅描述，
+#: 免得忘了打 `needs_fonts` 就照常跑然后失败（CI 上实测过）。
+from conftest import requires_fonts  # noqa: E402
+
 from novaloc.core.config import get_config  # noqa: E402
 from novaloc.core.events import EventBus  # noqa: E402
 from novaloc.core.registry import Context  # noqa: E402
 from novaloc.images.ocr_ppocrv6 import OcrPage  # noqa: E402
 from novaloc.images.service import TextureTranslator  # noqa: E402
 from novaloc.models import ImageTextBlock  # noqa: E402
+
+pytestmark = requires_fonts
+
 
 W, H = 200, 120
 

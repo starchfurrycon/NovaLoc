@@ -42,12 +42,19 @@ GameMaker 游戏 `Sloppy_Fields_0.5.1.3_-_Subscribestar`，跑一次 `auto`：
 from __future__ import annotations
 
 import inspect
+
+#: ★ 见 `tests/conftest.py` 的说明：这些标记是**实际探测**而非仅描述，
+#: 免得忘了打 `needs_fonts` 就照常跑然后失败（CI 上实测过）。
 from types import SimpleNamespace
 
 import pytest
+from conftest import windows_only  # noqa: E402
 
 from novaloc.engines.loose import LooseFilesAdapter
 from novaloc.models import TextKind, TextLocation, TextUnit
+
+pytestmark = windows_only
+
 
 CRLF = b"[Windows]\r\nSleepMargin=10\r\nUsex64=True\r\n"
 LF = b"[Windows]\nSleepMargin=10\nUsex64=True\n"

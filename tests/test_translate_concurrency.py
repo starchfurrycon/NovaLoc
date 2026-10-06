@@ -38,11 +38,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from conftest import requires_ollama  # noqa: E402
+
 from novaloc.core.config import Config  # noqa: E402
 from novaloc.core.events import EventBus  # noqa: E402
 from novaloc.core.registry import Context, TranslateItem  # noqa: E402
 from novaloc.models import TextKind, TextLocation, TextUnit  # noqa: E402
 from novaloc.translate.ollama_provider import OllamaTranslationProvider  # noqa: E402
+
+#: ★ 这些测试会构造真 `OllamaTranslationProvider` 并调 `available()`，
+#: 所以在**没有 Ollama 的 CI** 上必须 skip 而不是失败。
+#: 见 `tests/conftest.py` 的 `requires_ollama`。
+pytestmark = requires_ollama
+
 
 N = 40
 DELAY = 0.20
