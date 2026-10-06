@@ -738,6 +738,14 @@ class Pipeline:
         done = 0
         total = len(units)
 
+        # ★ 预算按**整个游戏**设一次（不是按批）—— 见
+        #   `OllamaTranslationProvider.begin_run` 的 docstring：
+        #   我第一版在 `translate_batch` 里按每批条数设，
+        #   于是正常批次重试几次就撞上限 ⇒ **整批被拒**。
+        _begin = getattr(provider, "begin_run", None)
+        if callable(_begin):
+            _begin(total)
+
         for kind, group in buckets.items():
             batch_indices = self._chunk_indices(provider, group, kind)
             #: 该 kind 内已处理到的下标（只用于日志定位；批次大小不再是固定的，

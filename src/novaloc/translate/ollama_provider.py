@@ -1379,6 +1379,37 @@ class OllamaTranslationProvider:
     # 主入口
     # ------------------------------------------------------------------
 
+
+    def begin_run(self, total_items: int) -> None:
+        r"""开始翻**一个游戏**：按该游戏的全部条数设定请求预算。
+
+        ## 为什么必须有这个方法（实测事故）
+
+        我第一版把预算写在 `translate_batch` 里按**每次调用**的条数设，
+        而那个方法是被**按批**调用的（每批 8~25 条）⇒ 预算退化成
+        "单批允许几次请求"⇒ 正常批次重试几次就撞上限 ⇒ **整批被拒**。
+
+        实测 `Battle Demon Kirsten`（31,263 条）报"25 次 > 上限 24"。
+
+        ⇒ 由调用方（`stage_translate`）在开始游戏前调用一次，
+        用**全部条数**设预算；`translate_batch` 只负责递增。
+
+        ⚠️ 计的是**整个游戏**的请求数，所以它是"病态游戏的止血阀"，
+        不是"单批保护"。正常游戏实际约 1 次请求/条，
+        远低于 `factor`（默认 3.0）。
+        """
+        o = self.cfg.ollama
+        factor = float(getattr(o, "request_budget_factor", 3.0))
+        floor = int(getattr(o, "request_budget_floor", 8))
+        self._requests_used = 0
+        self._request_budget = max(
+            int(total_items) + floor, int(int(total_items) * factor)
+        )
+        log.info(
+            "请求预算（本游戏）：%d 条 × %.1f = **%d 次请求**",
+            total_items, factor, self._request_budget,
+        )
+
     def translate_batch(
         self, items: list[TranslateItem], target_lang: str
     ) -> list[TranslationEntry]:
@@ -1409,13 +1440,40 @@ class OllamaTranslationProvider:
         # ⚠️ 这是**纯行为**控制（数请求数），**不判断内容**。这是本轮
         #    **两次否决内容判据**后学到的：字符层面分不出
         #    「`'ポイズンガード'`(7 字) 该译」与「`'一の型・焔斬'`(6 字) 不译」。
+        # ★★ 预算的作用域是**整个游戏**，不是**这一批**。
+        #
+        # ## 为什么（实测事故）
+        #
+        # `stage_translate` 是**按批**调用 `translate_batch` 的：
+        #
+        #     for idxs in batch_indices:
+        #         provider.translate_batch(items, ...)   # ← 每批一次
+        #
+        # 而我第一版在这里**每批重置**计数器与上限：
+        #
+        #     self._requests_used = 0
+        #     self._request_budget = max(len(items) + _floor, ...)
+        #
+        # ⇒ 预算退化成"**单批**允许几次请求"。
+        #   一个 16 条的批只要重试几次（`_call_batch` 3 次 + 逐条 + 补空）
+        #   就会撞到 24 ⇒ **整批被拒** ⇒ 条目被判 `FAILED`。
+        #   实测 `Battle Demon Kirsten`（31,263 条，预算本该 93,789）
+        #   报的是"25 次 > 上限 24"。
+        #
+        # ## 修法
+        #
+        # * **`begin_run(total_items)`**（新增）：`stage_translate` 在开始
+        #   翻一个游戏前调用一次，用**该游戏全部条数**设预算；
+        # * **`translate_batch` 不再重置** —— 只按批递增计数器；
+        # * 没调用 `begin_run` 时（贴图管线的小批量回调）退回
+        #   "按本次调用条数"设预算，保持原有的安全网。
         _factor = float(getattr(self.cfg.ollama, "request_budget_factor", 3.0))
         # 下限余量**可配置**：见 `request_budget_floor` 的 docstring。
-        # 它可配置的直接原因是**测试** —— 小样本加固定下限时
-        # 永远撞不到预算，'用尽'分支就没有覆盖（我第一版就漏了）。
         _floor = int(getattr(self.cfg.ollama, "request_budget_floor", 8))
-        self._requests_used = 0
-        self._request_budget = max(len(items) + _floor, int(len(items) * _factor))
+        if self._request_budget <= 0:
+            # 没有 `begin_run` ⇒ 按本次调用的条数设（安全网）
+            self._requests_used = 0
+            self._request_budget = max(len(items) + _floor, int(len(items) * _factor))
 
         # ---- 0. 同批内去重 ----
         # 真实数据里冗余极高：某个角色的**说话人名**有 4334 条待翻，
