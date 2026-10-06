@@ -199,6 +199,101 @@ _ZH_TEXT_EXT = {
 
 _ZH_RE = re.compile(r"[\u4e00-\u9fff]")
 
+#: 中文语言码的**文件名主干**集合（已把 `_` 归一成 `-`、转小写）。
+#: 见 :func:`_zh_language_file`：用**文件名**而不是目录名或内容作证据。
+_ZH_FILE_CODES: frozenset[str] = frozenset(
+    {
+        "zh", "zh-cn", "zh-hans", "zh-sg", "zh-tw", "zh-hant", "zh-hk",
+        "zhcn", "zhtw", "chs", "cht", "schinese", "tchinese", "chinese",
+        "cn", "sc", "tc", "zho", "chi", "zh-cn-hans", "zh-hant-tw",
+        "zh-hans-cn", "中文", "简体", "繁体", "简中", "繁中", "汉化", "漢化",
+    }
+)
+
+
+def _zh_language_file(game_dir: Path, *, max_depth: int = 6) -> Path | None:
+    r"""游戏里有没有**文件名就是中文语言码**的资产（`zh-CN.pak` / `zh_CN.json`）。
+
+    ## 为什么单独抽一个函数
+
+    它是 :func:`detect_builtin_chinese_assets` 的**判据 0**，逻辑独立
+    （按**文件名**而不是目录名或内容），所以单独可测 —— 见
+    `tests/test_zh_language_file.py`。
+
+    ## 为什么要**递归剥后缀**
+
+    真实文件名形如：
+
+    ```
+    zh-CN.pak          ← 剥 1 次得 `zh-CN`
+    zh_CN.pak.info     ← 剥 1 次得 `zh_CN.pak`，剥 2 次才得 `zh_CN`
+    zh-Hans.xaml       ← 剥 1 次得 `zh-Hans`
+    ```
+
+    只看一层后缀会漏掉 `zh-CN.pak.info` 这类。剥 3 层足够覆盖实测形态。
+
+    ## 为什么要归一 `_` → `-` 并转小写
+
+    实测同一个语言有 `zh_CN` / `zh-CN` / `ZH-cn` 多种写法。
+    归一后只需维护一份代码集合，避免"为新写法又加一条"。
+
+    ## 边界：不误抓"看起来像语言码"的普通文件
+
+    只接受**完整主干**匹配（剥完后整串等于某个语言码），
+    所以 `zh-CN-notes.txt`（剥完是 `zh-CN-notes`）**不会**命中 ——
+    它是"提到中文的文件"，不是"中文语言包"。
+
+    ## ★ 为什么要排除**两字母代码 + 多段主干**
+
+    实测误判（`.scratch/_zh_code_evidence.py` 的全库排查）：
+
+    ```
+    Fox Sex Farm_Data\Managed\sc.stylizedwater2.runtime.dll   ← 剥后缀得 'sc'
+    Robolife2_Data\Managed\sc.posteffects.runtime.dll         ← 同样
+    ```
+
+    `sc` 是合法的两字母语言码（简体中文），而这两个 **DLL** 名剥掉
+    `.dll` 后恰好是 `sc.stylizedwater2.runtime`，再剥才到 `sc`。
+    它是 Unity 的 **Shader 库**，与语言毫无关系。
+
+    ⇒ 判据收紧为：**两字母主干**（`sc`/`tc`/`cn`/`zh`）**必须没有多余的点**，
+    即整串就是那个代码本身。`sc.xxx.yyy` 因此被排除，
+    而 `zh-CN.pak`（主干 `zh-CN`，两段但用 `-`）仍然命中。
+
+    这个收紧**零成本**：实测 57 个命中里 **52 个是 `zh-CN.pak`**，
+    两字母形态只有 `zh.dat` 一例。
+    """
+    base_depth = len(game_dir.parts)
+    try:
+        for p in game_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if len(p.parts) - base_depth > max_depth:
+                continue
+            original = p.name
+            stem = original
+            for _ in range(4):  # `x.pak.info` 要剥两次
+                nxt = Path(stem).stem
+                if nxt == stem:
+                    break
+                stem = nxt
+            norm = stem.strip().lower().replace("_", "-")
+            if norm not in _ZH_FILE_CODES:
+                continue
+            # ★ 裸两字母码（`sc`/`tc`/`cn`/`zh`）**必须没有多余的点**。
+            #
+            # ⚠️ 守卫要看**原始文件名**，不能看 `stem` —— 后者已经把所有点剥掉了，
+            #    我第一版就写错在这里（`'.' in stem` 永远为假，守卫形同虚设）。
+            #
+            # 实测误判：`sc.stylizedwater2.runtime.dll` 剥到 `sc` 后
+            # 命中语言码，而它是 Unity 的 **Shader 库**，与语言无关。
+            if "-" not in norm and original.count(".") > 1:
+                continue
+            return p
+    except OSError:
+        return None
+    return None
+
 
 def detect_builtin_chinese_assets(
     game_dir: Path, *, max_depth: int = 6, min_zh_files: int = 3
@@ -241,6 +336,51 @@ def detect_builtin_chinese_assets(
     """
     names = _zh_lang_dir_names()
     base_depth = len(game_dir.parts)
+
+    # ---- ★★ 判据 0（新增）：**语言码文件名**本身就是证据 ----
+    #
+    # ## 为什么必须加这一条（实测：判据对整个 `locales/` 形态失效）
+    #
+    # Godot 等引擎的本地化形态是**语言码文件名**：
+    #
+    #     locales\am.pak  ar.pak  bg.pak  …  **zh-CN.pak**  zh-CN.pak.info
+    #
+    # 而原有的两条判据**同时**失败：
+    #
+    # 1. 目录名是 `locales`（**不是** `zh-cn`）⇒ 条件"目录名是语言码"不满足；
+    # 2. `.pak` **不在** `_ZH_TEXT_EXT` 白名单里，而且它是**二进制**
+    #    ⇒ 就算加进白名单，`read_text` 也读不出汉字 ⇒ 条件"含汉字文件"不满足。
+    #
+    # 实测后果（用户指正："文件夹里带中文选项的游戏很多，收益应该很高"）：
+    #
+    # ```
+    # 全库 194 个游戏，**57 个（29.4%）** 带中文语言资产
+    # 其中 **7 个已被处理过**（判据没拦住，已白烧）：
+    #   [Summoner Veil] 49,733 条    Battle Demon Kirsten 31,263 条
+    #   Ambrosia 18,785 条           072 Project 15,003 条   …
+    # 另有 **50 个尚未处理**（合计 72.8 GB）
+    # ```
+    #
+    # ## 为什么这条判据是**安全**的（不读内容、不判单条）
+    #
+    # * **不读文件内容** ⇒ 对二进制语言包（`.pak`/`.bundle`）同样有效；
+    # * **不判断单条文本** ⇒ 没有 `'清宮 真白'`（全汉字日文人名）那种误杀；
+    # * 一个文件叫 `zh-CN.pak` 与 50 个 `xx.pak` 并列在 `locales/` 里，
+    #   这是"官方支持中文"的**结构性铁证**。
+    #
+    # 判据方向符合项目一贯原则（见 `_zh_lang_dir_names` 的 docstring）：
+    # **漏判的代价**（白烧几小时 GPU + 改坏一个好游戏）远大于
+    # **误判的代价**（少翻一个游戏，用户可 `--force`）。
+    #
+    # ⚠️ 与原有判据**并列**，不替换 —— 后者仍能抓到"目录形态"的游戏。
+    lang_file = _zh_language_file(game_dir)
+    if lang_file is not None:
+        try:
+            rel = lang_file.relative_to(game_dir)
+        except ValueError:
+            rel = lang_file
+        return True, f"自带中文语言文件：{rel}"
+
     try:
         candidates = [
             d
