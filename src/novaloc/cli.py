@@ -519,6 +519,83 @@ def _collect_doctor() -> dict[str, Any]:
     }
 
 
+@app.command("cleanup")
+def cleanup(
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="真的删（默认只报告会删什么、能省多少）。",
+    ),
+    no_backups: bool = typer.Option(
+        False, "--no-backups", help="不处理保护性原版备份。"
+    ),
+    no_out: bool = typer.Option(
+        False, "--no-out", help="不处理写回产物目录 `out/`。"
+    ),
+) -> None:
+    """空间回收：**验收通过后**才清备份与写回产物。
+
+    ## 为什么需要
+
+    实测算过：工作区增长约 **1.09 GB / 游戏**，172 个游戏要 **187 GB**，
+    而数据盘可能只有 100 多 GB ⇒ **跑到一半就满**。
+
+    两类东西写回并验证成功后就没有价值：
+
+    * **`out/`**（写回产物）：内容已进游戏目录，断点靠
+      `translations/entries.jsonl` 承担；
+    * **`<游戏>-orig-<时间戳>/`**（保护性原版备份）。
+
+    ## ★★ 硬规则：没有通过验收，绝不删备份
+
+    判据（唯一闸门）必须同时满足：
+
+    1. 该游戏有验收记录；
+    2. `status == "ok"`；
+    3. **`launch == "clean"`** —— **真的启动过游戏且无错误**。
+
+    ⚠️ 第 3 条不可省：曾有事故里**静态检查全部通过**
+    （JSON 合法、无 BOM、字体正常）而**游戏启动即崩**
+    （`note` 里会被 `eval` 的 JS 被翻译）。
+    只做静态检查就删备份 = 把用户唯一的回退路径扔掉。
+
+    ⇒ 先跑 `novaloc verify <游戏>`（**不带** `--no-launch`），
+    再跑本命令。
+    """
+    import logging as _logging
+
+    from .cleanup import apply_cleanup, plan_cleanup
+    from .core import paths
+
+    _logging.basicConfig(level=_logging.INFO, format="%(message)s")
+    data_root = paths.data_root()
+    plan = plan_cleanup(
+        data_root, include_out=not no_out, include_backups=not no_backups
+    )
+    total = sum(
+        f.stat().st_size
+        for d in list(plan.backups) + list(plan.out_dirs)
+        for f in d.rglob("*")
+        if f.is_file()
+    )
+    console.print(
+        f"可清理：备份 [bold]{len(plan.backups)}[/bold] 个、"
+        f"out/ [bold]{len(plan.out_dirs)}[/bold] 个，"
+        f"预计回收 [bold]{total / 1024**3:.2f} GB[/bold]"
+    )
+    if plan.kept:
+        from collections import Counter
+
+        c = Counter(why for _d, why in plan.kept)
+        console.print(f"[yellow]保留 {len(plan.kept)} 项（未通过验收）[/yellow]")
+        for why, n in c.most_common(6):
+            console.print(f"  {n:>4}  {why}")
+    if not apply:
+        console.print("[dim]（dry-run；加 --apply 才真删）[/dim]")
+        return
+    freed = apply_cleanup(plan)
+    console.print(f"[green]✅ 已回收 {freed / 1024**3:.2f} GB[/green]")
+
+
 @app.command("verify")
 def verify(
     game: Path = typer.Argument(..., help="游戏目录（写回后要验收的那个）。"),

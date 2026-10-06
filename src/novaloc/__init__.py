@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 __app_name__ = "NovaLoc"
 __app_name_zh__ = "新译"
 

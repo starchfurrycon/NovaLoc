@@ -7,6 +7,38 @@
 
 ---
 
+## v1.8.1
+
+**修掉 v1.8.0 的一个遗漏：`novaloc cleanup` 没有接上命令行。**
+
+### 🔧 `novaloc cleanup` 现在可以从命令行用了
+
+v1.8.0 里的空间回收功能**内部**是通的（验收循环跑完后会自动清理），
+但**没在 `cli.py` 注册子命令** ⇒ 用户装好发行版后
+执行 `novaloc cleanup` 会报 `No such command 'cleanup'`。
+
+现在可用：
+
+```bash
+novaloc cleanup              # 只报告会删什么、能省多少（dry-run）
+novaloc cleanup --apply      # 真的删
+novaloc cleanup --no-backups # 只清写回产物
+```
+
+**硬规则不变**：必须 `status == ok` **且** `launch == "clean"`
+（**真的启动过游戏且无错误**）才会删备份。
+先跑 `novaloc verify <游戏>`（**不带** `--no-launch`）。
+
+### 这个遗漏是怎么发现的
+
+从 GitHub Releases **下载 wheel**、在**仓库外的干净虚拟环境**里装好、
+再跑 `novaloc cleanup --help` —— 本地开发时一直用
+`python -m novaloc.cleanup`，所以这条路径的问题看不见。
+
+⇒ 新功能必须**从用户视角验一遍**（装发行包、在仓库外跑）。
+
+---
+
 ## v1.8.0
 
 **主题：修掉两个会毁掉游戏的缺陷，并给"写回后验收"与"空间回收"补上机制。**
