@@ -791,7 +791,32 @@ class FontService:
             # 这条错误路径**只有在 QA 真的不通过时才会走到**，
             # 所以正常项目里永远测不到。修它的时候顺手确认了
             # `FontQAReport.summary` 与 `PatchResult.summary` 都是 property。
-            res.error = f"QA 未通过：{res.qa.summary}"
+            # ★★★ 报错里**必须带上具体字符**，否则上游的"剔除"机制失效。
+            #
+            # ## 实测缺陷（`Battle Demon Kirsten`，白跑 7.45 小时）
+            #
+            # `FontQAReport.summary` 是**给人看的**，只报数量：
+            #
+            #     '❌ 检查 2996 字  缺码点 8  空白 1'
+            #
+            # 而 `stage_fonts` 靠 `_chars_from_patch_error(res.error)`
+            # 取回"是哪几个字"，才能把**只影响极少数条目**的字符剔掉后重试。
+            # 那个函数按"最后一个冒号之后全是字符"解析（适配 `patch_font`
+            # 另一种措辞），于是把 summary 里的**汉字字面量**当成了数据：
+            #
+            #     输入 'QA 未通过：❌ 检查 2997 字  空白 1'
+            #     输出 {'空','❌','1','白','查','7','9','字','2','检'}
+            #
+            # ⇒ `U+2800`（盲文空白）**永远不在候选里** ⇒ 永远剔不掉
+            #   ⇒ 迭代 3 次用尽 ⇒ **硬失败** ⇒ 整局判失败。
+            #
+            # 修法：在 error 末尾按 `patch_font` 的既有格式附上字符
+            # （"……："+ 一串字符）。**不要再让上游从人读的文案里正则抓**。
+            _bad = "".join(res.qa.missing) + "".join(res.qa.blank) + "".join(res.qa.tofu)
+            if _bad:
+                res.error = f"QA 未通过：{res.qa.summary}；不合格字符：{_bad}"
+            else:
+                res.error = f"QA 未通过：{res.qa.summary}"
             res.warnings.append("为避免游戏内出现口口口，本次结果**未采用**")
             return res
         if plan.still_missing:
