@@ -104,9 +104,43 @@ PLUGIN_TAG_RE = re.compile(r"<[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z0-9_]+)*(?::[^<
 #: `note` 字段里的 **JavaScript 代码**特征。
 #: RPG Maker 的 `note` 是插件的配置区，插件文档里明确要求把脚本写进去：
 #: ``<JS Crafting Effect>`` 之类标签之间的内容是**会被 eval 的代码**。
+#:
+#: ## ★★ 为什么必须补上 `<JS …>` 区块判据（实测：游戏直接崩）
+#
+# 原判据只认 `$game`/`function`/`=>`/`var` 这类**语法特征**，
+# 于是**漏掉了纯 API 调用式代码**：
+#
+# ```text
+# <JS On Expire State>
+# target.addState(80);
+# </JS On Expire State>
+# ```
+#
+# `target.addState(80)` 一条都不匹配 ⇒ 被当成"人话"送去翻译 ⇒
+# 模型把它翻成 `目标生命值恢复至 80。` ⇒ VisuMZ 插件用
+# **`new Function()`** 执行它 ⇒ 抛
+#
+# ```text
+# SyntaxError: Unexpected number
+#     at new Function (<anonymous>)
+#     at ...Parse_Notetags_State_ApplyRemoveLeaveJS
+#        (VisuMZ_1_SkillsStatesCore.js)
+# ```
+#
+# ⇒ **游戏启动即崩**（实测 `Beyond the Portal`，7 处这样的 `note`）。
+#
+# 教训：**"是不是代码"不能只看语法特征** —— 任何 `<JS …>` 区块
+# 里的内容都**必然会被 eval**，无论它看起来像不像代码。
 NOTE_JS_RE = re.compile(
-    r"\$game[A-Za-z]+|\barguments\s*\[|\bfunction\b|=>|\bvar\s+\w|\blet\s+\w"
+    r"<(?:JS|/JS)\b[^>]*>"
+    r"|\$game[A-Za-z]+|\barguments\s*\[|\bfunction\b|=>|\bvar\s+\w|\blet\s+\w"
     r"|\bnew\s+[A-Z]|\.setValue\s*\(|\.value\s*\("
+    # ★ 常见 API 调用形态：`<对象>.<方法>(...)`。
+    #   覆盖 `target.addState(80)` / `user.gainHp(-1)` / `this.xxx()`
+    #   这类"没有语法关键字但会被 eval"的代码。
+    r"|\b(?:target|user|this|item|actor|enemy|state|value|a|b)\s*\.\s*[A-Za-z_]\w*\s*\("
+    # ★ 赋值/自增表达式：`x = ...` 之类（`NOTE_CONFIG_LINE_RE` 会漏掉含括号的）
+    r"|\w+\s*(?:\+\+|--)\s*;"
 )
 
 #: `note` 字段里的**换行/缩进式插件配置**特征。
