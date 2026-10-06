@@ -399,6 +399,10 @@ class OllamaTranslationProvider:
         self._model = cfg.ollama.text_model
         self._ready: tuple[bool, str] | None = None
         #: 统计信息，交给 UI 显示
+        #: ★★ **请求预算**（见 OllamaConfig.request_budget_factor）
+        #: 与已用计数。**唯一发请求的出口是 _chat**，预算在那里记。
+        self._requests_used = 0
+        self._request_budget = 0  # 由 translate_batch 按条目数设定
         self.stats: dict[str, int] = {
             "batches": 0,
             "retries": 0,
@@ -816,6 +820,33 @@ class OllamaTranslationProvider:
         更短的值** —— 见 `_call_single_once` 与
         `OllamaConfig.single_request_timeout_s` 的说明。
         """
+        # ★★ 请求预算：**唯一发请求的出口**在这里，所以预算也在这里记。
+        #
+        # 见 OllamaConfig.request_budget_factor 的 docstring：
+        # 三层重试相乘（批 3 × 逐条 2 × 补空 2 × 单条 2）让一条病态条目
+        # 最多发 6 次请求，实测 960 条失败 ⇒ 约 5,760 次无效请求。
+        #
+        # 预算是**纯行为**控制（数请求数），**不判断内容** ——
+        # 这是本轮两次否决内容判据（假名长度、汉字占比）后学到的：
+        # 字符层面分不出「'ポイズンガード'该译」与「'一の型・焔斬'不译」。
+        self._requests_used += 1
+        if self._requests_used > self._request_budget:
+            # 只在**第一次**用尽时记（避免刷屏），并且要能一眼看出来。
+            self.stats["request_budget_exhausted"] = (
+                self.stats.get("request_budget_exhausted", 0) + 1
+            )
+            if self.stats["request_budget_exhausted"] == 1:
+                log.error(
+                    "★ 请求预算用尽（%d 次 > 上限 %d）：本次运行不再发新请求，"
+                    "剩余条目留作未翻译（下次运行会重试）。"
+                    "常见原因：模型对某类短专名/技能名不给译文，"
+                    "而三层重试相乘导致请求数爆炸。",
+                    self._requests_used, self._request_budget,
+                )
+            raise ProviderError(
+                f"请求预算已用尽（{self._requests_used} > {self._request_budget}）"
+                f"：本次运行不再发新请求，剩余条目留作未翻译"
+            )
         result = self.client.chat(
             self._model,
             [
@@ -1359,6 +1390,32 @@ class OllamaTranslationProvider:
             raise ProviderError(why)
 
         self.stats["items"] += len(items)
+
+        # ★★ 设定**请求预算**（见 `OllamaConfig.request_budget_factor`）
+        #
+        # 三层重试相乘让一条病态条目最多发 6 次请求：
+        #
+        #     translate_batch   for attempt in range(3)   ← 批重试 3 次
+        #       ├─ _recover_by_subbatch → _call_single    ← 每缺条 2 次
+        #       └─ 补空 → _call_single                    ← 又 2 次
+        #     _call_single      for attempt in range(2)   ← 单条再 2 次
+        #
+        # 实测 `Battle Demon Kirsten`：960 条失败 × 约 6 次 ≈ **5,760 次**
+        # 无效请求，把吞吐拖到 **0~2 条/分钟**。独立重试只需 960 次 ⇒ 可省 83%。
+        #
+        # 预算按条目数给（每条允许 `factor` 次），所以**正常游戏永远碰不到**
+        # —— 正常几乎无失败，实际约 1 次/条；只有病态游戏才会撞上。
+        #
+        # ⚠️ 这是**纯行为**控制（数请求数），**不判断内容**。这是本轮
+        #    **两次否决内容判据**后学到的：字符层面分不出
+        #    「`'ポイズンガード'`(7 字) 该译」与「`'一の型・焔斬'`(6 字) 不译」。
+        _factor = float(getattr(self.cfg.ollama, "request_budget_factor", 3.0))
+        # 下限余量**可配置**：见 `request_budget_floor` 的 docstring。
+        # 它可配置的直接原因是**测试** —— 小样本加固定下限时
+        # 永远撞不到预算，'用尽'分支就没有覆盖（我第一版就漏了）。
+        _floor = int(getattr(self.cfg.ollama, "request_budget_floor", 8))
+        self._requests_used = 0
+        self._request_budget = max(len(items) + _floor, int(len(items) * _factor))
 
         # ---- 0. 同批内去重 ----
         # 真实数据里冗余极高：某个角色的**说话人名**有 4334 条待翻，
