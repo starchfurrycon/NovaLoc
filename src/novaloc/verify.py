@@ -70,6 +70,61 @@ NOISE_RE = re.compile(
 #: RPG Maker 的 entry exe 名（按可能性排序）
 EXE_CANDIDATES = ("Game.exe", "game.exe", "nw.exe", "Game", "*.exe")
 
+#: **不该验收**文件名的特征（小写子串匹配**文件名**，不是整条路径）。
+#:
+#: ## 为什么必须排除（实测误报）
+#:
+#: `Breeding Log 1.04 64` 的 `生殖活動記録_Data\savedata.json` 是**游戏存档**，
+#: 它**自带 UTF-8 BOM**（BOM 解掉后 JSON 完全合法）。
+#: 我的第一版验收器把它当数据文件 ⇒ 报"严格 JSON 校验失败" ⇒ **误报**。
+#:
+#: 而它**不在** `rpgmaker.DATABASE_FIELDS` 的 11 个数据文件白名单里
+#: ⇒ **NovaLoc 从来没碰过它**。
+_SKIP_NAME_PARTS = (
+    "savedata",
+    ".rpgsave",
+    ".rmmzsave",
+    ".bdic",   # Chromium 的拼写词典
+    ".pak",    # NW.js 的运行时语言包
+)
+
+#: **不该验收**的路径段（按 `/` 切分后的**整段**匹配）。
+#:
+#: ⚠️ ★★ 必须按**整段**匹配，不能按子串 —— 我第一版用
+#: ``"appdata" in path`` 就翻车了：`game/data/Items.json` 里**含有**
+#: `appdata`（`gamedata` 那 7 个字母）⇒ 把**所有数据文件**都排除了
+#: ⇒ **验收形同虚设**。
+#:
+#: 这个 bug 是"数据文件带 BOM 应报错"那条测试暴露的（5 条测试同时失败）。
+_SKIP_DIR_SEGMENTS = (
+    "save",
+    "saves",
+    "userdata",
+    "dictionaries",  # Chromium 的拼写词典
+    "locales",       # NW.js 的运行时语言包
+)
+
+
+def _is_user_data(p: pathlib.Path) -> bool:
+    """这个文件是**用户数据/运行时资源**（不该验收）吗？
+
+    ## 判据
+
+    * **文件名**含 `savedata`/`.rpgsave`/`.rmmzsave`/`.bdic`/`.pak`；
+    * **路径段**（按 `/` 切分）**整段等于**
+      `save`/`saves`/`userdata`/`dictionaries`/`locales`。
+
+    ## ⚠️ 为什么按"段"而不按"子串"
+
+    子串匹配会误排：`game/data/X.json` 含 `appdata`（`gamedata`）。
+    实测这会让**所有数据文件**被跳过 ⇒ 验收等于没有。
+    """
+    name = p.name.lower()
+    if any(part in name for part in _SKIP_NAME_PARTS):
+        return True
+    segments = {seg for seg in str(p).replace("\\", "/").lower().split("/") if seg}
+    return bool(segments & set(_SKIP_DIR_SEGMENTS))
+
 
 @dataclass
 class VerifyResult:
@@ -115,7 +170,7 @@ def check_js_blocks(game: pathlib.Path, *, max_mb: int = 16) -> list[str]:
     """
     problems: list[str] = []
     for p in sorted(game.rglob("*.json")):
-        if not p.is_file() or "locales" in str(p).lower():
+        if not p.is_file() or _is_user_data(p):
             continue
         try:
             if p.stat().st_size > max_mb * 1024 * 1024:
@@ -164,13 +219,23 @@ def check_data_integrity(game: pathlib.Path, *, max_mb: int = 16) -> list[str]:
     """
     problems: list[str] = []
     for p in sorted(game.rglob("*.json")):
-        if not p.is_file() or "locales" in str(p).lower():
+        if not p.is_file() or _is_user_data(p):
             continue
         try:
             if p.stat().st_size > max_mb * 1024 * 1024:
                 continue
             t = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            continue
+        # ★ BOM 检查：**必须显式查** —— Python 的 json.loads 会静默跳过
+        #   UTF-8 BOM，而 **JavaScript 的 JSON.parse 不会**
+        #   （会报 Unexpected token / Unexpected number）。
+        #   实测：加了这条测试才发现我的检查漏了它。
+        if t.startswith("\\ufeff"):
+            problems.append(
+                f"{p.relative_to(game)}：带 UTF-8 BOM（JS 的 JSON.parse 不接受，"
+                f"Python 的 json.loads 却会静默跳过 ⇒ 必须显式查）"
+            )
             continue
         # 严格解析
         try:

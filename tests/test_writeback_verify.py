@@ -232,3 +232,69 @@ def test_clean_game_runs_all_checks(tmp_path: Path) -> None:
     res = verify_game(tmp_path / "game", launch=True)
     assert "js_blocks" in res.checks_run
     assert "data_integrity" in res.checks_run
+
+
+# ----------------------------------------------------------------------
+# 6. ★★ 用户数据（存档/配置）**不该验收**
+# ----------------------------------------------------------------------
+def test_save_data_with_bom_is_not_an_error(tmp_path: Path) -> None:
+    r"""★★ 游戏存档带 BOM **不该**报错 —— 那是它自己的格式，不是我们的产物。
+
+    实测误报（Breeding Log 1.04 64）：
+
+    `
+    生殖活動記録_Data\savedata.json：严格 JSON 校验失败
+      → Unexpected UTF-8 BOM
+    `
+
+    而那是**存档文件**，BOM 解掉后 JSON 完全合法，
+    且它**不在** rpgmaker.DATABASE_FIELDS 的 11 个数据文件白名单里
+    ⇒ **NovaLoc 从来没碰过它**。
+
+    ⇒ 判据：只验收我们可能写过的东西。存档/配置属于用户数据。
+    """
+    game = tmp_path / "game"
+    d = game / "X_Data"
+    d.mkdir(parents=True)
+    # 存档：带 BOM
+    (d / "savedata.json").write_bytes(b"\xef\xbb\xbf" + b'{"keys":[1,2]}')
+    # 配置存档
+    (game / "save").mkdir()
+    (game / "save" / "config.rpgsave").write_bytes(b"N4IghgNg7mCeDOAR")
+    # 数据文件（**我们翻的**，合法）
+    (game / "data").mkdir()
+    (game / "data" / "Items.json").write_text('[{"id":1,"name":"药水"}]', encoding="utf-8")
+
+    assert check_data_integrity(game) == [], "把存档文件当成验收对象了"
+    assert check_js_blocks(game) == []
+
+
+def test_data_file_with_bom_is_still_an_error(tmp_path: Path) -> None:
+    r"""★ **数据文件**（我们翻的）带 BOM ⇒ **仍应报**（那是真的坏）。
+
+    这条守的是"排除"没排过头 —— 若把 data/*.json 也放过，
+    验收就失去意义了。
+    """
+    game = tmp_path / "game"
+    d = game / "data"
+    d.mkdir(parents=True)
+    (d / "Items.json").write_bytes(b"\xef\xbb\xbf" + b'[{"id":1}]')
+    probs = check_data_integrity(game)
+    assert probs, "数据文件带 BOM 却没报"
+
+
+def test_user_data_patterns() -> None:
+    """排除规则的覆盖面（含实测遇到的那几个）。"""
+    from novaloc.verify import _is_user_data
+
+    for s in (
+        "X_Data/savedata.json",
+        "save/config.rpgsave",
+        "save/global.rmmzsave",
+        "locales/zh-CN.pak",
+        "Dictionaries/en-US-9-0.bdic",
+        "Game/userdata/foo.json",
+    ):
+        assert _is_user_data(Path(s)), f"没排除 {s}"
+    for s in ("data/Items.json", "www/data/System.json", "Game/data/States.json"):
+        assert not _is_user_data(Path(s)), f"误排了数据文件 {s}"
