@@ -808,7 +808,14 @@ class OllamaTranslationProvider:
         temperature: float | None = None,
         n_items: int = 1,
         src_chars: int = 0,
+        timeout: float | None = None,
     ) -> str:
+        """发一次 `/api/chat`。
+
+        ``timeout`` 覆盖客户端的默认上限（300 秒）。**单条请求应当传一个
+        更短的值** —— 见 `_call_single_once` 与
+        `OllamaConfig.single_request_timeout_s` 的说明。
+        """
         result = self.client.chat(
             self._model,
             [
@@ -820,6 +827,7 @@ class OllamaTranslationProvider:
             ),
             fmt="json",
             keep_alive=self.cfg.ollama.keep_alive,
+            timeout=timeout,
         )
         return result.text
 
@@ -1083,7 +1091,15 @@ class OllamaTranslationProvider:
         if marker_warning:
             user = f"{user}\n\n{marker_warning}"
         raw = self._chat(
-            user, system=prompts.SYSTEM_PROMPT, n_items=1, src_chars=len(masked or "")
+            user,
+            system=prompts.SYSTEM_PROMPT,
+            n_items=1,
+            src_chars=len(masked or ""),
+            # ★ 单条用**更短**的超时。正常单条 3~10 秒，而 300 秒的余量
+            #   一旦遇上重复循环就是纯浪费：实测一条病态条目烧满
+            #   300 秒 × 3 次重试 = **15 分钟**，把整个队列拖成 0 条/分钟
+            #   （`CrossdresserKiller`，582 条里 6 条超长韩文多行条目）。
+            timeout=float(getattr(self.cfg.ollama, "single_request_timeout_s", 90.0)),
         )
         # ★ **必须传 `sources=[masked]`**（2026-10 修的第二个 bug）。
         #

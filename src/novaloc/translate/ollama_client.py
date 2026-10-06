@@ -256,8 +256,26 @@ class OllamaClient:
         keep_alive: str | int | None = None,
         images: list[str] | None = None,
         think: bool | None = None,
+        timeout: float | None = None,
     ) -> ChatResult:
-        """非流式对话。``fmt`` 传 ``"json"`` 或 JSON Schema 可强制结构化输出。"""
+        """非流式对话。``fmt`` 传 ``"json"`` 或 JSON Schema 可强制结构化输出。
+
+        ## ``timeout``：按请求类型覆盖（默认用客户端的 300 秒）
+
+        ★ 加它的原因（实测的算力浪费）：一条**单条**请求正常只要
+        3~10 秒，但沿用的 300 秒上限意味着"模型一旦进入重复循环，
+        这一条要烧满 5 分钟"，再加上调用方的 3 次重试 ⇒ **最多 15 分钟
+        只换来 1 条失败**。
+
+        实测（`CrossdresserKiller`，582 条里 6 条超长韩文多行条目）：
+        全库吞吐被这 6 条拖到 **0 条/分钟**，而 `llama-server` 满负荷空转
+        （120 秒窗口：新增 2 条、烧掉 113.5s CPU ⇒ **每条 56.8s**，
+        正常应 0.3~0.5s）。
+
+        ⇒ 单条请求给一个**贴合它实际需要的**上限（见
+        `OllamaConfig.single_request_timeout_s`）—— 超时就快速失败，
+        而不是让整个队列陪着一条病态条目烧 15 分钟。
+        """
         msgs = [dict(m) for m in messages]
         if images:
             if not msgs:
@@ -275,7 +293,10 @@ class OllamaClient:
             payload["think"] = think
 
         started = time.time()
-        resp = self._request("POST", "/api/chat", json=payload)
+        extra: dict[str, Any] = {}
+        if timeout is not None:
+            extra["timeout"] = timeout
+        resp = self._request("POST", "/api/chat", json=payload, **extra)
         data = resp.json()
         if data.get("error"):
             raise OllamaError(str(data["error"]))
