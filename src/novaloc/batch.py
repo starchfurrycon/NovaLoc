@@ -373,13 +373,26 @@ def detect_builtin_chinese_assets(
     # **误判的代价**（少翻一个游戏，用户可 `--force`）。
     #
     # ⚠️ 与原有判据**并列**，不替换 —— 后者仍能抓到"目录形态"的游戏。
-    lang_file = _zh_language_file(game_dir)
-    if lang_file is not None:
-        try:
-            rel = lang_file.relative_to(game_dir)
-        except ValueError:
-            rel = lang_file
-        return True, f"自带中文语言文件：{rel}"
+    # ★★★ **判据 0 已回退（2026-10）—— 它是一个误判。**
+    #
+    # 我原先按"文件名是中文语言码"（`locales/zh-CN.pak`）断定"自带中文"，
+    # 但实测**完全错误**：
+    #
+    # * **没有任何 JS 引用 `.pak`** ⇒ 游戏不读它；
+    # * **`.pak` 里是 Chromium/NW.js 的 UI 字符串**：
+    #
+    #       '位用户默认个人资料'  '书签栏其他书签移动设备书签'  '该政策已忽略'
+    #
+    #   RPG Maker MV/MZ 用 **NW.js（内嵌 Chromium）** 跑，
+    #   所以 `locales/` 是 **NW.js 自己的语言包**（106 种语言，人人都有），
+    #   **与游戏汉化毫无关系**。
+    #
+    # 后果（实测）：43 个"有 .pak"的游戏里，只有 **1 个**游戏数据真的已汉化，
+    # **32 个几乎无中文**却被跳过 ⇒ **本该翻译的游戏被漏掉**。
+    #
+    # ⇒ 判据**保留代码但不启用**（`_zh_language_file` 留给未来参考），
+    #   避免有人看到函数还在就以为这条路可行。
+    _ = _zh_language_file  # noqa: F841  —— 保留函数但**不调用**
 
     try:
         candidates = [

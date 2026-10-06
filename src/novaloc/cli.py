@@ -519,69 +519,6 @@ def _collect_doctor() -> dict[str, Any]:
     }
 
 
-@app.command("set-locale")
-def set_locale(
-    library: Path = typer.Argument(..., help="游戏库目录。"),
-    apply: bool = typer.Option(
-        False, "--apply",
-        help="真的写入。不加这个参数只打印计划（dry-run），不碰任何文件。",
-    ),
-    locale: str = typer.Option(
-        "zh_CN", "--locale",
-        help="目标 locale。游戏用 .match(/^zh/) 判断，所以 zh_CN/zh-CN 都行。",
-    ),
-) -> None:
-    """把**自带官方中文**的游戏设为中文（改 System.json 的 locale 字段）。
-
-    ## 为什么需要
-
-    RPG Maker 是否显示中文由 data/System.json 的 locale 决定
-    （依据是游戏自己的 rpg_objects.js：$dataSystem.locale.match(/^zh/)）。
-
-    实测全库：**57 个游戏自带 locales/zh-CN.pak**，但其中 **45 个**
-    的 locale 不是中文（ja_JP/en_US/ko_KR）⇒ 玩家看到的是日文/英文，
-    而且设置菜单里**未必有**语言选项。本命令把它们改成中文。
-
-    ## 安全性
-
-    * **默认 dry-run**：不加 --apply 不写任何文件；
-    * **写前必备份**：原文件存到 workspaces/<游戏>/locale_backup/System.json，
-      改动记进 locale_set.json，可回滚。备份失败则**放弃写入**；
-    * **只改一个字段**：文本级替换 "locale": "…"，其余字节不动；
-    * **不与流水线冲突**：
-pgmaker.py 的字段白名单是
-      {gameTitle, currencyUnit, terms}，**不含 locale**。
-    """
-    from .locale import DEFAULT_ZH_LOCALE, apply_plan, plan_library
-
-    plans = plan_library(library, target=locale or DEFAULT_ZH_LOCALE)
-    todo = [p for p in plans if p.will_change]
-    console.print(f"扫描 [bold]{len(plans)}[/] 个游戏，需要改 [bold]{len(todo)}[/] 个")
-    t = Table(box=box.SIMPLE_HEAVY, title_justify="left")
-    t.add_column("游戏")
-    t.add_column("改动")
-    for p in todo:
-        t.add_row(p.game.name[:48], p.reason[:70])
-    if todo:
-        console.print(t)
-    if not apply:
-        console.print("[yellow]dry-run：未写入任何文件。加 --apply 才真改。[/yellow]")
-        return
-
-    cfg = load_config()
-    ok = bad = 0
-    for p in todo:
-        ws = Path(cfg.data_root) / "workspaces" / p.game.name
-        good, why = apply_plan(p, workspace=ws)
-        if good:
-            ok += 1
-            console.print(f"[green]✅[/green] {p.game.name[:44]}  {why}")
-        else:
-            bad += 1
-            console.print(f"[yellow]⚠️[/yellow] {p.game.name[:44]}  {why}")
-    console.print(f"完成：成功 [bold]{ok}[/]，跳过/失败 {bad}")
-
-
 @app.command("doctor")
 def doctor(
     json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON 而不是表格。"),
