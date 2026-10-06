@@ -1394,6 +1394,20 @@ class OllamaTranslationProvider:
         ⇒ 由调用方（`stage_translate`）在开始游戏前调用一次，
         用**全部条数**设预算；`translate_batch` 只负责递增。
 
+        ## ★★ 预算**只增不减**（第二个实测事故）
+
+        贴图管线的回调拿到的 items 是**一张图里的文字块**
+        （常常 1~4 条），它也会走这里。若允许把预算**缩小**，
+        一次 `begin_run(1)` 就会把上限压到 `max(1+8, 3)=9`
+        并**不再恢复** ⇒ 实测连续拒绝几百批：
+
+        ```
+        批 0（1 条）第 1 次失败：请求预算已用尽（10 > 9）
+        …（100 > 9）…（300 > 9）…（600 > 9）…
+        ```
+
+        ⇒ 只在**新预算更大**时才更新；缩小的请求直接忽略。
+
         ⚠️ 计的是**整个游戏**的请求数，所以它是"病态游戏的止血阀"，
         不是"单批保护"。正常游戏实际约 1 次请求/条，
         远低于 `factor`（默认 3.0）。
@@ -1401,12 +1415,18 @@ class OllamaTranslationProvider:
         o = self.cfg.ollama
         factor = float(getattr(o, "request_budget_factor", 3.0))
         floor = int(getattr(o, "request_budget_floor", 8))
+        total_items = max(0, int(total_items))
+        new_budget = max(total_items + floor, int(total_items * factor))
+        if new_budget <= self._request_budget:
+            # ★★ **只增不减** —— 见 docstring 的实测事故：
+            #   贴图管线会用 1~4 条的小 items 调这里，
+            #   若允许缩小就会把预算压到 `max(1+8, 3)=9` 并**不再恢复**
+            #   ⇒ 连续拒绝几百批（实测日志里 10>9 … 600>9）。
+            return
         self._requests_used = 0
-        self._request_budget = max(
-            int(total_items) + floor, int(int(total_items) * factor)
-        )
+        self._request_budget = new_budget
         log.info(
-            "请求预算（本游戏）：%d 条 × %.1f = **%d 次请求**",
+            "请求预算（本作用域）：%d 条 × %.1f = **%d 次请求**",
             total_items, factor, self._request_budget,
         )
 
