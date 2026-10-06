@@ -1938,6 +1938,57 @@ class Pipeline:
             # 而不是解包阶段。
             repack_stats = self._repack_archives()
 
+            # ---- ★★ 写回后**自动验收** ----
+            #
+            # 见 `novaloc.verify` 的模块 docstring：本轮实测事故里
+            # NovaLoc 把 RPG Maker `note` 里**会被 eval 的 JS 代码**
+            # 当文本翻了 ⇒ VisuMZ 用 `new Function()` 执行 ⇒
+            # `SyntaxError: Unexpected number` ⇒ **游戏启动即崩**。
+            #
+            # ⚠️ 而 **JSON 校验、严格校验、BOM 检查全部通过** ——
+            # 坏掉的是"字符串里的代码语义"，不是 JSON 结构。
+            # ⇒ 只有**实际启动游戏**才能发现，而那次是**靠用户反馈**
+            #    才查到的。所以把它固化成自动检查。
+            #
+            # 这里只跑**便宜的两项**（JS 区块 + 数据完整性，毫秒级）。
+            # **启动检查**会占 GPU 十几秒，所以**不放进流水线** ——
+            # 由 `novaloc verify <游戏>` 按需跑（见 CLI 的说明）。
+            verify_stats: dict[str, Any] = {}
+            try:
+                from ..verify import check_data_integrity, check_js_blocks
+
+                game_dir = self.ws.source_dir
+                js_bad = check_js_blocks(game_dir)
+                data_bad = check_data_integrity(game_dir)
+                verify_stats = {
+                    "verify_js_blocks": len(js_bad),
+                    "verify_data": len(data_bad),
+                }
+                for msg in js_bad[:3]:
+                    self.bus.log(
+                        f"⚠️ 写回验收：{msg}",
+                        stage="apply",
+                        severity=Severity.ERROR,
+                    )
+                for msg in data_bad[:3]:
+                    self.bus.log(
+                        f"⚠️ 写回验收：{msg}",
+                        stage="apply",
+                        severity=Severity.ERROR,
+                    )
+                if not js_bad and not data_bad:
+                    self.bus.log(
+                        "写回验收通过：JS 区块无中文、数据文件严格合法。"
+                        "（建议再跑 `novaloc verify <游戏>` 做**启动**检查 —— "
+                        "那能发现 JSON 校验查不出的运行时错误）",
+                        stage="apply",
+                        severity=Severity.INFO,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # 验收本身出错**不该**让整轮失败（它只是附加保障）
+                verify_stats = {"verify_error": str(exc)[:120]}
+                log.debug("写回验收失败（不影响回写结果）：%s", exc)
+
             return StageResult(
                 stage="apply",
                 ok=True,
@@ -1951,6 +2002,7 @@ class Pipeline:
                     "refused": len(risky),
                     "out_dir": str(out_dir),
                     **repack_stats,
+                    **verify_stats,
                 },
             )
 

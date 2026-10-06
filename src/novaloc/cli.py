@@ -519,6 +519,61 @@ def _collect_doctor() -> dict[str, Any]:
     }
 
 
+@app.command("verify")
+def verify(
+    game: Path = typer.Argument(..., help="游戏目录（写回后要验收的那个）。"),
+    no_launch: bool = typer.Option(
+        False, "--no-launch",
+        help="跳过启动检查（快、不占 GPU）。只跑 JS 区块与数据完整性。",
+    ),
+    seconds: float = typer.Option(12.0, "--seconds", help="启动后观察秒数。"),
+) -> None:
+    """写回后**自动验收**：JS 区块 / 数据完整性 / 启动日志。
+
+    ## 为什么需要（实测事故）
+
+    NovaLoc 曾把 RPG Maker note 里**会被 eval 的 JS 代码**当文本翻了：
+
+        <JS On Expire State>
+        target.addState(80);        →  目标生命值恢复至 80。
+        </JS On Expire State>
+
+    VisuMZ 插件用 **
+ew Function()** 执行它 ⇒
+    SyntaxError: Unexpected number ⇒ **游戏启动即崩**。
+
+    ⚠️ 而 **JSON 校验、严格校验、BOM 检查全部通过** ——
+    坏掉的是"字符串里的代码语义"，不是 JSON 结构。
+    **只有实际启动游戏才能发现**。这次是靠用户反馈才查到的，
+    所以把它固化成自动检查。
+
+    ## 三项检查
+
+    1. **JS 区块**：<JS …> 里不能有中文（毫秒级，最快的哨兵）；
+    2. **数据完整性**：严格 JSON（拒绝 NaN/Infinity，
+       因为 JS 的 JSON.parse 拒绝而 Python 默认接受）
+       + 数字字段（price/damage 等）不能含中文；
+    3. **启动**：真启动游戏 --seconds 秒，用
+       --enable-logging=stderr 抓 SyntaxError 等致命错误
+       （已过滤 NW.js 自身噪声）。
+    """
+    import logging as _logging
+
+    from .verify import verify_game
+
+    _logging.basicConfig(level=_logging.INFO, format="%(message)s")
+    res = verify_game(game, launch=not no_launch, seconds=seconds)
+    if res.ok:
+        console.print(f"[green]{res.summary()}[/green]")
+        return
+    console.print(f"[red]{res.summary()}[/red]")
+    for name, msgs in res.problems.items():
+        console.print(f"\n[bold]{name}[/bold]（{len(msgs)} 处）")
+        for m in msgs[:20]:
+            console.print(f"  [red]❌[/red] {m}")
+    raise typer.Exit(code=1)
+
+
 @app.command("doctor")
 def doctor(
     json_output: bool = typer.Option(False, "--json", help="输出机器可读的 JSON 而不是表格。"),
