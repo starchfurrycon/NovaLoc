@@ -148,6 +148,57 @@ class StageResult:
         }
 
 
+
+class _ProgressHeartbeat:
+    r"""长时间跑的游戏**定期往日志写一行**，避免"沉默"。
+
+    ## 为什么需要（实测）
+
+    worker 输出重定向到文件时，`bus.progress()` 的订阅者
+    （Rich 交互式进度条）**不渲染** ⇒ 进度完全不落盘。
+    实测大游戏跑 7.5 小时，日志**一行都没打印**，
+    从外部无法区分"正常跑"和"卡死"。
+
+    ⇒ 这里绕开 Rich，**直接往 `bus.log` 写**。
+
+    ## 节流
+
+    * 默认 60 秒一行 —— 太密刷爆日志，太疏看不见；
+    * 只在跨过间隔时写 ⇒ 对吞吐零影响；
+    * 附带**速率估算**（条/分钟），便于一眼看出"是否在推进"。
+    """
+
+    def __init__(self, bus: Any, stage: str, *, interval_s: float = 60.0) -> None:
+        self.bus = bus
+        self.stage = stage
+        self.interval_s = interval_s
+        self._t0 = time.monotonic()
+        self._last = self._t0
+        self._last_done = 0
+
+    def __call__(self, done: int, total: int, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last) < self.interval_s:
+            return
+        elapsed = now - self._t0
+        window = now - self._last
+        grew = done - self._last_done
+        self._last = now
+        self._last_done = done
+        # 速率：用**本窗口**的增长算，这样"变慢了"能立刻看出来
+        rate = (grew / (window / 60.0)) if window > 0 else 0.0
+        pct = 100.0 * done / total if total else 0.0
+        eta = ""
+        if rate > 0 and done < total:
+            eta = f"，预计还需 {(total - done) / rate / 60:.1f} 小时"
+        self.bus.log(
+            f"进度 {done:,}/{total:,}（{pct:.0f}%）"
+            f"　本窗口 {rate:,.0f} 条/分　累计 {done / (elapsed / 60.0):,.0f} 条/分{eta}",
+            stage=self.stage,
+            severity=Severity.INFO,
+        )
+
+
 class PipelineError(RuntimeError):
     """流水线阶段失败。带上阶段名，方便 UI 定位。"""
 
@@ -727,6 +778,9 @@ class Pipeline:
 
         target_lang = self.ctx.config.translate.target_lang
         throttle = ProgressThrottle(self.bus, "translate", min_interval_s=0.4, min_delta=0.005)
+        #: 进度心跳（见 `_ProgressHeartbeat`）：每 60 秒往日志写一行，
+        #: 让"跑了很久"和"卡死了"在日志里可区分。
+        heartbeat = _ProgressHeartbeat(self.bus, "translate", interval_s=60.0)
 
         # 按类型分组：UI 短标签可以大批量，长对白必须小批量。
         # 混在一起会让模型把长句译成标签风格，或者把标签译得啰嗦。
@@ -789,6 +843,10 @@ class Pipeline:
                 seen += len(chunk)
                 done += len(chunk)
                 throttle(done / max(1, total), f"已翻译 {done}/{total}")
+                # ★ 进度心跳：与 Rich 进度条无关，**自己写一行日志**。
+                #   没有它的话，大游戏跑几小时日志完全沉默（实测 7.5 小时
+                #   一行未打印），从外部无法区分"正常"与"卡死"。
+                heartbeat(done, total)
                 if on_progress is not None:
                     # 每批之后给调用方一个落盘机会。回调自己负责节流，
                     # 所以这里不必判断时间。
