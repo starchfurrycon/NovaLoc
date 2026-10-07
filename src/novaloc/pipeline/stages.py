@@ -519,6 +519,41 @@ class Pipeline:
                     stage="translate", ok=False, error="还没有抽取文本，请先执行抽取"
                 )
 
+            #
+            # ## 背景（实测矛盾）
+            #
+            # 日志里有 `写回 N 个文件`、`回收 out/ 冗余`、`PipelineError: […]`
+            # （都走 `bus.log` ⇒ `console.print`）⇒ **bus 通道是通的**。
+            # 但我在 `_translate_units` 开头加的**无条件**诊断一次都没出现，
+            # 哪怕 `DemonHand` 跑了 **52 分钟**、34,287 条。
+            #
+            # ⇒ 必须分清是"这段代码没跑"还是"bus 在这条路径上丢了"。
+            #
+            # ## 做法：**两条通道各发一次**
+            #
+            # * `bus.log(...)` —— 走正常通道（进日志文件）；
+            # * `sys.stderr.write(...)` —— **绕过 bus 直写 stderr**
+            #   （worker 的 stderr 重定向到 `.scratch/run/auto9.err`）。
+            #
+            # 三种结果各有明确结论：
+            #
+            # | stderr | bus.log | 结论 |
+            # | --- | --- | --- |
+            # | 有 | 无 | bus 这条链在 `auto --watch` 路径上没接到文件 |
+            # | 有 | 有 | `_translate_units` 没被调用 ⇒ 查下面的早退 |
+            # | 无 | 无 | `stage_translate` 压根没跑 |
+            import sys as _sys
+
+            _units_n = len(units)
+            _msg = (
+                f"[translate] 进入 stage_translate：抽取 {_units_n:,} 条，"
+                f"only_pending={only_pending}"
+            )
+            _sys.stderr.write(_msg + "\n")
+            _sys.stderr.flush()
+            self.bus.log(_msg, stage="translate", severity=Severity.INFO)
+            # ============================================================
+
             existing = {e.uid: e for e in self.ws.load_entries()}
             # ---- 先按**当前**守卫规则重查一遍已有译文 ----
             #
@@ -781,6 +816,15 @@ class Pipeline:
         #: 进度心跳（见 `_ProgressHeartbeat`）：每 60 秒往日志写一行，
         #: 让"跑了很久"和"卡死了"在日志里可区分。
         heartbeat = _ProgressHeartbeat(self.bus, "translate", interval_s=60.0)
+        #: ★ 诊断：无条件记一行，用于确认"批循环真的进来了"。
+        #: 背景：加了进度心跳后生产日志里**一条都没有**，而代码路径看着
+        #: 完全正确（心跳前无 `continue`、端到端验证过会写日志）。
+        #: 所以需要先确认这段代码**是否被执行**，再谈别的。
+        self.bus.log(
+            f"开始翻译：{len(units)} 条待处理，心跳间隔 {heartbeat.interval_s:.0f} 秒",
+            stage="translate",
+            severity=Severity.INFO,
+        )
 
         # 按类型分组：UI 短标签可以大批量，长对白必须小批量。
         # 混在一起会让模型把长句译成标签风格，或者把标签译得啰嗦。

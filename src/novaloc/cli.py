@@ -26,6 +26,7 @@ import os
 import platform
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -228,6 +229,54 @@ def make_ctx(*, workspace: Workspace | None = None, events: EventBus | None = No
     """组装流水线/子服务需要的运行时上下文。"""
     cfg = load_config()
     return Context(config=cfg, events=events or EventBus(), workspace=workspace, logger=None)
+
+
+def _make_console_log_subscriber(
+    *,
+    max_same: int = 3,
+) -> Callable[[Event], None]:
+    r"""构造一个**把 `bus.log` 打到控制台**的订阅者（含同类消息去重）。
+
+    ## 为什么要有这个（实测事故）
+
+    `auto` 命令（批量汉化整个库）在**每个游戏**建了一个独立 `EventBus`
+    并交给 `Pipeline`，但**从未订阅它** ⇒ pipeline 的**所有** `bus.log`
+    **全部被丢弃**。
+
+    实测证据：同一个诊断点两条通道各发一次 ——
+    `sys.stderr.write` 成功 3 次，`self.bus.log` **0 次**。
+
+    危害不止"看不见进度"：`批次翻译失败`、`质检`的告警、
+    字体/贴图阶段的 `ERROR` **全都静默**，等于整条流水线的观测盲区。
+
+    ## 去重
+
+    质检阶段会为每条没有译文的串各发一条 WARN（几十上百条），
+    直接刷爆终端。⇒ 同类消息只打前 `max_same` 条，其余汇总。
+
+    ## 与 `run` 的关系
+
+    `run` 命令里那段逻辑**行为一致**，只是它还要更新 Rich 进度条
+    （`auto` 没有进度条）。这里把"打印"部分抽出来共用。
+    """
+    seen: dict[str, int] = {}
+    suppressed: dict[str, int] = {}
+
+    def _on(ev: Event) -> None:
+        if ev.kind != "log":
+            return
+        sev = _safe_severity(ev)
+        style = {"warn": "yellow", "error": "red"}.get(sev, "")
+        prefix = {"warn": "⚠ ", "error": "✗ "}.get(sev, "  ")
+        n = seen.get(ev.message, 0)
+        seen[ev.message] = n + 1
+        if n >= max_same:
+            suppressed[ev.message] = suppressed.get(ev.message, 0) + 1
+            return
+        text = f"{prefix}{ev.message}"
+        console.print(f"[{style}]{text}[/{style}]" if style else text)
+
+    return _on
 
 
 def config_summary() -> dict[str, Any]:
@@ -2710,6 +2759,17 @@ def auto(
             ent.project_id = ws.project.id
 
             bus = EventBus()
+            # ★★ 必须订阅！否则 pipeline 的**所有** `bus.log` 都被丢弃。
+            #
+            # 实测事故：`auto` 里建了 bus 却从未 `subscribe`，
+            # 于是 `_translate_units` 里的诊断与进度心跳
+            # （以及所有 `批次翻译失败`/质检告警/字体贴图 ERROR）
+            # **全部静默**。证据：同一诊断点
+            # `sys.stderr.write` 成功 3 次、`self.bus.log` **0 次**。
+            #
+            # 对比：`run` 命令是有订阅的（见它自己的 `bus.subscribe(on_event)`），
+            # 所以 `novaloc run` 的日志一直正常 —— 只有 `auto` 有这个问题。
+            _unsub_log = bus.subscribe(_make_console_log_subscriber())
             ctx = Context(config=cfg, events=bus, workspace=ws, logger=None)
             pipe = Pipeline(ws, ctx)
             with ws.lock(what="auto"):
@@ -2718,6 +2778,8 @@ def auto(
                 has_units = run_pipeline(
                     pipe, ws, skip_extract_if_cached=backlog
                 )
+
+            _unsub_log()  # 取消订阅，避免跨游戏累积
 
             units = ws.load_units()
             ent.units = len(units)
